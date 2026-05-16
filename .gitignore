@@ -1,0 +1,41 @@
+# Personal config (contains private URLs/IPs — use config.example.json as template)
+config.json
+
+# Runtime data
+.watch_history.json
+.search_history.json
+
+# Cache directories
+.epg_cache/
+.m3u_cache/
+
+# Log files
+*.log
+mpv-log-archive/
+
+# Backup files
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Claude Code internal files
+.claude/
+.tmp.driveupload/
+
+# Working / scratch directories
+working/

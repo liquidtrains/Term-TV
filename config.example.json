@@ -1,0 +1,20 @@
+{
+  "vpn_ip": "",
+  "openvpn": {
+    "enabled": false,
+    "executable": "",
+    "config_file": "",
+    "auto_connect": false
+  },
+  "playlists": [
+    {
+      "name": "My Playlist",
+      "m3u_url": "http://your-iptv-provider.example/playlist.m3u",
+      "epg_url": "http://your-iptv-provider.example/epg.xml.gz"
+    },
+    {
+      "name": "Public (iptv-org)",
+      "m3u_url": "https://iptv-org.github.io/iptv/index.m3u"
+    }
+  ]
+}
