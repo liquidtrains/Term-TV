@@ -24,6 +24,20 @@ def _ensure_dependencies():
 _ensure_dependencies()
 
 import requests
+import shutil as _shutil
+
+
+def _check_external_tools():
+    """Warn at startup if external tools are missing."""
+    if not _shutil.which("mpv"):
+        print("Error: 'mpv' not found on PATH. mpv is required to play streams.", file=sys.stderr)
+        sys.exit(1)
+    for tool in ("ffmpeg", "ffprobe"):
+        if not _shutil.which(tool):
+            print(f"Warning: '{tool}' not found on PATH. Recording and subtitle features will be unavailable.", file=sys.stderr)
+
+
+_check_external_tools()
 import re
 import lzma
 import json
@@ -37,6 +51,8 @@ import hashlib
 import logging
 import atexit
 import platform
+
+import lib.term_tv_core as _core
 
 from lib.term_tv_core import (
     Channel, EpgData, ShowResult,
@@ -1164,6 +1180,12 @@ def main():
     if not playlists:
         print("Error: No playlists defined in config.json.", file=sys.stderr)
         sys.exit(1)
+
+    # Apply optional recordings_dir override from config
+    global RECORDINGS_DIR
+    if "recordings_dir" in config:
+        RECORDINGS_DIR = Path(config["recordings_dir"]).expanduser()
+        _core.RECORDINGS_DIR = RECORDINGS_DIR
 
     # Get expected VPN IP from config (optional)
     expected_vpn_ip = config.get("vpn_ip")
