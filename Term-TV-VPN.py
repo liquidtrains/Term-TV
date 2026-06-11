@@ -541,7 +541,8 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
             next_provider = next_channel.get("group-title", "Unknown Provider")
             next_name = next_channel.get("name", "Unknown")
             next_start = next_rerun["start_time"]
-            minutes_until = next_rerun["minutes_until"]
+            new_delay = max(0, int((next_start - datetime.now().astimezone()).total_seconds()))
+            minutes_until = new_delay // 60
 
             logging.info(f"Found future rerun in {minutes_until} minutes on {next_name} [{next_provider}]")
             print(f"[PLAYBACK] Found future rerun:")
@@ -550,7 +551,6 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
 
             # Schedule new playback
             new_task_id = int(time.time() * 1000)
-            new_delay = minutes_until * 60
 
             with SCHEDULED_TASKS_LOCK:
                 SCHEDULED_TASKS.append({
@@ -559,7 +559,7 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
                     "channel_name": next_name,
                     "provider": next_provider,
                     "show_title": show_title,
-                    "scheduled_time": datetime.now() + timedelta(seconds=new_delay)
+                    "scheduled_time": datetime.now().astimezone() + timedelta(seconds=new_delay)
                 })
 
             thread = threading.Thread(
@@ -776,7 +776,8 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
             next_provider = next_channel.get("group-title", "Unknown Provider")
             next_name = next_channel.get("name", "Unknown")
             next_start = next_rerun["start_time"]
-            minutes_until = next_rerun["minutes_until"]
+            new_delay = max(0, int((next_start - datetime.now().astimezone()).total_seconds()))
+            minutes_until = new_delay // 60
 
             logging.info(f"Found future rerun in {minutes_until} minutes on {next_name} [{next_provider}]")
             print(f"[RECORDING] Found future rerun:")
@@ -785,7 +786,6 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
 
             # Schedule new recording
             new_task_id = int(time.time() * 1000)
-            new_delay = minutes_until * 60
 
             with SCHEDULED_TASKS_LOCK:
                 SCHEDULED_TASKS.append({
@@ -794,7 +794,7 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
                     "channel_name": next_name,
                     "provider": next_provider,
                     "show_title": show_title,
-                    "scheduled_time": datetime.now() + timedelta(seconds=new_delay)
+                    "scheduled_time": datetime.now().astimezone() + timedelta(seconds=new_delay)
                 })
 
             thread = threading.Thread(
