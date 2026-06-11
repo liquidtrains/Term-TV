@@ -1,5 +1,6 @@
 {
   "vpn_ip": "",
+  "recordings_dir": "~/Videos/Recordings",
   "openvpn": {
     "enabled": false,
     "executable": "",

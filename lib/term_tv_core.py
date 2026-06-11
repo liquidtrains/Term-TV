@@ -526,13 +526,19 @@ def search_channels(channels: List[Channel], query: str) -> List[Channel]:
     return [c for c in channels if q in c.get("name", "").lower()]
 
 
+_tvg_map_cache: Dict[int, Dict[str, List[Channel]]] = {}
+
+
 def _build_tvg_map(channels: List[Channel]) -> Dict[str, List[Channel]]:
-    tvg_map: Dict[str, List[Channel]] = defaultdict(list)
-    for ch in channels:
-        tvg_id = ch.get("tvg-id")
-        if tvg_id:
-            tvg_map[tvg_id].append(ch)
-    return tvg_map
+    key = id(channels)
+    if key not in _tvg_map_cache:
+        tvg_map: Dict[str, List[Channel]] = defaultdict(list)
+        for ch in channels:
+            tvg_id = ch.get("tvg-id")
+            if tvg_id:
+                tvg_map[tvg_id].append(ch)
+        _tvg_map_cache[key] = tvg_map
+    return _tvg_map_cache[key]
 
 
 def _fmt_time_status(is_playing_now: bool, minutes_until: int) -> str:
