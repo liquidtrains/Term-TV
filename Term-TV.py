@@ -237,22 +237,21 @@ def run_mpv_with_logging(mpv_args: List[str], channel_name: str) -> subprocess.C
     """
     import subprocess
 
-    # Open log file for appending
+    log_file = None
     try:
-        log_file = open(MPV_LOG_FILE, 'a', encoding='utf-8')
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        log_file.write(f"\n{'='*80}\n")
-        log_file.write(f"[{timestamp}] Channel: {channel_name}\n")
-        log_file.write(f"Command: {' '.join(mpv_args)}\n")
-        log_file.write(f"{'-'*80}\n")
-        log_file.write("OUTPUT (combined stdout/stderr):\n")
-        log_file.flush()
-    except Exception as e:
-        logging.warning(f"Failed to open mpv log file: {e}")
-        log_file = None
+        try:
+            log_file = open(MPV_LOG_FILE, 'a', encoding='utf-8')
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            log_file.write(f"\n{'='*80}\n")
+            log_file.write(f"[{timestamp}] Channel: {channel_name}\n")
+            log_file.write(f"Command: {' '.join(mpv_args)}\n")
+            log_file.write(f"{'-'*80}\n")
+            log_file.write("OUTPUT (combined stdout/stderr):\n")
+            log_file.flush()
+        except Exception as e:
+            logging.warning(f"Failed to open mpv log file: {e}")
+            log_file = None
 
-    # Use Popen to capture output while still displaying it
-    try:
         process = subprocess.Popen(
             mpv_args,
             stdout=subprocess.PIPE,
@@ -310,22 +309,26 @@ def run_mpv_with_logging(mpv_args: List[str], channel_name: str) -> subprocess.C
         # Wait for process to complete
         returncode = process.wait()
 
-        # Write exit code to log
         if log_file:
             log_file.write(f"\n{'-'*80}\n")
             log_file.write(f"Exit Code: {returncode}\n")
             log_file.write(f"{'='*80}\n")
-            log_file.close()
 
-        # Return CompletedProcess-like object
         return subprocess.CompletedProcess(mpv_args, returncode, None, None)
 
     except Exception as e:
         if log_file:
-            log_file.write(f"\nEXCEPTION: {e}\n")
-            log_file.write(f"{'='*80}\n")
-            log_file.close()
+            try:
+                log_file.write(f"\nEXCEPTION: {e}\n{'='*80}\n")
+            except Exception:
+                pass
         raise
+    finally:
+        if log_file:
+            try:
+                log_file.close()
+            except Exception:
+                pass
 
 # --- Global State ---
 SCHEDULED_TASKS = []  # List of scheduled playback/recording tasks
@@ -618,7 +621,8 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
             next_provider = next_channel.get("group-title", "Unknown Provider")
             next_name = next_channel.get("name", "Unknown")
             next_start = next_rerun["start_time"]
-            minutes_until = next_rerun["minutes_until"]
+            new_delay = max(0, int((next_start - datetime.now().astimezone()).total_seconds()))
+            minutes_until = new_delay // 60
 
             logging.info(f"Found future rerun in {minutes_until} minutes on {next_name} [{next_provider}]")
             print(f"[PLAYBACK] Found future rerun:")
@@ -627,7 +631,6 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
 
             # Schedule new playback
             new_task_id = int(time.time() * 1000)
-            new_delay = minutes_until * 60
             new_cancel_event = threading.Event()
 
             with SCHEDULED_TASKS_LOCK:
@@ -637,7 +640,7 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
                     "channel_name": next_name,
                     "provider": next_provider,
                     "show_title": show_title,
-                    "scheduled_time": datetime.now() + timedelta(seconds=new_delay),
+                    "scheduled_time": datetime.now().astimezone() + timedelta(seconds=new_delay),
                     "cancel_event": new_cancel_event,
                 })
 
@@ -865,7 +868,8 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
             next_provider = next_channel.get("group-title", "Unknown Provider")
             next_name = next_channel.get("name", "Unknown")
             next_start = next_rerun["start_time"]
-            minutes_until = next_rerun["minutes_until"]
+            new_delay = max(0, int((next_start - datetime.now().astimezone()).total_seconds()))
+            minutes_until = new_delay // 60
 
             logging.info(f"Found future rerun in {minutes_until} minutes on {next_name} [{next_provider}]")
             print(f"[RECORDING] Found future rerun:")
@@ -874,7 +878,6 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
 
             # Schedule new recording
             new_task_id = int(time.time() * 1000)
-            new_delay = minutes_until * 60
             new_cancel_event = threading.Event()
 
             with SCHEDULED_TASKS_LOCK:
@@ -884,7 +887,7 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
                     "channel_name": next_name,
                     "provider": next_provider,
                     "show_title": show_title,
-                    "scheduled_time": datetime.now() + timedelta(seconds=new_delay),
+                    "scheduled_time": datetime.now().astimezone() + timedelta(seconds=new_delay),
                     "cancel_event": new_cancel_event,
                 })
 
@@ -1056,12 +1059,6 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
     print(f"Command: {' '.join(mpv_args[:2])}..." if len(mpv_args) > 2 else f"Command: {' '.join(mpv_args)}")
     print(f"Starting mpv... (if it hangs, the stream may be down - press Ctrl+C to cancel)")
 
-    # Verify channel URL is not empty
-    if not channel_url or channel_url.strip() == "":
-        logging.error("Channel URL is empty or invalid")
-        print(f"\nError: Channel URL is empty or invalid.", file=sys.stderr)
-        return
-
     # Track start time
     start_time = datetime.now()
 
@@ -1100,22 +1097,21 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         print(f"\nError launching mpv: {e}", file=sys.stderr)
         return
     finally:
-        # Calculate duration (only for watch-only sessions)
-        if record_choice == 'w':
-            end_time = datetime.now()
-            duration = (end_time - start_time).total_seconds()
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
 
-            logging.info(f"Watch session duration: {duration:.1f} seconds")
+        logging.info(f"Session duration: {duration:.1f} seconds")
 
-            # Log the watch (only counts if >= 2 minutes)
-            if duration >= 2:  # At least 2 seconds to avoid instant failures
-                log_channel_watch(channel, int(duration))
+        if duration >= 2:
+            log_channel_watch(channel, int(duration))
 
-                if duration >= 120:
-                    logging.info(f"Watch session logged: {int(duration // 60)} minutes")
+            if duration >= 120:
+                logging.info(f"Session logged: {int(duration // 60)} minutes")
+                if record_choice == 'w':
                     print(f"\nWatched for {int(duration // 60)} minutes - session logged!")
-                else:
-                    logging.debug(f"Watch session too short to log: {int(duration)} seconds")
+            else:
+                logging.debug(f"Session too short to log: {int(duration)} seconds")
+                if record_choice == 'w':
                     print(f"\nWatched for {int(duration)} seconds (need 2 min to log frequency)")
 
 
@@ -1128,7 +1124,7 @@ def select_from_show_results(results: List[ShowResult]) -> Optional[ShowResult]:
         channel_name = result["channel"].get("name", "Unknown")
         title = result["title"]
         time_status = result["time_status"]
-        start_time = result["start_time"].strftime("%I:%M %p")
+        start_time = result["start_time"].strftime("%I:%M %p") if result.get("start_time") else "?"
         is_playing = result.get("is_playing_now", False)
         is_new = result.get("is_new", False)
         episode_num = result.get("episode_num", "")

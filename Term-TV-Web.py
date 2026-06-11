@@ -42,27 +42,29 @@ _ensure_deps()
 import os
 import re
 import json
-import gzip
-import zlib
 import lzma
 import time
 import logging
-import hashlib
 import threading
 import platform
 import shutil
 import webbrowser
 import atexit
-from io import BytesIO
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
-import xml.etree.ElementTree as ET
 
 import requests
 from flask import Flask, jsonify, request, Response
-from lib.term_tv_core import parse_epg_time, get_safe_filename
+from lib.term_tv_core import (
+    parse_epg_time, get_safe_filename,
+    load_m3u_cached as _core_load_m3u_cached,
+    load_epg as _core_load_epg,
+    load_watch_history as _core_load_watch_history,
+    get_public_ip as _core_get_public_ip,
+    is_new_episode as _core_is_new_episode,
+)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 CONFIG_FILE         = Path("config.json")
@@ -100,17 +102,10 @@ def setup_logging():
     logging.getLogger().handlers[1].setLevel(logging.WARNING)
     logging.info("Term-TV Web started")
 
-# ── Core data functions (reference: Term-TV.py) ───────────────────────────────
+# ── Core data functions (delegated to lib.term_tv_core) ──────────────────────
 
 def get_public_ip() -> Optional[str]:
-    for url in ["https://api.ipify.org?format=text", "https://icanhazip.com"]:
-        try:
-            r = requests.get(url, timeout=5)
-            r.raise_for_status()
-            return r.text.strip()
-        except Exception:
-            continue
-    return None
+    return _core_get_public_ip()
 
 
 # B3 / Fix-6: Cached public IP (60s TTL, invalidated on VPN state change, lock prevents storm)
@@ -136,219 +131,15 @@ def get_public_ip_cached() -> Optional[str]:
 
 
 def load_m3u_cached(url: str) -> List[Dict]:
-    M3U_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    url_hash = hashlib.md5(url.encode()).hexdigest()
-    cache_file = M3U_CACHE_DIR / f"{url_hash}.m3u"
-    meta_file  = M3U_CACHE_DIR / f"{url_hash}.meta"
-
-    headers = {}
-    if meta_file.exists():
-        try:
-            meta = json.loads(meta_file.read_text())
-            if "etag" in meta:
-                headers["If-None-Match"] = meta["etag"]
-            if "last-modified" in meta:
-                headers["If-Modified-Since"] = meta["last-modified"]
-        except Exception:
-            pass
-
-    print(f"Checking M3U from {url}...")
-    try:
-        resp = requests.get(url, timeout=15, headers=headers)
-        if resp.status_code == 304:
-            content = cache_file.read_text(encoding="utf-8") if cache_file.exists() else ""
-            if not content:
-                resp = requests.get(url, timeout=15)
-                content = resp.text
-        elif resp.status_code == 200:
-            content = resp.text
-            cache_file.write_text(content, encoding="utf-8")
-            meta = {}
-            if "etag" in resp.headers:
-                meta["etag"] = resp.headers["etag"]
-            if "last-modified" in resp.headers:
-                meta["last-modified"] = resp.headers["last-modified"]
-            if meta:
-                meta_file.write_text(json.dumps(meta))
-        else:
-            resp.raise_for_status()
-            content = ""
-    except requests.RequestException as e:
-        if cache_file.exists():
-            content = cache_file.read_text(encoding="utf-8")
-        else:
-            logging.error(f"M3U download failed: {e}")
-            return []
-
-    channels = []
-    info: Optional[Dict] = None
-    for line in content.splitlines():
-        line = line.strip()
-        if line.startswith("#EXTINF"):
-            info = {}
-            for attr in ("tvg-id", "tvg-name", "tvg-logo", "group-title"):
-                m = re.search(rf'{attr}="([^"]*)"', line)
-                if m:
-                    info[attr] = m.group(1)
-            name_part = line.split(",", 1)
-            if len(name_part) == 2:
-                info["name"] = name_part[1].strip()
-        elif line and not line.startswith("#") and info is not None:
-            if "name" in info:
-                info["url"] = line
-                channels.append(info)
-            info = None
-
-    print(f"✓ Loaded {len(channels)} channels")
-    return channels
+    return _core_load_m3u_cached(url)
 
 
 def load_epg(url: str) -> Dict:
-    EPG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    url_hash   = hashlib.md5(url.encode()).hexdigest()
-    cache_file = EPG_CACHE_DIR / f"{url_hash}.xml.gz"
-    meta_file  = EPG_CACHE_DIR / f"{url_hash}.meta"
-
-    headers = {}
-    if meta_file.exists():
-        try:
-            meta = json.loads(meta_file.read_text())
-            if "etag" in meta:
-                headers["If-None-Match"] = meta["etag"]
-            if "last-modified" in meta:
-                headers["If-Modified-Since"] = meta["last-modified"]
-        except Exception:
-            pass
-
-    print(f"Checking EPG from {url}...")
-    try:
-        resp = requests.get(url, timeout=(10, 120), headers=headers)
-        if resp.status_code == 304:
-            content = cache_file.read_bytes() if cache_file.exists() else b""
-            if not content:
-                resp = requests.get(url, timeout=(10, 120))
-                content = resp.content
-        elif resp.status_code == 200:
-            content = resp.content
-            if not content.startswith(b"\x1f\x8b"):
-                gz_tmp = EPG_CACHE_DIR / f"{url_hash}_tmp.xml.gz"
-                with gzip.open(gz_tmp, "wb") as gz:
-                    gz.write(content)
-                content = gz_tmp.read_bytes()
-                gz_tmp.rename(cache_file)
-            else:
-                cache_file.write_bytes(content)
-            meta = {}
-            if "etag" in resp.headers:
-                meta["etag"] = resp.headers["etag"]
-            if "last-modified" in resp.headers:
-                meta["last-modified"] = resp.headers["last-modified"]
-            if meta:
-                meta_file.write_text(json.dumps(meta))
-        else:
-            resp.raise_for_status()
-            content = b""
-    except requests.RequestException as e:
-        if cache_file.exists():
-            content = cache_file.read_bytes()
-        else:
-            print(f"EPG unavailable: {e}", file=sys.stderr)
-            return {}
-
-    # Decompress
-    try:
-        if content.startswith(b"\x1f\x8b"):
-            try:
-                xml_data = gzip.decompress(content)
-            except (EOFError, gzip.BadGzipFile):
-                d = zlib.decompressobj(wbits=31)
-                xml_data = d.decompress(content)
-        else:
-            xml_data = content
-    except Exception as e:
-        print(f"EPG decompress failed: {e}", file=sys.stderr)
-        return {}
-
-    # Parse XML leniently (tolerates truncated feeds)
-    root = ET.Element("tv")
-    recovered = 0
-    try:
-        for _, elem in ET.iterparse(BytesIO(xml_data), events=("end",)):
-            if elem.tag in ("programme", "channel"):
-                root.append(elem)
-                recovered += 1
-    except ET.ParseError as e:
-        logging.warning(f"EPG XML truncated or malformed ({e}); recovered {recovered} elements")
-
-    # Keep programs that ended less than 6 hours ago through all future programs
-    epg: Dict = {}
-    now = datetime.now().astimezone()
-    cutoff = now - timedelta(hours=6)
-    total = skipped = 0
-
-    for prog_el in root.findall("programme"):
-        total += 1
-        ch_id = prog_el.get("channel")
-        if not ch_id:
-            continue
-
-        stop_str  = prog_el.get("stop", "")
-        stop_time = parse_epg_time(stop_str)
-        if stop_time and stop_time < cutoff:
-            skipped += 1
-            continue
-
-        start_str  = prog_el.get("start", "")
-        start_time = parse_epg_time(start_str)
-
-        title_el   = prog_el.find("title")
-        sub_el     = prog_el.find("sub-title")
-        desc_el    = prog_el.find("desc")
-        ep_el      = prog_el.find("episode-num")
-        date_el    = prog_el.find("date")
-
-        epg.setdefault(ch_id, []).append({
-            "start":       start_str,
-            "stop":        stop_str,
-            "start_time":  start_time,
-            "stop_time":   stop_time,
-            "title":       (title_el.text or "Untitled") if title_el is not None else "Untitled",
-            "subtitle":    (sub_el.text  or "")          if sub_el   is not None else "",
-            "description": (desc_el.text or "")          if desc_el  is not None else "",
-            "episode_num": (ep_el.text   or "")          if ep_el    is not None else "",
-            "air_date":    (date_el.text or "")          if date_el  is not None else "",
-        })
-
-    for ch_id in epg:
-        epg[ch_id].sort(key=lambda x: x["start_time"] or datetime.max.astimezone())
-
-    print(f"✓ Loaded EPG: {len(epg)} channels ({total - skipped} programmes)")
-    return epg
+    return _core_load_epg(url, lookback_hours=6)
 
 
 def load_watch_history() -> List[Dict]:
-    if not WATCH_HISTORY_FILE.exists():
-        return []
-    try:
-        with open(WATCH_HISTORY_FILE, "r", encoding="utf-8") as f:
-            history = json.load(f)
-        migrated = False
-        for entry in history:
-            if "timestamp" in entry and "watch_count" not in entry:
-                entry["watch_count"]  = 1
-                entry["last_watched"] = entry.pop("timestamp")
-                migrated = True
-            if "total_duration_seconds" not in entry:
-                entry["total_duration_seconds"] = entry.get("watch_count", 0) * 600
-                migrated = True
-        if migrated:
-            try:
-                WATCH_HISTORY_FILE.write_text(json.dumps(history, indent=2))
-            except Exception:
-                pass
-        return history
-    except Exception:
-        return []
+    return _core_load_watch_history()
 
 
 # B4: Watch history cache (30s TTL) — avoids disk read on every /api/guide call
@@ -379,15 +170,8 @@ def _is_vod_ch(ch: Dict) -> bool:
 
 
 def is_new_episode(prog: Dict) -> bool:
-    """S1: True if the programme's air_date is within the last 7 days (matches CLI is_new_episode)."""
-    air_date_str = prog.get("air_date", "")
-    if not air_date_str:
-        return False
-    try:
-        air_date = datetime.strptime(air_date_str[:8], "%Y%m%d").replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - air_date).days <= 7
-    except (ValueError, TypeError):
-        return False
+    """True if the programme's air_date is within the last 7 days."""
+    return _core_is_new_episode(prog.get("air_date", ""))
 
 
 def search_shows_web(query: str, hours_ahead: int = 24, groups: Optional[set] = None) -> List[Dict]:

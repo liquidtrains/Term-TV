@@ -65,12 +65,12 @@ def clean_old_cache_files(max_age_days: int = 15):
             if not file_path.is_file():
                 continue
             try:
-                age_seconds = (now - datetime.fromtimestamp(file_path.stat().st_mtime)).total_seconds()
+                st = file_path.stat()
+                age_seconds = (now - datetime.fromtimestamp(st.st_mtime)).total_seconds()
                 if age_seconds > max_age_seconds:
-                    file_size = file_path.stat().st_size
                     file_path.unlink()
                     total_deleted += 1
-                    total_freed_bytes += file_size
+                    total_freed_bytes += st.st_size
                     logging.info(f"Deleted old cache file ({age_seconds/86400:.1f}d): {file_path.name}")
             except Exception as e:
                 logging.warning(f"Error checking/deleting cache file {file_path}: {e}")
@@ -331,11 +331,13 @@ def load_m3u_cached(url: str) -> List[Channel]:
 # EPG loading  (robust: iterparse + zlib fallback + tuple timeout)
 # ---------------------------------------------------------------------------
 
-def load_epg(url: str) -> EpgData:
+def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
     """
     Download and parse an XMLTV EPG with caching.
     Uses iterparse to recover data from truncated XML and zlib for lenient
     gzip decompression (tolerates missing gzip footer from misconfigured servers).
+
+    lookback_hours: keep programmes that ended up to this many hours ago (0 = discard all past).
     """
     EPG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     url_hash = hashlib.md5(url.encode()).hexdigest()
@@ -442,6 +444,7 @@ def load_epg(url: str) -> EpgData:
 
     epg: EpgData = {}
     now = datetime.now().astimezone()
+    cutoff = now - timedelta(hours=lookback_hours)
     total = filtered = 0
 
     for prog in root.findall("programme"):
@@ -459,7 +462,7 @@ def load_epg(url: str) -> EpgData:
         start_time = parse_epg_time(start_str)
         stop_time  = parse_epg_time(stop_str)
 
-        if stop_time and stop_time < now:
+        if stop_time and stop_time < cutoff:
             filtered += 1
             continue
 
@@ -508,10 +511,11 @@ def parse_epg_time(time_str: str) -> Optional[datetime]:
 
 def is_new_episode(air_date: str, days_threshold: int = 7) -> bool:
     """Return True if *air_date* (YYYYMMDD) is within *days_threshold* days of today."""
-    if not air_date or len(air_date) != 8:
+    if not air_date or len(air_date) < 8:
         return False
     try:
-        days_diff = (datetime.now() - datetime.strptime(air_date, "%Y%m%d")).days
+        air_dt = datetime.strptime(air_date[:8], "%Y%m%d").replace(tzinfo=timezone.utc)
+        days_diff = (datetime.now(timezone.utc) - air_dt).days
         return 0 <= days_diff <= days_threshold
     except ValueError:
         return False
@@ -526,19 +530,21 @@ def search_channels(channels: List[Channel], query: str) -> List[Channel]:
     return [c for c in channels if q in c.get("name", "").lower()]
 
 
-_tvg_map_cache: Dict[int, Dict[str, List[Channel]]] = {}
+_tvg_map_cached_key: Optional[List[Channel]] = None
+_tvg_map_cached_result: Dict[str, List[Channel]] = {}
 
 
 def _build_tvg_map(channels: List[Channel]) -> Dict[str, List[Channel]]:
-    key = id(channels)
-    if key not in _tvg_map_cache:
+    global _tvg_map_cached_key, _tvg_map_cached_result
+    if channels is not _tvg_map_cached_key:
         tvg_map: Dict[str, List[Channel]] = defaultdict(list)
         for ch in channels:
             tvg_id = ch.get("tvg-id")
             if tvg_id:
                 tvg_map[tvg_id].append(ch)
-        _tvg_map_cache[key] = tvg_map
-    return _tvg_map_cache[key]
+        _tvg_map_cached_key = channels
+        _tvg_map_cached_result = tvg_map
+    return _tvg_map_cached_result
 
 
 def _fmt_time_status(is_playing_now: bool, minutes_until: int) -> str:
@@ -627,9 +633,10 @@ def find_alternative_streams(
             stop_time      = prog.get("stop_time")
             if not start_time:
                 continue
-            title_match   = show_title.lower() in title.lower() or title.lower() in show_title.lower()
-            episode_match = episode_num and prog_ep and episode_num == prog_ep
-            if not (title_match and episode_match):
+            title_match = show_title.lower() in title.lower() or title.lower() in show_title.lower()
+            if not title_match:
+                continue
+            if episode_num and prog_ep and episode_num != prog_ep:
                 continue
             if abs((start_time - original_start_time).total_seconds() / 60) > tolerance_minutes:
                 continue
@@ -772,11 +779,15 @@ def log_channel_watch(channel: Channel, duration_seconds: int):
 
 def get_frequent_channels(channels: List[Channel], epg: EpgData) -> List[Dict[str, Any]]:
     """Return top-3 channels by total watch time, enriched with current EPG info."""
-    history = sorted(
-        load_watch_history(),
-        key=lambda x: (x.get("total_duration_seconds", 0), x.get("last_watched", "")),
-        reverse=True,
-    )
+    def _sort_key(x: Dict[str, Any]):
+        ts = x.get("last_watched", "")
+        try:
+            dt = datetime.fromisoformat(ts) if ts else datetime.min
+        except ValueError:
+            dt = datetime.min
+        return (x.get("total_duration_seconds", 0), dt)
+
+    history = sorted(load_watch_history(), key=_sort_key, reverse=True)
     frequent: List[Dict[str, Any]] = []
     for entry in history[:3]:
         url    = entry.get("url")
