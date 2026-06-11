@@ -41,6 +41,7 @@ _check_external_tools()
 import re
 import lzma
 import json
+import argparse
 from pathlib import Path
 from collections import defaultdict
 from typing import List, Dict, Any, Optional
@@ -329,6 +330,7 @@ def run_mpv_with_logging(mpv_args: List[str], channel_name: str) -> subprocess.C
 # --- Global State ---
 SCHEDULED_TASKS = []  # List of scheduled playback/recording tasks
 SCHEDULED_TASKS_LOCK = threading.Lock()  # Protects SCHEDULED_TASKS from concurrent access
+DATA_LOCK = threading.RLock()  # Protects channels_global / epg_global during EPG refresh
 channels_global = []  # Global reference to channels (for scheduled task retry logic)
 epg_global = {}  # Global reference to EPG data (for scheduled task retry logic)
 
@@ -386,7 +388,52 @@ def display_scheduled_tasks():
             print()
 
 
-def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: str, show_title: str, provider: str = "Unknown Provider", task_id: int = 0, episode_num: str = "", original_start_time: Optional[datetime] = None):
+def manage_scheduled_tasks():
+    """Interactive menu to cancel pending scheduled tasks."""
+    with SCHEDULED_TASKS_LOCK:
+        tasks = list(SCHEDULED_TASKS)
+
+    if not tasks:
+        print("No scheduled tasks to manage.")
+        return
+
+    now = datetime.now()
+    print("\n" + "="*60)
+    print("MANAGE SCHEDULED TASKS  (enter number to cancel)")
+    print("="*60)
+    for i, task in enumerate(tasks, 1):
+        task_type = task.get("type", "unknown").upper()
+        show_title = task.get("show_title", "Unknown")
+        channel_name = task.get("channel_name", "Unknown")
+        scheduled_time = task.get("scheduled_time")
+        if scheduled_time:
+            minutes_until = max(0, int((scheduled_time - now).total_seconds() / 60))
+            time_str = f"in {minutes_until}m" if minutes_until < 60 else f"in {minutes_until // 60}h {minutes_until % 60}m"
+        else:
+            time_str = "unknown time"
+        print(f"  {i}. [{task_type}] {show_title} on {channel_name} ({time_str})")
+    print("  0. Back")
+
+    raw = input("\nCancel task #: ").strip()
+    if not raw or not raw.isdigit():
+        return
+    idx = int(raw) - 1
+    if idx < 0:
+        return
+    if idx >= len(tasks):
+        print("Invalid selection.")
+        return
+
+    task = tasks[idx]
+    cancel_event = task.get("cancel_event")
+    if cancel_event:
+        cancel_event.set()
+    with SCHEDULED_TASKS_LOCK:
+        SCHEDULED_TASKS[:] = [t for t in SCHEDULED_TASKS if t.get("id") != task.get("id")]
+    print(f"✓ Cancelled: {task.get('show_title', 'task')}")
+
+
+def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: str, show_title: str, provider: str = "Unknown Provider", task_id: int = 0, episode_num: str = "", original_start_time: Optional[datetime] = None, cancel_event: Optional[threading.Event] = None):
     """
     Background task that waits then launches playback with retry logic.
 
@@ -412,13 +459,22 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
     logging.info(f"  Delay: {delay_seconds} seconds ({delay_seconds // 60} minutes)")
     logging.info(f"  Episode: {episode_num}")
 
+    # Snapshot globals once at the start so the task works with a consistent dataset
+    # even if an EPG refresh happens while this thread is running.
+    with DATA_LOCK:
+        _channels = channels_global
+        _epg = epg_global
+
     print(f"\n[SCHEDULED] Playback will start in {delay_seconds // 60} minutes...")
     print(f"[SCHEDULED] Channel: {channel_name} [{provider}]")
     print(f"[SCHEDULED] Show: {show_title}")
     print(f"[SCHEDULED] Will auto-launch when show starts\n")
 
-    # Wait for the scheduled time
-    time.sleep(delay_seconds)
+    # Wait for the scheduled time; cancel_event.wait returns True if cancelled early
+    _evt = cancel_event or threading.Event()
+    if _evt.wait(timeout=delay_seconds):
+        logging.info(f"Playback task cancelled: {show_title}")
+        return
 
     # Remove from scheduled tasks list
     with SCHEDULED_TASKS_LOCK:
@@ -488,10 +544,10 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
     logging.warning(f"Original stream failed after 2 attempts, searching for alternatives")
     print(f"\n[PLAYBACK] Original stream failed, searching for alternative providers...")
 
-    if episode_num and original_start_time and channels_global and epg_global:
+    if episode_num and original_start_time and _channels and _epg:
         alternatives = find_alternative_streams(
-            channels_global,
-            epg_global,
+            _channels,
+            _epg,
             show_title,
             episode_num,
             original_start_time,
@@ -546,10 +602,10 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
     logging.warning(f"All streams failed, searching for future reruns")
     print(f"\n[PLAYBACK] All streams failed, searching for future reruns...")
 
-    if episode_num and channels_global and epg_global:
+    if episode_num and _channels and _epg:
         reruns = find_future_reruns(
-            channels_global,
-            epg_global,
+            _channels,
+            _epg,
             show_title,
             episode_num,
             hours_ahead=24
@@ -572,6 +628,7 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
             # Schedule new playback
             new_task_id = int(time.time() * 1000)
             new_delay = minutes_until * 60
+            new_cancel_event = threading.Event()
 
             with SCHEDULED_TASKS_LOCK:
                 SCHEDULED_TASKS.append({
@@ -580,12 +637,13 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
                     "channel_name": next_name,
                     "provider": next_provider,
                     "show_title": show_title,
-                    "scheduled_time": datetime.now() + timedelta(seconds=new_delay)
+                    "scheduled_time": datetime.now() + timedelta(seconds=new_delay),
+                    "cancel_event": new_cancel_event,
                 })
 
             thread = threading.Thread(
                 target=scheduled_playback_task,
-                args=(next_url, new_delay, next_name, show_title, next_provider, new_task_id, episode_num, next_start),
+                args=(next_url, new_delay, next_name, show_title, next_provider, new_task_id, episode_num, next_start, new_cancel_event),
                 daemon=True
             )
             thread.start()
@@ -600,7 +658,7 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
     print(f"  All stream URLs failed and no future reruns found in the next 24 hours")
 
 
-def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds: int, channel_name: str, show_title: str, provider: str = "Unknown Provider", extract_subs: bool = True, task_id: int = 0, episode_num: str = "", original_start_time: Optional[datetime] = None):
+def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds: int, channel_name: str, show_title: str, provider: str = "Unknown Provider", extract_subs: bool = True, task_id: int = 0, episode_num: str = "", original_start_time: Optional[datetime] = None, cancel_event: Optional[threading.Event] = None):
     """
     Background task that waits then starts recording with retry logic.
 
@@ -628,14 +686,21 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
     logging.info(f"  Delay: {delay_seconds} seconds ({delay_seconds // 60} minutes)")
     logging.info(f"  Episode: {episode_num}")
 
+    with DATA_LOCK:
+        _channels = channels_global
+        _epg = epg_global
+
     print(f"\n[SCHEDULED] Recording will start in {delay_seconds // 60} minutes...")
     print(f"[SCHEDULED] Channel: {channel_name} [{provider}]")
     print(f"[SCHEDULED] Show: {show_title}")
     print(f"[SCHEDULED] Output: {output_path}")
     print(f"[SCHEDULED] Press Ctrl+C in mpv window to stop recording\n")
 
-    # Wait for the scheduled time
-    time.sleep(delay_seconds)
+    # Wait for the scheduled time; cancel_event.wait returns True if cancelled early
+    _evt = cancel_event or threading.Event()
+    if _evt.wait(timeout=delay_seconds):
+        logging.info(f"Recording task cancelled: {show_title}")
+        return
 
     # Remove from scheduled tasks list
     with SCHEDULED_TASKS_LOCK:
@@ -716,10 +781,10 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
     logging.warning(f"Original stream failed after 2 attempts, searching for alternatives")
     print(f"\n[RECORDING] Original stream failed, searching for alternative providers...")
 
-    if episode_num and original_start_time and channels_global and epg_global:
+    if episode_num and original_start_time and _channels and _epg:
         alternatives = find_alternative_streams(
-            channels_global,
-            epg_global,
+            _channels,
+            _epg,
             show_title,
             episode_num,
             original_start_time,
@@ -784,10 +849,10 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
     logging.warning(f"All streams failed, searching for future reruns")
     print(f"\n[RECORDING] All streams failed, searching for future reruns...")
 
-    if episode_num and channels_global and epg_global:
+    if episode_num and _channels and _epg:
         reruns = find_future_reruns(
-            channels_global,
-            epg_global,
+            _channels,
+            _epg,
             show_title,
             episode_num,
             hours_ahead=24
@@ -810,6 +875,7 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
             # Schedule new recording
             new_task_id = int(time.time() * 1000)
             new_delay = minutes_until * 60
+            new_cancel_event = threading.Event()
 
             with SCHEDULED_TASKS_LOCK:
                 SCHEDULED_TASKS.append({
@@ -818,12 +884,13 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
                     "channel_name": next_name,
                     "provider": next_provider,
                     "show_title": show_title,
-                    "scheduled_time": datetime.now() + timedelta(seconds=new_delay)
+                    "scheduled_time": datetime.now() + timedelta(seconds=new_delay),
+                    "cancel_event": new_cancel_event,
                 })
 
             thread = threading.Thread(
                 target=scheduled_recording_task,
-                args=(next_url, output_path, new_delay, next_name, show_title, next_provider, extract_subs, new_task_id, episode_num, next_start),
+                args=(next_url, output_path, new_delay, next_name, show_title, next_provider, extract_subs, new_task_id, episode_num, next_start, new_cancel_event),
                 daemon=True
             )
             thread.start()
@@ -921,6 +988,7 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
 
         # Generate unique task ID
         task_id = int(time.time() * 1000)  # Millisecond timestamp
+        cancel_event = threading.Event()
 
         # Add to scheduled tasks list
         scheduled_time = datetime.now() + timedelta(seconds=delay_seconds)
@@ -931,12 +999,13 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
                 "channel_name": channel_name,
                 "provider": provider,
                 "show_title": show_title,
-                "scheduled_time": scheduled_time
+                "scheduled_time": scheduled_time,
+                "cancel_event": cancel_event,
             })
 
         thread = threading.Thread(
             target=scheduled_recording_task,
-            args=(channel_url, output_path, delay_seconds, channel_name, show_title, provider, True, task_id, episode_num, start_time),
+            args=(channel_url, output_path, delay_seconds, channel_name, show_title, provider, True, task_id, episode_num, start_time, cancel_event),
             daemon=True
         )
         thread.start()
@@ -1153,6 +1222,12 @@ def main():
     """Main application entry point."""
     global channels_global, epg_global
 
+    parser = argparse.ArgumentParser(description="Term-TV: CLI IPTV player")
+    parser.add_argument("--playlist", type=int, metavar="N", help="Auto-select playlist N (1-based, skips menu)")
+    parser.add_argument("--skip-vpn", action="store_true", help="Skip VPN check")
+    parser.add_argument("--search", metavar="QUERY", help="Jump directly to show search on startup")
+    args = parser.parse_args()
+
     # --- Logging Setup ---
     setup_logging()
     logging.info("Starting main application")
@@ -1195,6 +1270,13 @@ def main():
         # Auto-select if only one playlist
         chosen_playlist = playlists[0]
         print(f"Loading: {chosen_playlist['name']}")
+    elif args.playlist is not None:
+        index = args.playlist - 1
+        if not (0 <= index < len(playlists)):
+            print(f"Error: --playlist {args.playlist} is out of range (1-{len(playlists)}).", file=sys.stderr)
+            sys.exit(1)
+        chosen_playlist = playlists[index]
+        print(f"Loading: {chosen_playlist['name']}")
     else:
         # Show selection menu for multiple playlists
         print("Available Playlists:")
@@ -1209,7 +1291,6 @@ def main():
         ).strip()
 
         if not selection:
-            # Empty input after timeout - use default
             selection = "1"
 
         if not selection.isdigit():
@@ -1225,7 +1306,7 @@ def main():
         print(f"\nLoading: {chosen_playlist['name']}")
 
     # --- VPN Check ---
-    if not check_vpn_status(expected_vpn_ip):
+    if not args.skip_vpn and not check_vpn_status(expected_vpn_ip):
         sys.exit(0)
 
     # --- Data Loading ---
@@ -1238,8 +1319,8 @@ def main():
     logging.info(f"Loaded {len(channels)} channels")
     print(f"Loaded {len(channels)} channels.")
 
-    # Store in global for scheduled tasks
-    channels_global = channels
+    with DATA_LOCK:
+        channels_global = channels
 
     epg = {}
     if chosen_playlist.get("epg_url"):
@@ -1254,8 +1335,11 @@ def main():
             print("⚠ EPG unavailable - continuing without program guide data.")
             print("  (Show search and EPG features will be limited)\n")
 
-    # Store in global for scheduled tasks
-    epg_global = epg
+    with DATA_LOCK:
+        epg_global = epg
+
+    # If --search was passed, run the search once before entering the loop
+    _startup_search = args.search
 
     # --- Main Interaction Loop ---
     while True:
@@ -1281,9 +1365,14 @@ def main():
         print("  s: Search for show/movie")
         print("  c: Search for channel")
         print("  epg: Refresh EPG data")
+        if SCHEDULED_TASKS:
+            print("  t: Manage scheduled tasks")
         print("  quit: Exit")
 
-        choice = input("\nYour choice (default: s): ").strip().lower()
+        if _startup_search:
+            choice = 's'
+        else:
+            choice = input("\nYour choice (default: s): ").strip().lower()
 
         if not choice:
             choice = 's'
@@ -1291,12 +1380,17 @@ def main():
         if choice in ("quit", "exit"):
             break
 
+        if choice == "t":
+            manage_scheduled_tasks()
+            continue
+
         # Refresh EPG
         if choice == "epg":
             if chosen_playlist.get("epg_url"):
                 print("\nRefreshing EPG data...")
                 epg = load_epg(chosen_playlist["epg_url"])
-                epg_global = epg  # Update global for scheduled tasks
+                with DATA_LOCK:
+                    epg_global = epg
                 if epg:
                     logging.info(f"EPG refreshed and global state updated")
                     print(f"✓ Refreshed EPG for {len(epg)} channels.")
@@ -1320,18 +1414,23 @@ def main():
 
         # Show search
         if choice == 's':
-            # Load and display recent searches
-            recent_searches = load_search_history()
+            if _startup_search:
+                query_input = _startup_search
+                _startup_search = None  # only auto-run once
+                print(f"Auto-searching: '{query_input}'")
+            else:
+                # Load and display recent searches
+                recent_searches = load_search_history()
 
-            if recent_searches:
-                print("\nRecent searches:")
-                for i, search in enumerate(recent_searches, 1):
-                    print(f"  {i}. {search}")
-                print("\nEnter a number to repeat a search, or type a new search term")
+                if recent_searches:
+                    print("\nRecent searches:")
+                    for i, search in enumerate(recent_searches, 1):
+                        print(f"  {i}. {search}")
+                    print("\nEnter a number to repeat a search, or type a new search term")
 
-            query_input = input("Search for a show/movie: ").strip()
-            if not query_input:
-                continue
+                query_input = input("Search for a show/movie: ").strip()
+                if not query_input:
+                    continue
 
             # Check if user selected a recent search
             if query_input.isdigit() and recent_searches:
@@ -1412,6 +1511,7 @@ def main():
 
                             # Generate unique task ID
                             task_id = int(time.time() * 1000)  # Millisecond timestamp
+                            cancel_event = threading.Event()
 
                             # Add to scheduled tasks list
                             scheduled_time = datetime.now() + timedelta(seconds=delay_seconds)
@@ -1422,12 +1522,13 @@ def main():
                                     "channel_name": channel_name,
                                     "provider": provider,
                                     "show_title": show_title,
-                                    "scheduled_time": scheduled_time
+                                    "scheduled_time": scheduled_time,
+                                    "cancel_event": cancel_event,
                                 })
 
                             thread = threading.Thread(
                                 target=scheduled_playback_task,
-                                args=(channel_url, delay_seconds, channel_name, show_title, provider, task_id, episode_num, start_time),
+                                args=(channel_url, delay_seconds, channel_name, show_title, provider, task_id, episode_num, start_time, cancel_event),
                                 daemon=True
                             )
                             thread.start()
@@ -1457,6 +1558,7 @@ def main():
 
                             # Generate unique task ID
                             task_id = int(time.time() * 1000)  # Millisecond timestamp
+                            cancel_event = threading.Event()
 
                             # Add to scheduled tasks list
                             scheduled_time = datetime.now() + timedelta(seconds=delay_seconds)
@@ -1467,12 +1569,13 @@ def main():
                                     "channel_name": channel_name,
                                     "provider": provider,
                                     "show_title": show_title,
-                                    "scheduled_time": scheduled_time
+                                    "scheduled_time": scheduled_time,
+                                    "cancel_event": cancel_event,
                                 })
 
                             thread = threading.Thread(
                                 target=scheduled_recording_task,
-                                args=(channel_url, output_path, delay_seconds, channel_name, show_title, provider, True, task_id, episode_num, start_time),
+                                args=(channel_url, output_path, delay_seconds, channel_name, show_title, provider, True, task_id, episode_num, start_time, cancel_event),
                                 daemon=True
                             )
                             thread.start()
