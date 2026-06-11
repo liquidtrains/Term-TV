@@ -165,12 +165,17 @@ def input_with_countdown(prompt: str, timeout: int = 15, default: str = "") -> s
             time.sleep(0.1)
 
     else:
-        print(f"{prompt} [{timeout}s] ", end="", flush=True)
-        readable, _, _ = select.select([sys.stdin], [], [], timeout)
-        if readable:
-            return sys.stdin.readline().strip()
-        print(f"(auto-selecting: {default})")
-        return default
+        deadline = time.time() + timeout
+        while True:
+            remaining = max(0, int(deadline - time.time()))
+            print(f"\r{prompt} [{remaining}s] ", end="", flush=True)
+            if remaining == 0:
+                print(f"(auto-selecting: {default})")
+                return default
+            r, _, _ = select.select([sys.stdin], [], [], min(1.0, deadline - time.time()))
+            if r:
+                print()
+                return sys.stdin.readline().strip()
 
 # ---------------------------------------------------------------------------
 # Networking helpers

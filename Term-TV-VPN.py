@@ -328,7 +328,7 @@ def display_scheduled_tasks():
     print("SCHEDULED TASKS:")
     print("="*80)
 
-    now = datetime.now()
+    now = datetime.now().astimezone()
 
     for task in tasks_snapshot:
         task_type = task.get("type", "unknown")
@@ -906,7 +906,7 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         task_id = int(time.time() * 1000)  # Millisecond timestamp
 
         # Add to scheduled tasks list
-        scheduled_time = datetime.now() + timedelta(seconds=delay_seconds)
+        scheduled_time = datetime.now().astimezone() + timedelta(seconds=delay_seconds)
         with SCHEDULED_TASKS_LOCK:
             SCHEDULED_TASKS.append({
                 "id": task_id,
@@ -1046,7 +1046,7 @@ def select_from_show_results(results: List[ShowResult]) -> Optional[ShowResult]:
         channel_name = result["channel"].get("name", "Unknown")
         title = result["title"]
         time_status = result["time_status"]
-        start_time = result["start_time"].strftime("%I:%M %p")
+        start_time = result["start_time"].strftime("%I:%M %p") if result.get("start_time") else "?"
         is_playing = result.get("is_playing_now", False)
         is_new = result.get("is_new", False)
         episode_num = result.get("episode_num", "")
@@ -1063,6 +1063,12 @@ def select_from_show_results(results: List[ShowResult]) -> Optional[ShowResult]:
 
         if is_playing:
             display_parts.append(" ◄◄◄")
+
+        stop_time = result.get("stop_time")
+        if stop_time and result.get("start_time"):
+            end_str = stop_time.strftime("%I:%M %p")
+            dur = int((stop_time - result["start_time"]).total_seconds() / 60)
+            display_parts.append(f"  → {end_str} ({dur}m)")
 
         print("".join(display_parts))
 
@@ -2018,7 +2024,7 @@ def main():
                             task_id = int(time.time() * 1000)  # Millisecond timestamp
 
                             # Add to scheduled tasks list
-                            scheduled_time = datetime.now() + timedelta(seconds=delay_seconds)
+                            scheduled_time = datetime.now().astimezone() + timedelta(seconds=delay_seconds)
                             with SCHEDULED_TASKS_LOCK:
                                 SCHEDULED_TASKS.append({
                                     "id": task_id,
@@ -2065,7 +2071,7 @@ def main():
                             task_id = int(time.time() * 1000)  # Millisecond timestamp
 
                             # Add to scheduled tasks list
-                            scheduled_time = datetime.now() + timedelta(seconds=delay_seconds)
+                            scheduled_time = datetime.now().astimezone() + timedelta(seconds=delay_seconds)
                             with SCHEDULED_TASKS_LOCK:
                                 SCHEDULED_TASKS.append({
                                     "id": task_id,

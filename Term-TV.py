@@ -75,6 +75,7 @@ from lib.term_tv_core import (
 CONFIG_FILE = Path("config.json")
 LOG_FILE = Path("term-tv.log")
 MPV_LOG_FILE = Path("mpv-output.log")
+RECORDINGS_LOG_FILE = Path("recordings.log")
 MPV_LOG_ARCHIVE_DIR = Path("mpv-log-archive")
 MPV_LOG_CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB per chunk
 
@@ -185,7 +186,7 @@ def archive_mpv_log():
         print(f"MPV log archive: Deleted {deleted} archive(s) older than 1 year.")
 
 
-def log_mpv_output(channel_name: str, command: List[str], stdout: str = "", stderr: str = "", returncode: Optional[int] = None):
+def log_mpv_output(channel_name: str, command: List[str], stdout: str = "", stderr: str = "", returncode: Optional[int] = None, log_path: Optional[Path] = None):
     """
     Logs mpv console output to the dedicated mpv log file.
 
@@ -197,7 +198,7 @@ def log_mpv_output(channel_name: str, command: List[str], stdout: str = "", stde
         returncode: Exit code from mpv process
     """
     try:
-        with open(MPV_LOG_FILE, 'a', encoding='utf-8') as f:
+        with open(log_path or MPV_LOG_FILE, 'a', encoding='utf-8') as f:
             # Write header with timestamp
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             f.write(f"\n{'='*80}\n")
@@ -224,7 +225,7 @@ def log_mpv_output(channel_name: str, command: List[str], stdout: str = "", stde
     except Exception as e:
         logging.warning(f"Failed to write mpv output to log: {e}")
 
-def run_mpv_with_logging(mpv_args: List[str], channel_name: str) -> subprocess.CompletedProcess:
+def run_mpv_with_logging(mpv_args: List[str], channel_name: str, log_path: Optional[Path] = None) -> subprocess.CompletedProcess:
     """
     Runs mpv with output displayed in terminal AND logged to file.
 
@@ -240,7 +241,7 @@ def run_mpv_with_logging(mpv_args: List[str], channel_name: str) -> subprocess.C
     log_file = None
     try:
         try:
-            log_file = open(MPV_LOG_FILE, 'a', encoding='utf-8')
+            log_file = open(log_path or MPV_LOG_FILE, 'a', encoding='utf-8')
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             log_file.write(f"\n{'='*80}\n")
             log_file.write(f"[{timestamp}] Channel: {channel_name}\n")
@@ -350,7 +351,7 @@ def display_scheduled_tasks():
     print("SCHEDULED TASKS:")
     print("="*80)
 
-    now = datetime.now()
+    now = datetime.now().astimezone()
 
     for task in tasks_snapshot:
         task_type = task.get("type", "unknown")
@@ -400,7 +401,7 @@ def manage_scheduled_tasks():
         print("No scheduled tasks to manage.")
         return
 
-    now = datetime.now()
+    now = datetime.now().astimezone()
     print("\n" + "="*60)
     print("MANAGE SCHEDULED TASKS  (enter number to cancel)")
     print("="*60)
@@ -752,6 +753,7 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
                 channel_name=f"{channel_name} [{provider}] - {show_title} (recording)",
                 command=mpv_cmd,
                 stdout=stdout,
+                log_path=RECORDINGS_LOG_FILE,
                 stderr=stderr,
                 returncode=returncode
             )
@@ -834,6 +836,7 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
                     channel_name=f"{alt_name} [{alt_provider}] - {show_title} (recording alternative)",
                     command=mpv_cmd,
                     stdout=stdout,
+                    log_path=RECORDINGS_LOG_FILE,
                     stderr=stderr,
                     returncode=returncode
                 )
@@ -1000,7 +1003,7 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         cancel_event = threading.Event()
 
         # Add to scheduled tasks list
-        scheduled_time = datetime.now() + timedelta(seconds=delay_seconds)
+        scheduled_time = datetime.now().astimezone() + timedelta(seconds=delay_seconds)
         with SCHEDULED_TASKS_LOCK:
             SCHEDULED_TASKS.append({
                 "id": task_id,
@@ -1076,7 +1079,8 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         # Run mpv (blocks until player exits or fails to connect)
         # If mpv hangs connecting to stream, press Ctrl+C to cancel
         logging.info("Starting mpv subprocess...")
-        result = run_mpv_with_logging(mpv_args, f"{channel_name} [{provider}]")
+        result = run_mpv_with_logging(mpv_args, f"{channel_name} [{provider}]",
+                                      log_path=RECORDINGS_LOG_FILE if record_choice == 'r' else None)
         logging.info(f"mpv exited with return code: {result.returncode}")
 
         # Check if mpv exited with an error
@@ -1151,6 +1155,12 @@ def select_from_show_results(results: List[ShowResult]) -> Optional[ShowResult]:
 
         if is_playing:
             display_parts.append(" ◄◄◄")
+
+        stop_time = result.get("stop_time")
+        if stop_time and result.get("start_time"):
+            end_str = stop_time.strftime("%I:%M %p")
+            dur = int((stop_time - result["start_time"]).total_seconds() / 60)
+            display_parts.append(f"  → {end_str} ({dur}m)")
 
         print("".join(display_parts))
 
@@ -1392,7 +1402,10 @@ def main():
             break
 
         if choice == "t":
-            manage_scheduled_tasks()
+            if not SCHEDULED_TASKS:
+                print("No scheduled tasks.")
+            else:
+                manage_scheduled_tasks()
             continue
 
         # Switch playlist
@@ -1561,7 +1574,7 @@ def main():
                             cancel_event = threading.Event()
 
                             # Add to scheduled tasks list
-                            scheduled_time = datetime.now() + timedelta(seconds=delay_seconds)
+                            scheduled_time = datetime.now().astimezone() + timedelta(seconds=delay_seconds)
                             with SCHEDULED_TASKS_LOCK:
                                 SCHEDULED_TASKS.append({
                                     "id": task_id,
@@ -1610,7 +1623,7 @@ def main():
                             cancel_event = threading.Event()
 
                             # Add to scheduled tasks list
-                            scheduled_time = datetime.now() + timedelta(seconds=delay_seconds)
+                            scheduled_time = datetime.now().astimezone() + timedelta(seconds=delay_seconds)
                             with SCHEDULED_TASKS_LOCK:
                                 SCHEDULED_TASKS.append({
                                     "id": task_id,
