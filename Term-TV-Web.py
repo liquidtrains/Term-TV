@@ -84,7 +84,7 @@ _VOD_GRP_RE = re.compile(
 )
 
 WEB_HOST = "127.0.0.1"
-WEB_PORT = 8080  # many ranges above 6100 are excluded by Windows Hyper-V; 8080 is safe
+WEB_PORT = 8891  # 8079-8378 and 8485-8884 are excluded by Hyper-V on this machine; 8885-9080 is safe
 WEB_URL  = f"http://{WEB_HOST}:{WEB_PORT}"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
