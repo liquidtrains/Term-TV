@@ -661,7 +661,7 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
     print(f"  All stream URLs failed and no future reruns found in the next 24 hours")
 
 
-def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds: int, channel_name: str, show_title: str, provider: str = "Unknown Provider", extract_subs: bool = True, task_id: int = 0, episode_num: str = "", original_start_time: Optional[datetime] = None, cancel_event: Optional[threading.Event] = None):
+def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds: int, channel_name: str, show_title: str, provider: str = "Unknown Provider", extract_subs: bool = True, task_id: int = 0, episode_num: str = "", original_start_time: Optional[datetime] = None, duration_seconds: int = 0, cancel_event: Optional[threading.Event] = None):
     """
     Background task that waits then starts recording with retry logic.
 
@@ -727,8 +727,10 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
                 "--stream-lavf-o=timeout=10000000",
                 "--sid=auto",  # Auto-select subtitles at start
                 "--no-sub-visibility",  # Start with subs hidden (user can toggle with 'v')
-                channel_url
             ]
+            if duration_seconds:
+                mpv_cmd.append(f"--length={duration_seconds}")
+            mpv_cmd.append(channel_url)
             proc = subprocess.Popen(
                 mpv_cmd,
                 stdout=subprocess.PIPE,
@@ -810,8 +812,10 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
                     "--stream-lavf-o=timeout=10000000",
                     "--sid=auto",  # Auto-select subtitles at start
                     "--no-sub-visibility",  # Start with subs hidden (user can toggle with 'v')
-                    alt_url
                 ]
+                if duration_seconds:
+                    mpv_cmd.append(f"--length={duration_seconds}")
+                mpv_cmd.append(alt_url)
                 proc = subprocess.Popen(
                     mpv_cmd,
                     stdout=subprocess.PIPE,
@@ -893,7 +897,7 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
 
             thread = threading.Thread(
                 target=scheduled_recording_task,
-                args=(next_url, output_path, new_delay, next_name, show_title, next_provider, extract_subs, new_task_id, episode_num, next_start, new_cancel_event),
+                args=(next_url, output_path, new_delay, next_name, show_title, next_provider, extract_subs, new_task_id, episode_num, next_start, duration_seconds, new_cancel_event),
                 daemon=True
             )
             thread.start()
@@ -981,6 +985,8 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         output_path = RECORDINGS_DIR / filename
 
         print(f"\nRecording will be saved to: {output_path}")
+        duration_cap_input = input("Duration in minutes (Enter for unlimited): ").strip()
+        rec_duration_seconds = int(duration_cap_input) * 60 if duration_cap_input and duration_cap_input.isdigit() else 0
         confirm = input("Schedule this recording? (y/n): ").strip().lower()
 
         if confirm != 'y':
@@ -1008,7 +1014,7 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
 
         thread = threading.Thread(
             target=scheduled_recording_task,
-            args=(channel_url, output_path, delay_seconds, channel_name, show_title, provider, True, task_id, episode_num, start_time, cancel_event),
+            args=(channel_url, output_path, delay_seconds, channel_name, show_title, provider, True, task_id, episode_num, start_time, rec_duration_seconds, cancel_event),
             daemon=True
         )
         thread.start()
@@ -1044,6 +1050,10 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         mpv_args.append(f"--stream-record={output_path}")
         mpv_args.append("--sid=auto")  # Auto-select subtitles at start
         mpv_args.append("--no-sub-visibility")  # Start with subs hidden (toggle with 'v')
+
+        duration_cap = input("Duration in minutes (Enter for unlimited): ").strip()
+        if duration_cap and duration_cap.isdigit():
+            mpv_args.append(f"--length={int(duration_cap) * 60}")
 
         print(f"\n📹 Recording to: {output_path}")
         print("⚠️  WARNING: Do NOT change subtitle tracks during recording or it will stop!")
@@ -1222,6 +1232,7 @@ def main():
     parser.add_argument("--playlist", type=int, metavar="N", help="Auto-select playlist N (1-based, skips menu)")
     parser.add_argument("--skip-vpn", action="store_true", help="Skip VPN check")
     parser.add_argument("--search", metavar="QUERY", help="Jump directly to show search on startup")
+    parser.add_argument("--no-epg", action="store_true", help="Skip EPG loading (channel browsing only)")
     args = parser.parse_args()
 
     # --- Logging Setup ---
@@ -1319,7 +1330,9 @@ def main():
         channels_global = channels
 
     epg = {}
-    if chosen_playlist.get("epg_url"):
+    if args.no_epg:
+        print("EPG skipped (--no-epg) — show search unavailable, channel browsing only.")
+    elif chosen_playlist.get("epg_url"):
         print("\nLoading EPG data...")
         logging.info(f"Loading EPG from {chosen_playlist['epg_url']}")
         epg = load_epg(chosen_playlist["epg_url"])
@@ -1361,6 +1374,8 @@ def main():
         print("  s: Search for show/movie")
         print("  c: Search for channel")
         print("  epg: Refresh EPG data")
+        if len(playlists) > 1:
+            print("  pl: Switch playlist")
         if SCHEDULED_TASKS:
             print("  t: Manage scheduled tasks")
         print("  quit: Exit")
@@ -1378,6 +1393,39 @@ def main():
 
         if choice == "t":
             manage_scheduled_tasks()
+            continue
+
+        # Switch playlist
+        if choice == "pl":
+            print("\nAvailable Playlists:")
+            for i, pl_item in enumerate(playlists, 1):
+                marker = " (current)" if pl_item is chosen_playlist else ""
+                print(f"  {i}. {pl_item['name']}{marker}")
+            pl_sel = input(f"Select playlist (1-{len(playlists)}): ").strip()
+            if pl_sel.isdigit():
+                pl_idx = int(pl_sel) - 1
+                if 0 <= pl_idx < len(playlists):
+                    chosen_playlist = playlists[pl_idx]
+                    print(f"\nSwitching to: {chosen_playlist['name']}")
+                    channels = load_m3u_cached(chosen_playlist["m3u_url"])
+                    if not channels:
+                        print("Could not load channels.", file=sys.stderr)
+                    else:
+                        with DATA_LOCK:
+                            channels_global = channels
+                        epg = {}
+                        if not args.no_epg and chosen_playlist.get("epg_url"):
+                            print("Loading EPG data...")
+                            epg = load_epg(chosen_playlist["epg_url"])
+                            if epg:
+                                print(f"✓ Loaded EPG for {len(epg)} channels.")
+                            else:
+                                print("⚠ EPG unavailable.")
+                        with DATA_LOCK:
+                            epg_global = epg
+                        print(f"✓ Switched to {chosen_playlist['name']} ({len(channels)} channels)")
+                else:
+                    print("Invalid selection.", file=sys.stderr)
             continue
 
         # Refresh EPG
@@ -1445,8 +1493,11 @@ def main():
             if hours_input and hours_input.isdigit():
                 hours_ahead = max(1, min(int(hours_input), 9))
 
+            groups_input = input("Filter by group (comma-separated, Enter for all): ").strip()
+            groups_filter = {g.strip() for g in groups_input.split(",") if g.strip()} if groups_input else None
+
             print(f"\nSearching for '{query}' in the next {hours_ahead} hour(s)...")
-            results = search_shows_in_timeframe(channels, epg, query, hours_ahead)
+            results = search_shows_in_timeframe(channels, epg, query, hours_ahead, groups=groups_filter)
 
             if not results:
                 print("No shows found matching your search in the specified timeframe.")
@@ -1547,6 +1598,8 @@ def main():
                         output_path = RECORDINGS_DIR / filename
 
                         print(f"\nRecording will be saved to: {output_path}")
+                        future_dur_input = input("Duration in minutes (Enter for unlimited): ").strip()
+                        future_rec_duration = int(future_dur_input) * 60 if future_dur_input and future_dur_input.isdigit() else 0
                         confirm = input("Schedule this recording? (y/n): ").strip().lower()
 
                         if confirm == 'y':
@@ -1571,7 +1624,7 @@ def main():
 
                             thread = threading.Thread(
                                 target=scheduled_recording_task,
-                                args=(channel_url, output_path, delay_seconds, channel_name, show_title, provider, True, task_id, episode_num, start_time, cancel_event),
+                                args=(channel_url, output_path, delay_seconds, channel_name, show_title, provider, True, task_id, episode_num, start_time, future_rec_duration, cancel_event),
                                 daemon=True
                             )
                             thread.start()

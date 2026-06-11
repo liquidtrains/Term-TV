@@ -562,8 +562,12 @@ def search_shows_in_timeframe(
     epg: EpgData,
     query: str,
     hours_ahead: int = 3,
+    groups: Optional[set] = None,
 ) -> List[ShowResult]:
-    """Search for shows matching *query* that are on now or start within *hours_ahead* hours."""
+    """Search for shows matching *query* that are on now or start within *hours_ahead* hours.
+
+    groups: optional set of group-title strings to restrict results to.
+    """
     q = query.lower()
     now = datetime.now().astimezone()
     cutoff = now + timedelta(hours=hours_ahead)
@@ -588,6 +592,8 @@ def search_shows_in_timeframe(
             minutes_until = int((start_time - now).total_seconds() / 60)
             air_date = prog.get("air_date", "")
             for ch in tvg_map[channel_id]:
+                if groups and ch.get("group-title") not in groups:
+                    continue
                 results.append({
                     "channel":      ch,
                     "title":        title,
