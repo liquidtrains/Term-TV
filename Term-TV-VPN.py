@@ -64,6 +64,12 @@ MPV_LOG_FILE = Path("mpv-output.log")
 MPV_LOG_ARCHIVE_DIR = Path("mpv-log-archive")
 MPV_LOG_CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB per chunk
 
+# --- Shared global state (for scheduled background tasks) ---
+SCHEDULED_TASKS: list = []
+SCHEDULED_TASKS_LOCK = threading.Lock()
+channels_global: list = []
+epg_global: dict = {}
+
 # --- Logging Configuration ---
 def setup_logging():
     """Configure logging to both file and console with detailed formatting."""
@@ -368,6 +374,50 @@ def display_scheduled_tasks():
             print(f"   Channel: {channel_name} [{provider}]")
             print()
 
+
+def manage_scheduled_tasks():
+    """Interactive menu to cancel pending scheduled tasks."""
+    with SCHEDULED_TASKS_LOCK:
+        tasks = list(SCHEDULED_TASKS)
+
+    if not tasks:
+        print("No scheduled tasks to manage.")
+        return
+
+    now = datetime.now()
+    print("\n" + "="*60)
+    print("MANAGE SCHEDULED TASKS  (enter number to cancel)")
+    print("="*60)
+    for i, task in enumerate(tasks, 1):
+        task_type = task.get("type", "unknown").upper()
+        show_title = task.get("show_title", "Unknown")
+        channel_name = task.get("channel_name", "Unknown")
+        scheduled_time = task.get("scheduled_time")
+        if scheduled_time:
+            minutes_until = max(0, int((scheduled_time - now).total_seconds() / 60))
+            time_str = f"in {minutes_until}m" if minutes_until < 60 else f"in {minutes_until // 60}h {minutes_until % 60}m"
+        else:
+            time_str = "unknown time"
+        print(f"  {i}. [{task_type}] {show_title} on {channel_name} ({time_str})")
+    print("  0. Back")
+
+    raw = input("\nCancel task #: ").strip()
+    if not raw or not raw.isdigit():
+        return
+    idx = int(raw) - 1
+    if idx < 0:
+        return
+    if idx >= len(tasks):
+        print("Invalid selection.")
+        return
+
+    task = tasks[idx]
+    cancel_event = task.get("cancel_event")
+    if cancel_event:
+        cancel_event.set()
+    with SCHEDULED_TASKS_LOCK:
+        SCHEDULED_TASKS[:] = [t for t in SCHEDULED_TASKS if t.get("id") != task.get("id")]
+    print(f"✓ Cancelled: {task.get('show_title', 'task')}")
 
 
 def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: str, show_title: str, provider: str = "Unknown Provider", task_id: int = 0, episode_num: str = "", original_start_time: Optional[datetime] = None):
@@ -1018,22 +1068,21 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         print(f"\nError launching mpv: {e}", file=sys.stderr)
         return
     finally:
-        # Calculate duration (only for watch-only sessions)
-        if record_choice == 'w':
+        # Log watch history for both watch and record sessions
+        if record_choice in ('w', 'r'):
             end_time = datetime.now()
             duration = (end_time - start_time).total_seconds()
 
-            logging.info(f"Watch session duration: {duration:.1f} seconds")
+            logging.info(f"Session duration: {duration:.1f} seconds (mode={record_choice})")
 
-            # Log the watch (only counts if >= 2 minutes)
-            if duration >= 2:  # At least 2 seconds to avoid instant failures
+            if duration >= 2:
                 log_channel_watch(channel, int(duration))
 
                 if duration >= 120:
-                    logging.info(f"Watch session logged: {int(duration // 60)} minutes")
+                    logging.info(f"Session logged: {int(duration // 60)} minutes")
                     print(f"\nWatched for {int(duration // 60)} minutes - session logged!")
                 else:
-                    logging.debug(f"Watch session too short to log: {int(duration)} seconds")
+                    logging.debug(f"Session too short to log: {int(duration)} seconds")
                     print(f"\nWatched for {int(duration)} seconds (need 2 min to log frequency)")
 
 
@@ -1845,19 +1894,24 @@ def main():
             s_end = len(frequent) + len(search_now_playing)
             label = str(s_start) if s_start == s_end else f"{s_start}-{s_end}"
             print(f"  {label}: Watch from recent searches")
-        print("  s: Search for show/movie")
+        if not args.no_epg:
+            print("  s: Search for show/movie")
         print("  c: Search for channel")
-        print("  epg: Refresh EPG data")
+        if not args.no_epg:
+            print("  epg: Refresh EPG data")
         if len(playlists) > 1:
             print("  pl: Switch playlist")
+        if SCHEDULED_TASKS:
+            print("  t: Manage scheduled tasks")
         vpn_label = "Connected" if vpn_is_connected() else "Disconnected"
         print(f"  vpn: VPN status/toggle [{vpn_label}]")
         print("  quit: Exit")
 
-        choice = input("\nYour choice (default: s): ").strip().lower()
+        default_choice = 'c' if args.no_epg else 's'
+        choice = input(f"\nYour choice (default: {default_choice}): ").strip().lower()
 
         if not choice:
-            choice = 's'
+            choice = default_choice
 
         if choice in ("quit", "exit"):
             break
@@ -1865,6 +1919,11 @@ def main():
         # VPN toggle
         if choice == "vpn":
             toggle_vpn_menu()
+            continue
+
+        # Task cancellation
+        if choice == "t":
+            manage_scheduled_tasks()
             continue
 
         # Switch playlist
@@ -1877,33 +1936,38 @@ def main():
             if pl_sel.isdigit():
                 pl_idx = int(pl_sel) - 1
                 if 0 <= pl_idx < len(playlists):
-                    chosen_playlist = playlists[pl_idx]
-                    print(f"\nSwitching to: {chosen_playlist['name']}")
-                    channels = load_m3u_cached(chosen_playlist["m3u_url"])
-                    if not channels:
-                        print("Could not load channels.", file=sys.stderr)
+                    if playlists[pl_idx] is chosen_playlist:
+                        print("Already on this playlist.")
                     else:
-                        channels_global = channels
-                        epg = {}
-                        if not args.no_epg and chosen_playlist.get("epg_url"):
-                            print("Loading EPG data...")
-                            epg = load_epg(chosen_playlist["epg_url"])
-                            if epg:
-                                print(f"✓ Loaded EPG for {len(epg)} channels.")
-                            else:
-                                print("⚠ EPG unavailable.")
-                        epg_global = epg
-                        print(f"✓ Switched to {chosen_playlist['name']} ({len(channels)} channels)")
+                        chosen_playlist = playlists[pl_idx]
+                        print(f"\nSwitching to: {chosen_playlist['name']}")
+                        channels = load_m3u_cached(chosen_playlist["m3u_url"])
+                        if not channels:
+                            print("Could not load channels.", file=sys.stderr)
+                        else:
+                            channels_global = channels
+                            epg = {}
+                            if not args.no_epg and chosen_playlist.get("epg_url"):
+                                print("Loading EPG data...")
+                                epg = load_epg(chosen_playlist["epg_url"])
+                                if epg:
+                                    print(f"✓ Loaded EPG for {len(epg)} channels.")
+                                else:
+                                    print("⚠ EPG unavailable.")
+                            epg_global = epg
+                            print(f"✓ Switched to {chosen_playlist['name']} ({len(channels)} channels)")
                 else:
                     print("Invalid selection.", file=sys.stderr)
             continue
 
         # Refresh EPG
         if choice == "epg":
-            if chosen_playlist.get("epg_url"):
+            if args.no_epg:
+                print("EPG is disabled (--no-epg). Restart without this flag to load guide data.")
+            elif chosen_playlist.get("epg_url"):
                 print("\nRefreshing EPG data...")
                 epg = load_epg(chosen_playlist["epg_url"])
-                epg_global = epg  # Update global for scheduled tasks
+                epg_global = epg
                 if epg:
                     logging.info(f"EPG refreshed and global state updated")
                     print(f"✓ Refreshed EPG for {len(epg)} channels.")

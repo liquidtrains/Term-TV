@@ -1418,32 +1418,37 @@ def main():
             if pl_sel.isdigit():
                 pl_idx = int(pl_sel) - 1
                 if 0 <= pl_idx < len(playlists):
-                    chosen_playlist = playlists[pl_idx]
-                    print(f"\nSwitching to: {chosen_playlist['name']}")
-                    channels = load_m3u_cached(chosen_playlist["m3u_url"])
-                    if not channels:
-                        print("Could not load channels.", file=sys.stderr)
+                    if playlists[pl_idx] is chosen_playlist:
+                        print("Already on this playlist.")
                     else:
-                        with DATA_LOCK:
-                            channels_global = channels
-                        epg = {}
-                        if not args.no_epg and chosen_playlist.get("epg_url"):
-                            print("Loading EPG data...")
-                            epg = load_epg(chosen_playlist["epg_url"])
-                            if epg:
-                                print(f"✓ Loaded EPG for {len(epg)} channels.")
-                            else:
-                                print("⚠ EPG unavailable.")
-                        with DATA_LOCK:
-                            epg_global = epg
-                        print(f"✓ Switched to {chosen_playlist['name']} ({len(channels)} channels)")
+                        chosen_playlist = playlists[pl_idx]
+                        print(f"\nSwitching to: {chosen_playlist['name']}")
+                        channels = load_m3u_cached(chosen_playlist["m3u_url"])
+                        if not channels:
+                            print("Could not load channels.", file=sys.stderr)
+                        else:
+                            with DATA_LOCK:
+                                channels_global = channels
+                            epg = {}
+                            if not args.no_epg and chosen_playlist.get("epg_url"):
+                                print("Loading EPG data...")
+                                epg = load_epg(chosen_playlist["epg_url"])
+                                if epg:
+                                    print(f"✓ Loaded EPG for {len(epg)} channels.")
+                                else:
+                                    print("⚠ EPG unavailable.")
+                            with DATA_LOCK:
+                                epg_global = epg
+                            print(f"✓ Switched to {chosen_playlist['name']} ({len(channels)} channels)")
                 else:
                     print("Invalid selection.", file=sys.stderr)
             continue
 
         # Refresh EPG
         if choice == "epg":
-            if chosen_playlist.get("epg_url"):
+            if args.no_epg:
+                print("EPG is disabled (--no-epg). Restart without this flag to load guide data.")
+            elif chosen_playlist.get("epg_url"):
                 print("\nRefreshing EPG data...")
                 epg = load_epg(chosen_playlist["epg_url"])
                 with DATA_LOCK:

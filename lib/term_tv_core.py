@@ -65,13 +65,34 @@ def clean_old_cache_files(max_age_days: int = 15):
             if not file_path.is_file():
                 continue
             try:
+                # Delete .meta sidecars whose data file no longer exists
+                if file_path.suffix == ".meta":
+                    stem = file_path.stem  # e.g. "abc123"
+                    siblings = list(cache_dir.glob(f"{stem}.*"))
+                    has_data = any(s != file_path for s in siblings)
+                    if not has_data:
+                        st = file_path.stat()
+                        file_path.unlink()
+                        total_deleted += 1
+                        total_freed_bytes += st.st_size
+                        logging.info(f"Deleted orphaned meta file: {file_path.name}")
+                    continue
+
                 st = file_path.stat()
                 age_seconds = (now - datetime.fromtimestamp(st.st_mtime)).total_seconds()
                 if age_seconds > max_age_seconds:
+                    # Delete the data file and its .meta sidecar together
+                    meta_file = file_path.with_suffix(".meta")
                     file_path.unlink()
                     total_deleted += 1
                     total_freed_bytes += st.st_size
                     logging.info(f"Deleted old cache file ({age_seconds/86400:.1f}d): {file_path.name}")
+                    if meta_file.exists():
+                        meta_st = meta_file.stat()
+                        meta_file.unlink()
+                        total_deleted += 1
+                        total_freed_bytes += meta_st.st_size
+                        logging.info(f"Deleted paired meta file: {meta_file.name}")
             except Exception as e:
                 logging.warning(f"Error checking/deleting cache file {file_path}: {e}")
 
@@ -568,6 +589,7 @@ def search_shows_in_timeframe(
     query: str,
     hours_ahead: int = 3,
     groups: Optional[set] = None,
+    max_results: int = 100,
 ) -> List[ShowResult]:
     """Search for shows matching *query* that are on now or start within *hours_ahead* hours.
 
@@ -617,6 +639,9 @@ def search_shows_in_timeframe(
                 })
 
     results.sort(key=lambda x: (not x["is_playing_now"], x["start_time"]))
+    if max_results and len(results) > max_results:
+        logging.info(f"Search capped at {max_results} results (found {len(results)} total)")
+        results = results[:max_results]
     return results
 
 
@@ -701,9 +726,10 @@ def find_future_reruns(
             stop_time  = prog.get("stop_time")
             if not start_time:
                 continue
-            title_match   = show_title.lower() in title.lower() or title.lower() in show_title.lower()
-            episode_match = episode_num and prog_ep and episode_num == prog_ep
-            if not (title_match and episode_match):
+            title_match = show_title.lower() in title.lower() or title.lower() in show_title.lower()
+            if not title_match:
+                continue
+            if episode_num and prog_ep and episode_num != prog_ep:
                 continue
             if not (now < start_time <= cutoff):
                 continue

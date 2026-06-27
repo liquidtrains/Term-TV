@@ -45,6 +45,7 @@ import json
 import lzma
 import time
 import logging
+import argparse
 import threading
 import platform
 import shutil
@@ -2510,6 +2511,10 @@ def _open_browser():
 def main():
     global _config, _vpn_configured
 
+    parser = argparse.ArgumentParser(description="Term-TV Web: Browser-based IPTV guide")
+    parser.add_argument("--skip-vpn", action="store_true", help="Skip VPN prompt at startup")
+    args = parser.parse_args()
+
     setup_logging()
     atexit.register(archive_mpv_log)
     atexit.register(disconnect_vpn)
@@ -2532,7 +2537,7 @@ def main():
 
     # VPN setup (optional)
     vpn_cfg = _config.get("openvpn", {})
-    if vpn_cfg.get("enabled") and vpn_cfg.get("auto_connect"):
+    if not args.skip_vpn and vpn_cfg.get("enabled") and vpn_cfg.get("auto_connect"):
         _vpn_configured = True
         try:
             ans = input("Connect VPN? [y/N]: ").strip().lower()
@@ -2558,7 +2563,7 @@ def main():
                         _register_vpn_signal_handlers()
                     else:
                         print("⚠  VPN connection failed — continuing without VPN.", file=sys.stderr)
-    elif vpn_cfg.get("enabled"):
+    elif not args.skip_vpn and vpn_cfg.get("enabled"):
         _vpn_configured = True
 
     # Start data loading in background

@@ -128,3 +128,17 @@ The EPG parser handles malformed feeds from misconfigured servers:
 - Lenient gzip: falls back to `zlib` when gzip footer is missing
 - Incremental XML: uses `iterparse` to recover data from truncated XML
 - Extended timeouts: 10s connect + 120s read
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues (`liquidtrains/Term-TV`). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context repo — one `CONTEXT.md` + `docs/adr/` at the root. See `docs/agents/domain.md`.
