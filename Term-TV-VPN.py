@@ -43,7 +43,7 @@ import os
 
 from lib.term_tv_core import (
     Channel, EpgData, ShowResult,
-    WATCH_HISTORY_FILE, SEARCH_HISTORY_FILE, RECORDINGS_DIR,
+    WATCH_HISTORY_FILE, SEARCH_HISTORY_FILE, FAVORITES_FILE, RECORDINGS_DIR,
     EPG_CACHE_DIR, M3U_CACHE_DIR,
     load_m3u, load_m3u_cached, load_epg,
     parse_epg_time, is_new_episode,
@@ -53,6 +53,10 @@ from lib.term_tv_core import (
     display_frequent_channels, get_search_history_now_playing,
     display_search_history_now_playing,
     load_search_history, save_search_history, add_to_search_history,
+    load_favorites, save_favorites, toggle_favorite,
+    get_favorite_channels, display_favorites,
+    get_channel_groups, get_channel_schedule,
+    send_desktop_notification,
     ensure_recordings_dir, extract_subtitles_from_recording, get_safe_filename,
     clean_old_cache_files, get_public_ip, check_vpn_status, input_with_countdown,
 )
@@ -451,8 +455,13 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
     print(f"[SCHEDULED] Show: {show_title}")
     print(f"[SCHEDULED] Will auto-launch when show starts\n")
 
-    # Wait for the scheduled time
-    time.sleep(delay_seconds)
+    # Wait, firing a desktop notification 5 min before start
+    _notify_wait = max(0, delay_seconds - 300)
+    time.sleep(_notify_wait)
+    if _notify_wait > 0:
+        send_desktop_notification("Term-TV", f"Starting in 5 min: {show_title}")
+        logging.info(f"Desktop notification sent for: {show_title}")
+    time.sleep(delay_seconds - _notify_wait)
 
     # Remove from scheduled tasks list
     with SCHEDULED_TASKS_LOCK:
@@ -664,8 +673,13 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
     print(f"[SCHEDULED] Output: {output_path}")
     print(f"[SCHEDULED] Press Ctrl+C in mpv window to stop recording\n")
 
-    # Wait for the scheduled time
-    time.sleep(delay_seconds)
+    # Wait, firing a desktop notification 5 min before start
+    _notify_wait = max(0, delay_seconds - 300)
+    time.sleep(_notify_wait)
+    if _notify_wait > 0:
+        send_desktop_notification("Term-TV", f"Recording in 5 min: {show_title}")
+        logging.info(f"Desktop notification sent for recording: {show_title}")
+    time.sleep(delay_seconds - _notify_wait)
 
     # Remove from scheduled tasks list
     with SCHEDULED_TASKS_LOCK:
@@ -899,7 +913,25 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
     if show_result:
         print(f"Show: {show_result['title']}")
 
-    print("\nRecording options:")
+    # F6: show what's currently on / coming up for this channel
+    if not show_result:
+        tvg_id = channel.get("tvg-id", "")
+        schedule = get_channel_schedule(epg_global, tvg_id, upcoming=3)
+        if schedule:
+            now = datetime.now().astimezone()
+            print()
+            for prog in schedule:
+                st = prog.get("start_time")
+                et = prog.get("stop_time")
+                label = "NOW" if (st and et and st <= now < et) else (st.strftime("%I:%M %p") if st else "?")
+                title = prog.get("title", "Unknown")
+                ep = prog.get("episode_num", "")
+                dur = f" ({int((et - st).total_seconds() / 60)}m)" if st and et else ""
+                new_badge = " +++" if is_new_episode(prog.get("air_date", "")) else ""
+                print(f"  {label:>10}: {title}{' (' + ep + ')' if ep else ''}{dur}{new_badge}")
+            print()
+
+    print("Recording options:")
     print("  w: Watch only (no recording)")
     print("  r: Record while watching")
     print("  s: Schedule recording for later")
@@ -1130,10 +1162,23 @@ def select_from_show_results(results: List[ShowResult]) -> Optional[ShowResult]:
             print(f"   Channel: {channel_name} [{provider}]")
         print()
 
-    selection = input(f"Select show to watch (1-{len(results)}, or 'b' for back): ").strip()
+    selection = input(
+        f"Select show (1-{len(results)}, 'b' for back, or '1 3 5' to schedule multiple): "
+    ).strip()
 
     if selection.lower() == 'b':
         return None
+
+    # Multi-select: space-separated numbers (F3)
+    parts = selection.split()
+    if len(parts) > 1:
+        chosen = []
+        for p in parts:
+            if p.isdigit():
+                idx = int(p) - 1
+                if 0 <= idx < len(results):
+                    chosen.append(results[idx])
+        return chosen if chosen else None
 
     if selection.isdigit():
         index = int(selection) - 1
@@ -1875,30 +1920,44 @@ def main():
 
     # --- Main Interaction Loop ---
     while True:
+        # Display favorites
+        favorites = get_favorite_channels(channels, epg)
+        display_favorites(favorites, start_index=1)
+
         # Display frequently watched channels
+        fav_count = len(favorites)
         frequent = get_frequent_channels(channels, epg)
         display_frequent_channels(frequent)
 
         # Display currently-airing matches from recent search history
         search_now_playing = get_search_history_now_playing(channels, epg)
-        display_search_history_now_playing(search_now_playing, start_index=len(frequent) + 1)
+        display_search_history_now_playing(
+            search_now_playing, start_index=fav_count + len(frequent) + 1
+        )
 
         # Display scheduled tasks
         display_scheduled_tasks()
 
         print("\nOptions:")
+        if favorites:
+            print(f"  1-{fav_count}: Watch favorite")
         if frequent:
-            print(f"  1-{len(frequent)}: Watch frequent channel")
+            f_start = fav_count + 1
+            f_end   = fav_count + len(frequent)
+            print(f"  {f_start if f_start == f_end else str(f_start) + '-' + str(f_end)}: Watch frequent channel")
         if search_now_playing:
-            s_start = len(frequent) + 1
-            s_end = len(frequent) + len(search_now_playing)
-            label = str(s_start) if s_start == s_end else f"{s_start}-{s_end}"
+            s_start = fav_count + len(frequent) + 1
+            s_end   = s_start + len(search_now_playing) - 1
+            label   = str(s_start) if s_start == s_end else f"{s_start}-{s_end}"
             print(f"  {label}: Watch from recent searches")
         if not args.no_epg:
             print("  s: Search for show/movie")
         print("  c: Search for channel")
+        print("  g: Browse by channel group")
+        print("  fav: Manage favorites")
         if not args.no_epg:
             print("  epg: Refresh EPG data")
+        print("  cfg: Reload config")
         if len(playlists) > 1:
             print("  pl: Switch playlist")
         if SCHEDULED_TASKS:
@@ -1977,13 +2036,85 @@ def main():
                 print("No EPG URL configured for this playlist.", file=sys.stderr)
             continue
 
-        # Select from frequent channels or search-history now-playing
+        # F7: Config hot-reload
+        if choice == "cfg":
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as _f:
+                    _new_cfg = json.load(_f)
+                playlists = _new_cfg.get("playlists", playlists)
+                print(f"✓ Config reloaded — {len(playlists)} playlist(s) found.")
+                logging.info("Config reloaded from disk")
+            except Exception as _e:
+                print(f"Error reloading config: {_e}", file=sys.stderr)
+            continue
+
+        # F1: Favorites management
+        if choice == "fav":
+            _favs = load_favorites()
+            if _favs:
+                print("\nCurrent favorites:")
+                for _i, _f in enumerate(_favs, 1):
+                    print(f"  {_i}. {_f.get('name', 'Unknown')} [{_f.get('group-title', '')}]")
+            else:
+                print("\nNo favorites yet.")
+            print("\nEnter a channel name to search and add, or '-N' to remove, or Enter to cancel:")
+            _fav_input = input("  > ").strip()
+            if _fav_input.startswith("-") and _fav_input[1:].isdigit():
+                _rm_idx = int(_fav_input[1:]) - 1
+                if 0 <= _rm_idx < len(_favs):
+                    _removed = _favs.pop(_rm_idx)
+                    save_favorites(_favs)
+                    print(f"✓ Removed from favorites: {_removed.get('name', 'Unknown')}")
+                else:
+                    print("Invalid selection.")
+            elif _fav_input:
+                _fav_results = search_channels(channels, _fav_input)
+                if not _fav_results:
+                    print("No channels found.")
+                else:
+                    _chosen_fav = select_from_channel_list(_fav_results, epg)
+                    if _chosen_fav:
+                        _added = toggle_favorite(_chosen_fav)
+                        print(f"{'✓ Added to' if _added else '✓ Removed from'} favorites: {_chosen_fav.get('name')}")
+            continue
+
+        # F5: Group browser
+        if choice == "g":
+            groups = get_channel_groups(channels)
+            if not groups:
+                print("No channel groups found.")
+                continue
+            print(f"\nChannel Groups ({len(groups)} total):")
+            print("-" * 60)
+            for _gi, (_gname, _gcnt) in enumerate(groups, 1):
+                print(f"  {_gi:>3}. {_gname} ({_gcnt})")
+            _gsel = input(f"\nSelect group (1-{len(groups)}, or 'b' to back): ").strip()
+            if _gsel.lower() == 'b' or not _gsel:
+                continue
+            if not _gsel.isdigit():
+                print("Invalid selection.", file=sys.stderr)
+                continue
+            _gidx = int(_gsel) - 1
+            if not (0 <= _gidx < len(groups)):
+                print("Invalid selection.", file=sys.stderr)
+                continue
+            _selected_group = groups[_gidx][0]
+            _group_channels = [c for c in channels if c.get("group-title") == _selected_group]
+            print(f"\n{_selected_group} — {len(_group_channels)} channel(s):")
+            _gc = select_from_channel_list(_group_channels, epg)
+            if _gc:
+                play_channel(_gc)
+            continue
+
+        # Select from favorites, frequent channels, or search-history now-playing
         if choice.isdigit():
             num = int(choice)
-            if frequent and 1 <= num <= len(frequent):
-                play_channel(frequent[num - 1]["channel"])
-            elif search_now_playing and len(frequent) + 1 <= num <= len(frequent) + len(search_now_playing):
-                item = search_now_playing[num - len(frequent) - 1]
+            if favorites and 1 <= num <= fav_count:
+                play_channel(favorites[num - 1]["channel"])
+            elif frequent and fav_count + 1 <= num <= fav_count + len(frequent):
+                play_channel(frequent[num - fav_count - 1]["channel"])
+            elif search_now_playing and fav_count + len(frequent) + 1 <= num <= fav_count + len(frequent) + len(search_now_playing):
+                item = search_now_playing[num - fav_count - len(frequent) - 1]
                 play_channel(item["result"]["channel"], item["result"])
             else:
                 print("Invalid selection.", file=sys.stderr)
@@ -2032,6 +2163,43 @@ def main():
                 continue
 
             chosen_result = select_from_show_results(results)
+
+            # F3: multi-select — schedule all chosen future shows at once
+            if isinstance(chosen_result, list):
+                add_to_search_history(query)
+                scheduled_count = 0
+                for _mr in chosen_result:
+                    _mu = _mr.get("minutes_until", 0)
+                    if _mu <= 5:
+                        print(f"Skipped (already started): {_mr['title']}")
+                        continue
+                    _ch = _mr["channel"]
+                    _title = _mr.get("title", "Unknown")
+                    _ep = _mr.get("episode_num", "")
+                    _st = _mr.get("start_time")
+                    _delay = _mu * 60
+                    _task_id = int(time.time() * 1000) + scheduled_count
+                    _sched_time = datetime.now().astimezone() + timedelta(seconds=_delay)
+                    with SCHEDULED_TASKS_LOCK:
+                        SCHEDULED_TASKS.append({
+                            "id": _task_id, "type": "playback",
+                            "channel_name": _ch.get("name", "?"),
+                            "provider": _ch.get("group-title", ""),
+                            "show_title": _title,
+                            "scheduled_time": _sched_time,
+                        })
+                    threading.Thread(
+                        target=scheduled_playback_task,
+                        args=(_ch.get("url", ""), _delay, _ch.get("name", "?"), _title,
+                              _ch.get("group-title", ""), _task_id, _ep, _st),
+                        daemon=True,
+                    ).start()
+                    print(f"✓ Scheduled: {_title} in {_mu} min")
+                    scheduled_count += 1
+                if scheduled_count:
+                    print(f"\n{scheduled_count} show(s) scheduled. Keep this terminal open.")
+                continue
+
             if chosen_result:
                 # Add to search history since user selected a result
                 add_to_search_history(query)

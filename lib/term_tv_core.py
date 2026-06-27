@@ -43,6 +43,7 @@ ShowResult = Dict[str, Any]
 # ---------------------------------------------------------------------------
 WATCH_HISTORY_FILE  = Path(".watch_history.json")
 SEARCH_HISTORY_FILE = Path(".search_history.json")
+FAVORITES_FILE      = Path(".favorites.json")
 RECORDINGS_DIR      = Path.home() / "Videos" / "Recordings"
 EPG_CACHE_DIR       = Path(".epg_cache")
 M3U_CACHE_DIR       = Path(".m3u_cache")
@@ -274,7 +275,20 @@ def _parse_m3u_lines(lines: List[str]) -> List[Channel]:
                 current["url"] = line
                 channels.append(current)
             current = None
-    return channels
+    # F4: collapse duplicate URLs — merge group-title labels
+    seen: Dict[str, Channel] = {}
+    order: List[str] = []
+    for ch in channels:
+        url = ch.get("url", "")
+        if url not in seen:
+            seen[url] = dict(ch)
+            order.append(url)
+        else:
+            g_existing = seen[url].get("group-title", "")
+            g_new = ch.get("group-title", "")
+            if g_new and g_new not in g_existing:
+                seen[url]["group-title"] = f"{g_existing}, {g_new}" if g_existing else g_new
+    return [seen[url] for url in order]
 
 
 def load_m3u(url: str) -> List[Channel]:
@@ -926,6 +940,161 @@ def display_search_history_now_playing(now_playing: List[Dict[str, Any]], start_
         print(f"{i}. {s}")
         print(f"   {ch.get('name', 'Unknown')} [{ch.get('group-title', 'Unknown')}]  (from search: '{item['query']}')")
         print()
+
+# ---------------------------------------------------------------------------
+# Favorites (F1)
+# ---------------------------------------------------------------------------
+
+def load_favorites() -> List[Dict[str, str]]:
+    """Return the saved favorites list."""
+    if not FAVORITES_FILE.exists():
+        return []
+    try:
+        with open(FAVORITES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.warning(f"Failed to load favorites: {e}")
+        return []
+
+
+def save_favorites(favs: List[Dict[str, str]]):
+    """Persist the favorites list."""
+    try:
+        with open(FAVORITES_FILE, "w", encoding="utf-8") as f:
+            json.dump(favs, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save favorites. {e}", file=sys.stderr)
+
+
+def toggle_favorite(channel: Channel) -> bool:
+    """Add channel to favorites if absent; remove if present. Returns True if added."""
+    favs = load_favorites()
+    tvg_id = channel.get("tvg-id", "")
+    url = channel.get("url", "")
+    key = tvg_id or url
+    existing = next(
+        (f for f in favs if (f.get("tvg-id") or f.get("url")) == key), None
+    )
+    if existing:
+        favs = [f for f in favs if (f.get("tvg-id") or f.get("url")) != key]
+        save_favorites(favs)
+        return False
+    favs.append({
+        "name":        channel.get("name", "Unknown"),
+        "tvg-id":      tvg_id,
+        "url":         url,
+        "group-title": channel.get("group-title", ""),
+    })
+    save_favorites(favs)
+    return True
+
+
+def get_favorite_channels(channels: List[Channel], epg: EpgData) -> List[Dict[str, Any]]:
+    """Return saved favorites matched against the live channel list, enriched with EPG."""
+    favs = load_favorites()
+    result: List[Dict[str, Any]] = []
+    now = datetime.now().astimezone()
+    for fav in favs:
+        tvg_id = fav.get("tvg-id", "")
+        url    = fav.get("url", "")
+        ch = (
+            next((c for c in channels if c.get("tvg-id") == tvg_id), None)
+            if tvg_id else None
+        ) or (
+            next((c for c in channels if c.get("url") == url), None)
+            if url else None
+        )
+        if not ch:
+            continue
+        current_show = None
+        if tvg_id and tvg_id in epg:
+            for prog in epg[tvg_id]:
+                st = prog.get("start_time")
+                et = prog.get("stop_time")
+                if st and et and st <= now < et:
+                    current_show = prog
+                    break
+        result.append({"channel": ch, "current_show": current_show})
+    return result
+
+
+def display_favorites(favorites: List[Dict[str, Any]], start_index: int = 1):
+    """Print the favorites panel to stdout."""
+    if not favorites:
+        return
+    print("\n" + "=" * 80)
+    print("FAVORITES:")
+    print("=" * 80)
+    for i, item in enumerate(favorites, start_index):
+        ch   = item["channel"]
+        show = item["current_show"]
+        print(f"{i}. {ch.get('name', 'Unknown')} [{ch.get('group-title', 'Unknown')}]")
+        if show:
+            s = show.get("title", "Unknown")
+            if show.get("episode_num"):
+                s += f" ({show['episode_num']})"
+            if show.get("subtitle"):
+                s += f' - "{show["subtitle"]}"'
+            if is_new_episode(show.get("air_date", "")):
+                s += " +++"
+            print(f"   NOW PLAYING: {s}")
+        else:
+            print("   (No EPG data)")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# Channel groups (F5)
+# ---------------------------------------------------------------------------
+
+def get_channel_groups(channels: List[Channel]) -> List[tuple]:
+    """Return a sorted list of (group_name, channel_count) tuples."""
+    counts: Dict[str, int] = defaultdict(int)
+    for ch in channels:
+        group = ch.get("group-title", "")
+        if group:
+            counts[group] += 1
+    return sorted(counts.items(), key=lambda x: x[0].lower())
+
+
+# ---------------------------------------------------------------------------
+# Channel schedule (F6)
+# ---------------------------------------------------------------------------
+
+def get_channel_schedule(epg: EpgData, tvg_id: str, upcoming: int = 3) -> List[Dict[str, Any]]:
+    """Return the current programme and the next *upcoming* programmes for a tvg-id."""
+    if not tvg_id or tvg_id not in epg:
+        return []
+    now = datetime.now().astimezone()
+    cutoff = now + timedelta(hours=12)
+    items: List[Dict[str, Any]] = []
+    for prog in epg[tvg_id]:
+        st = prog.get("start_time")
+        et = prog.get("stop_time")
+        if not st:
+            continue
+        if et and et < now:
+            continue
+        if st > cutoff:
+            break
+        items.append(prog)
+        if len(items) >= upcoming + 1:
+            break
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Desktop notifications (F2) — optional plyer dependency
+# ---------------------------------------------------------------------------
+
+def send_desktop_notification(title: str, message: str):
+    """Fire a desktop notification via plyer if available; silently skip if not."""
+    try:
+        from plyer import notification  # type: ignore
+        notification.notify(title=title, message=message, timeout=10)
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Recording utilities
