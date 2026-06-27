@@ -36,6 +36,7 @@ Thumbs.db
 # Claude Code internal files
 .claude/
 .tmp.driveupload/
+CLAUDE.md
 
 # Working / scratch directories
 working/
