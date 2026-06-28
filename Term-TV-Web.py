@@ -399,7 +399,7 @@ def launch_mpv(url: str, channel_name: str, show_title: str = "") -> bool:
 
     mpv_args = [
         "mpv",
-        "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5,timeout=10000000",
+        "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
         "--cache=yes",
         "--cache-pause=no",
         url,
@@ -603,7 +603,7 @@ def archive_mpv_log():
                     f.write(chunk)
             print(f"MPV log split into {total} chunks and archived.")
         MPV_LOG_FILE.write_bytes(b"")
-    except Exception as e:
+    except (Exception, KeyboardInterrupt) as e:
         logging.warning(f"archive_mpv_log: {e}")
         return
 
@@ -1705,7 +1705,7 @@ function showPopup(prog, ch) {
   const imdbBtn   = document.getElementById('popup-imdb');
   const imdbQuery = prog.title + (prog.air_date ? ' ' + prog.air_date.slice(0, 4) : '');
   imdbBtn.href        = 'https://www.imdb.com/find/?q=' + encodeURIComponent(imdbQuery) + '&s=tt';
-  imdbBtn.textContent = 'IMDb';   // will be updated by fetchShowMeta if match found
+  imdbBtn.textContent = 'IMDb…';
   imdbBtn.style.display = '';
   fetchShowMeta(prog, prog);   // async; updates href/label/desc/ep when ready
 
@@ -1800,13 +1800,19 @@ async function fetchShowMeta(prog, capturedPopupProg) {
   if (prog.air_date)    params.set('air_date',    prog.air_date);
   if (prog.episode_num) params.set('episode_num', prog.episode_num);
   try {
-    const cacheKey = prog.title.toLowerCase() + '|' + (prog.air_date||'') + '|' + (prog.subtitle||'');
+    const cacheKey = prog.title.toLowerCase() + '|' + (prog.episode_num||'') + '|' + (prog.air_date||'') + '|' + (prog.subtitle||'');
     let meta = _showMetaCache.get(cacheKey);
     if (!meta) {
       meta = await (await fetch('/api/show_meta?' + params)).json();
       if (meta.imdb_id) _showMetaCache.set(cacheKey, meta);
     }
-    if (!meta || !meta.imdb_id) return;
+    if (!meta || !meta.imdb_id) {
+      if (popupProg === capturedPopupProg) {
+        const b = document.getElementById('popup-imdb');
+        if (b) b.textContent = 'IMDb';
+      }
+      return;
+    }
     if (popupProg !== capturedPopupProg) return;   // popup switched
 
     // Determine season — prefer TVMaze match, fall back to parsed EPG episode_num
@@ -1869,8 +1875,9 @@ async function schedulePb(prog, ch) {
       body: JSON.stringify({url: ch.url, channel_name: ch.name, title: prog.title, start_ts: prog.start_ts})
     });
     const data = await res.json();
-    if (data.ok) { _markTask(ch, prog, 'schedule', data.task_id); showToast('Scheduled: ' + prog.title + ' in ' + data.minutes_until + ' min'); }
-    else           showToast('Schedule failed: ' + (data.error || 'unknown'), true);
+    if (data.ok && data.already_set) { showToast('Already scheduled: ' + prog.title); }
+    else if (data.ok) { _markTask(ch, prog, 'schedule', data.task_id); showToast('Scheduled: ' + prog.title + ' in ' + data.minutes_until + ' min'); }
+    else               showToast('Schedule failed: ' + (data.error || 'unknown'), true);
   } catch (e) { showToast('Error: ' + e.message, true); }
 }
 
@@ -1881,8 +1888,9 @@ async function remindPb(prog, ch) {
       body: JSON.stringify({start_ts: prog.start_ts, title: prog.title, channel_name: ch.name})
     });
     const data = await res.json();
-    if (data.ok) { _markTask(ch, prog, 'remind', data.task_id); showToast('Reminder set for ' + prog.title + ' (in ' + data.minutes_until + ' min)'); }
-    else           showToast('Reminder failed: ' + (data.error || 'unknown'), true);
+    if (data.ok && data.already_set) { showToast('Reminder already set: ' + prog.title); }
+    else if (data.ok) { _markTask(ch, prog, 'remind', data.task_id); showToast('Reminder set for ' + prog.title + ' (in ' + data.minutes_until + ' min)'); }
+    else               showToast('Reminder failed: ' + (data.error || 'unknown'), true);
   } catch (e) { showToast('Error: ' + e.message, true); }
 }
 
@@ -2602,11 +2610,10 @@ def _fetch_ep_imdb_via_tmdb(show_imdb_id: str, season: int, episode: int) -> Opt
             params={"api_key": api_key},
             timeout=5,
         )
-        if r.status_code == 200:
-            ep_imdb = r.json().get("imdb_id")
-            with _tvmaze_lock:
-                _tvmaze_ep_cache[ep_key] = {"ep_imdb_id": ep_imdb, "_ts": time.time()}
-            return ep_imdb
+        ep_imdb = r.json().get("imdb_id") if r.status_code == 200 else None
+        with _tvmaze_lock:
+            _tvmaze_ep_cache[ep_key] = {"ep_imdb_id": ep_imdb, "_ts": time.time()}
+        return ep_imdb
     except Exception:
         pass
 
@@ -2757,6 +2764,9 @@ def api_remind():
     task_id    = int(time.time() * 1000)
     cancel_evt = threading.Event()
     with _web_tasks_lock:
+        if any(t["type"] == "remind" and t["title"] == title and t["start_ts"] == start_ts
+               for t in _web_tasks):
+            return jsonify({"ok": True, "already_set": True, "minutes_until": minutes_until})
         _web_tasks.append({"id": task_id, "type": "remind", "title": title,
                            "ch_name": ch_name, "ch_url": data.get("ch_url", ""),
                            "start_ts": start_ts, "_cancel": cancel_evt})
@@ -2793,6 +2803,9 @@ def api_schedule():
     task_id    = int(time.time() * 1000)
     cancel_evt = threading.Event()
     with _web_tasks_lock:
+        if any(t["type"] == "schedule" and t["title"] == title and t["start_ts"] == start_ts
+               for t in _web_tasks):
+            return jsonify({"ok": True, "already_set": True, "minutes_until": minutes_until})
         _web_tasks.append({"id": task_id, "type": "schedule", "title": title,
                            "ch_name": ch_name, "ch_url": url, "start_ts": start_ts,
                            "_cancel": cancel_evt})
@@ -2811,7 +2824,12 @@ def api_schedule():
         with _web_tasks_lock:
             _web_tasks[:] = [t for t in _web_tasks if t["id"] != task_id]
         try:
-            subprocess.Popen(["mpv", "--stream-lavf-o=timeout=10000000", url])
+            subprocess.Popen([
+            "mpv",
+            "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
+            "--cache=yes", "--cache-pause=no",
+            url,
+        ])
             print(f"[SCHEDULE] '{title}' on {ch_name} — mpv launched")
         except Exception as e:
             print(f"[SCHEDULE] '{title}' — launch failed: {e}", file=sys.stderr)
