@@ -73,6 +73,7 @@ from lib.term_tv_core import (
     send_desktop_notification,
     ensure_recordings_dir, extract_subtitles_from_recording, get_safe_filename,
     clean_old_cache_files, get_public_ip, check_vpn_status, input_with_countdown,
+    _ch_in_group,
 )
 
 # --- Constants ---
@@ -1479,6 +1480,10 @@ def main():
                 with open(CONFIG_FILE, "r", encoding="utf-8") as _f:
                     _new_cfg = json.load(_f)
                 playlists = _new_cfg.get("playlists", playlists)
+                expected_vpn_ip = _new_cfg.get("vpn_ip", expected_vpn_ip)
+                if "recordings_dir" in _new_cfg:
+                    RECORDINGS_DIR = Path(_new_cfg["recordings_dir"]).expanduser()
+                    _core.RECORDINGS_DIR = RECORDINGS_DIR
                 print(f"✓ Config reloaded — {len(playlists)} playlist(s) found.")
                 logging.info("Config reloaded from disk")
             except Exception as _e:
@@ -1536,7 +1541,7 @@ def main():
                 print("Invalid selection.", file=sys.stderr)
                 continue
             _selected_group = groups[_gidx][0]
-            _group_channels = [c for c in channels if c.get("group-title") == _selected_group]
+            _group_channels = [c for c in channels if _ch_in_group(c, {_selected_group})]
             print(f"\n{_selected_group} — {len(_group_channels)} channel(s):")
             _gc = select_from_channel_list(_group_channels, epg)
             if _gc:

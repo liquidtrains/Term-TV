@@ -570,6 +570,18 @@ def search_channels(channels: List[Channel], query: str) -> List[Channel]:
     return [c for c in channels if q in c.get("name", "").lower()]
 
 
+def _ch_in_group(ch: Channel, groups: set) -> bool:
+    """True if the channel belongs to any of *groups*, handling merged group labels.
+
+    F4 dedup can produce group-title like "US HD, US SD" — split on ", " so
+    that filtering by either component still matches.
+    """
+    raw = ch.get("group-title", "")
+    if raw in groups:
+        return True
+    return any(g.strip() in groups for g in raw.split(","))
+
+
 _tvg_map_cached_key: Optional[List[Channel]] = None
 _tvg_map_cached_result: Dict[str, List[Channel]] = {}
 
@@ -633,7 +645,7 @@ def search_shows_in_timeframe(
             minutes_until = int((start_time - now).total_seconds() / 60)
             air_date = prog.get("air_date", "")
             for ch in tvg_map[channel_id]:
-                if groups and ch.get("group-title") not in groups:
+                if groups and not _ch_in_group(ch, groups):
                     continue
                 results.append({
                     "channel":      ch,
@@ -807,7 +819,13 @@ def log_channel_watch(channel: Channel, duration_seconds: int):
         return
     history = load_watch_history()
     tvg_id = channel.get("tvg-id", "")
-    existing = next((h for h in history if h.get("tvg-id") == tvg_id), None)
+    url = channel.get("url", "")
+    # Match by tvg-id when present; fall back to URL to avoid merging unrelated
+    # channels that share an empty tvg-id.
+    if tvg_id:
+        existing = next((h for h in history if h.get("tvg-id") == tvg_id), None)
+    else:
+        existing = next((h for h in history if h.get("url") == url and h.get("tvg-id", "") == ""), None)
     if existing:
         existing["total_duration_seconds"] = existing.get("total_duration_seconds", 0) + duration_seconds
         existing["watch_count"] = existing.get("watch_count", 0) + 1
