@@ -1788,8 +1788,9 @@ const _showMetaCache = new Map();  // title_lower → resolved meta object
 
 async function fetchShowMeta(prog, capturedPopupProg) {
   const params = new URLSearchParams({title: prog.title});
-  if (prog.subtitle)  params.set('subtitle', prog.subtitle);
-  if (prog.air_date)  params.set('air_date',  prog.air_date);
+  if (prog.subtitle)    params.set('subtitle',    prog.subtitle);
+  if (prog.air_date)    params.set('air_date',    prog.air_date);
+  if (prog.episode_num) params.set('episode_num', prog.episode_num);
   try {
     const cacheKey = prog.title.toLowerCase() + '|' + (prog.air_date||'') + '|' + (prog.subtitle||'');
     let meta = _showMetaCache.get(cacheKey);
@@ -2488,12 +2489,41 @@ def api_status():
     })
 
 
+def _parse_ep_num(raw: str):
+    """Parse XMLTV episode-num to (season, episode). Returns None if not parseable."""
+    if not raw:
+        return None
+    # xmltv_ns: "8.3.0" → Season 9, Episode 4  (0-indexed)
+    if re.match(r"^\d+\.\d", raw):
+        parts = raw.split(".")
+        s, e = int(parts[0]) + 1, int(parts[1]) + 1
+        return (s, e) if s > 0 and e > 0 else None
+    m = re.match(r"[Ss](\d+)[Ee](\d+)", raw)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    m = re.match(r"^(\d+)[xX](\d+)$", raw)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def _ep_cached_entry(ep: dict) -> dict:
+    return {
+        "season":   ep.get("season"),
+        "episode":  ep.get("number"),
+        "ep_title": ep.get("name", ""),
+        "ep_desc":  re.sub(r"<[^>]+>", "", ep.get("summary") or ""),
+        "_ts":      time.time(),
+    }
+
+
 @app.route("/api/show_meta")
 def api_show_meta():
     """Return TVMaze show + episode metadata for the IMDb popup link."""
-    title    = request.args.get("title",    "").strip()
-    subtitle = request.args.get("subtitle", "").strip()
-    air_date = request.args.get("air_date", "").strip()   # YYYYMMDD
+    title       = request.args.get("title",       "").strip()
+    subtitle    = request.args.get("subtitle",    "").strip()
+    air_date    = request.args.get("air_date",    "").strip()   # YYYYMMDD
+    episode_num = request.args.get("episode_num", "").strip()   # raw XMLTV episode-num
     if not title:
         return jsonify({"error": "No title"}), 400
 
@@ -2526,11 +2556,15 @@ def api_show_meta():
     show_id = show_cached["id"]
     result  = {k: v for k, v in show_cached.items() if k not in ("_ts", "id")}
 
-    # ── 2. Find specific episode: try air_date first, then subtitle ─────────
-    ep_info   = None
-    ep_cached = None
+    # ── 2. Find specific episode ────────────────────────────────────────────
+    # Strategy A: parse XMLTV episode_num directly — fastest, no extra API call
+    ep_info = None
+    parsed  = _parse_ep_num(episode_num)
+    if parsed:
+        ep_info = {"season": parsed[0], "episode": parsed[1]}
 
-    if air_date and len(air_date) >= 8:
+    # Strategy B: TVMaze episodesbydate using EPG original air_date
+    if not ep_info and air_date and len(air_date) >= 8:
         ep_key = f"{show_id}|date|{air_date[:8]}"
         with _tvmaze_lock:
             ep_cached = _tvmaze_ep_cache.get(ep_key)
@@ -2542,14 +2576,7 @@ def api_show_meta():
                 if r.status_code == 200:
                     eps = r.json()
                     if eps:
-                        ep = eps[0]
-                        ep_cached = {
-                            "season":   ep.get("season"),
-                            "episode":  ep.get("number"),
-                            "ep_title": ep.get("name", ""),
-                            "ep_desc":  re.sub(r"<[^>]+>", "", ep.get("summary") or ""),
-                            "_ts":      time.time(),
-                        }
+                        ep_cached = _ep_cached_entry(eps[0])
                         with _tvmaze_lock:
                             _tvmaze_ep_cache[ep_key] = ep_cached
             except Exception:
@@ -2557,8 +2584,11 @@ def api_show_meta():
         if ep_cached and ep_cached.get("season"):
             ep_info = {k: v for k, v in ep_cached.items() if k != "_ts"}
 
+    # Strategy C: scan full episode list with fuzzy subtitle match
     if not ep_info and subtitle:
-        ep_key = f"{show_id}|sub|{subtitle.lower()[:60]}"
+        # Strip trailing ellipsis chars that EPG providers sometimes add
+        sub_norm = re.sub(r"[.\s…]+$", "", subtitle).lower()
+        ep_key   = f"{show_id}|sub|{sub_norm[:60]}"
         with _tvmaze_lock:
             ep_cached = _tvmaze_ep_cache.get(ep_key)
         if not ep_cached or time.time() - ep_cached.get("_ts", 0) > 86400:
@@ -2566,19 +2596,15 @@ def api_show_meta():
                 r = requests.get(f"https://api.tvmaze.com/shows/{show_id}/episodes",
                                  timeout=8)
                 if r.status_code == 200:
-                    sub_lower = subtitle.lower()
+                    def _norm(s): return re.sub(r"[.\s…]+$", "", s).lower()
                     match = next(
-                        (e for e in r.json() if e.get("name", "").lower() == sub_lower),
+                        (e for e in r.json()
+                         if _norm(e.get("name", "")).startswith(sub_norm)
+                         or sub_norm.startswith(_norm(e.get("name", "")))),
                         None
                     )
                     if match:
-                        ep_cached = {
-                            "season":   match.get("season"),
-                            "episode":  match.get("number"),
-                            "ep_title": match.get("name", ""),
-                            "ep_desc":  re.sub(r"<[^>]+>", "", match.get("summary") or ""),
-                            "_ts":      time.time(),
-                        }
+                        ep_cached = _ep_cached_entry(match)
                         with _tvmaze_lock:
                             _tvmaze_ep_cache[ep_key] = ep_cached
             except Exception:
