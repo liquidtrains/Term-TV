@@ -1740,6 +1740,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Term-TV VPN: CLI IPTV player with OpenVPN")
     parser.add_argument("--playlist", type=int, metavar="N", help="Auto-select playlist N (1-based, skips menu)")
+    parser.add_argument("--skip-vpn", action="store_true", help="Skip VPN connection/prompt at startup")
     parser.add_argument("--no-epg", action="store_true", help="Skip EPG loading (channel browsing only)")
     parser.add_argument("--search", metavar="QUERY", help="Jump directly to show search on startup")
     args = parser.parse_args()
@@ -1824,7 +1825,9 @@ def main():
     vpn_enabled = openvpn_cfg.get("enabled", False)
     auto_connect = openvpn_cfg.get("auto_connect", False)
 
-    if vpn_enabled and auto_connect:
+    if args.skip_vpn:
+        pass  # skip all VPN logic
+    elif vpn_enabled and auto_connect:
         ovpn_file = openvpn_cfg.get("config_file", "")
         config_exe = openvpn_cfg.get("executable", "")
 
@@ -1866,7 +1869,7 @@ def main():
         atexit.register(disconnect_vpn)
         _register_vpn_signal_handlers()
 
-    else:
+    elif not args.skip_vpn:
         # Auto-connect disabled — fall back to manual prompt
         if not check_vpn_status(expected_vpn_ip):
             sys.exit(0)
