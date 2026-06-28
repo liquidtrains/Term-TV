@@ -470,6 +470,9 @@ def mpv_status() -> Dict:
 _recordings:      Dict[str, Dict] = {}
 _recordings_lock: threading.Lock  = threading.Lock()
 
+_web_tasks:      List[Dict] = []   # [{id, type, title, ch_name, ch_url, start_ts}]
+_web_tasks_lock: threading.Lock = threading.Lock()
+
 
 def launch_recording(url: str, channel: str, show: str = "") -> Dict:
     """Start a background mpv recording (no window). Returns status dict."""
@@ -787,6 +790,14 @@ body {
   position: absolute; bottom: 0; left: 0; height: 2px;
   background: var(--prog-now-bdr); border-radius: 0 0 3px 3px; pointer-events: none;
 }
+.prog-badge {
+  position: absolute; top: 2px; right: 3px;
+  font-size: 8px; font-weight: 700; letter-spacing: .3px;
+  padding: 1px 3px; border-radius: 3px; pointer-events: none; line-height: 1.5; z-index: 1;
+}
+.pb-remind   { background: #0c4a6e; color: #38bdf8; }
+.pb-schedule { background: #3b0764; color: #a78bfa; }
+.pb-record   { background: #7f1d1d; color: #f87171; }
 .no-epg {
   position: absolute; top: 0; left: 0; height: 100%;
   display: flex; align-items: center; padding-left: 10px;
@@ -1134,6 +1145,7 @@ body {
     </div>
     <div id="popup-body">
       <div id="popup-now" class="now-badge" style="display:none">NOW PLAYING</div>
+      <div id="popup-task-status" style="display:none;font-size:11px;font-weight:600;margin-bottom:6px"></div>
       <h2 id="popup-title"></h2>
       <div id="popup-ep"></div>
       <div id="popup-time"></div>
@@ -1193,6 +1205,7 @@ let vodMode         = false;
 let vodPage         = 1;
 let _vodTotal       = 0;
 let _prevDataLoading  = true;       // U3: start true so first poll always detects load completion
+const _webTasks = new Map();        // key: ch_url+'|'+start_ts  value: 'remind'|'schedule'|'record'
 let _dataVersion      = -1;         // tracks data_version from /api/status; reload guide when it changes
 let _playingRow       = null;       // Fix-7: cached DOM ref to highlighted guide row
 let _loadGuideActive  = false;      // prevent concurrent loadGuide() calls
@@ -1229,6 +1242,7 @@ async function _boot() {
   }
 
   loadSources();
+  _loadScheduled();
   loadGuide().then(() => {
     jumpToNow();
     loadGroups();
@@ -1454,6 +1468,10 @@ function buildBlock(prog, ch, totalW) {
 
   b.title = prog.title + '\\n' + fmt(prog.start_ts) + ' – ' + fmt(prog.stop_ts);
   b.addEventListener('click', e => { e.stopPropagation(); showPopup(prog, ch); });
+  const _tk = (ch.url || '') + '|' + prog.start_ts;
+  b.dataset.tk = _tk;
+  const _bt = _webTasks.get(_tk);
+  if (_bt) b.appendChild(_makeTaskBadge(_bt));
   return b;
 }
 
@@ -1634,7 +1652,19 @@ function showPopup(prog, ch) {
   playBtn.onclick = () => { play(ch.url, ch.name, prog.title); closePopup(); };
 
   const recBtn = document.getElementById('popup-record');
-  recBtn.onclick = () => { startRecording(ch.url, ch.name, prog.title); closePopup(); };
+  recBtn.onclick = () => { _markTask(ch, prog, 'record'); startRecording(ch.url, ch.name, prog.title); closePopup(); };
+
+  const _taskStatusEl = document.getElementById('popup-task-status');
+  const _existingTask = _webTasks.get((ch.url || '') + '|' + prog.start_ts);
+  if (_existingTask) {
+    const _taskLabels = {remind: '🔔 Reminder set', schedule: '⏰ Scheduled for playback', record: '⏺ Recording queued'};
+    const _taskColors = {remind: '#38bdf8', schedule: '#a78bfa', record: '#f87171'};
+    _taskStatusEl.textContent  = _taskLabels[_existingTask] || _existingTask;
+    _taskStatusEl.style.color  = _taskColors[_existingTask] || '';
+    _taskStatusEl.style.display = '';
+  } else {
+    _taskStatusEl.style.display = 'none';
+  }
 
   const imdbBtn = document.getElementById('popup-imdb');
   const imdbQuery = prog.title + (prog.air_date ? ' ' + prog.air_date.slice(0, 4) : '');
@@ -1658,6 +1688,34 @@ function closePopup() {
   document.getElementById('popup-overlay').style.display = 'none';
 }
 
+function _taskKey(ch, prog)    { return (ch.url || '') + '|' + prog.start_ts; }
+function _makeTaskBadge(type)  {
+  const s = document.createElement('span');
+  s.className = 'prog-badge pb-' + type;
+  s.textContent = type === 'remind' ? 'RM' : type === 'schedule' ? 'SC' : 'RC';
+  return s;
+}
+function _refreshTaskBadges() {
+  _webTasks.forEach((type, key) => {
+    document.querySelectorAll('[data-tk="' + key.replace(/"/g, '\\"') + '"]').forEach(cell => {
+      if (!cell.querySelector('.prog-badge')) cell.appendChild(_makeTaskBadge(type));
+    });
+  });
+}
+function _markTask(ch, prog, type) {
+  _webTasks.set(_taskKey(ch, prog), type);
+  _refreshTaskBadges();
+}
+async function _loadScheduled() {
+  try {
+    const data = await (await fetch('/api/scheduled')).json();
+    (data.tasks || []).forEach(t => {
+      if (t.ch_url && t.start_ts) _webTasks.set(t.ch_url + '|' + t.start_ts, t.type);
+    });
+    _refreshTaskBadges();
+  } catch (_) {}
+}
+
 async function schedulePb(prog, ch) {
   try {
     const res  = await fetch('/api/schedule', {
@@ -1665,8 +1723,8 @@ async function schedulePb(prog, ch) {
       body: JSON.stringify({url: ch.url, channel_name: ch.name, title: prog.title, start_ts: prog.start_ts})
     });
     const data = await res.json();
-    if (data.ok) showToast('Scheduled: ' + prog.title + ' in ' + data.minutes_until + ' min');
-    else         showToast('Schedule failed: ' + (data.error || 'unknown'), true);
+    if (data.ok) { _markTask(ch, prog, 'schedule'); showToast('Scheduled: ' + prog.title + ' in ' + data.minutes_until + ' min'); }
+    else           showToast('Schedule failed: ' + (data.error || 'unknown'), true);
   } catch (e) { showToast('Error: ' + e.message, true); }
 }
 
@@ -1677,8 +1735,8 @@ async function remindPb(prog, ch) {
       body: JSON.stringify({start_ts: prog.start_ts, title: prog.title, channel_name: ch.name})
     });
     const data = await res.json();
-    if (data.ok) showToast('Reminder set for ' + prog.title + ' (in ' + data.minutes_until + ' min)');
-    else         showToast('Reminder failed: ' + (data.error || 'unknown'), true);
+    if (data.ok) { _markTask(ch, prog, 'remind'); showToast('Reminder set for ' + prog.title + ' (in ' + data.minutes_until + ' min)'); }
+    else           showToast('Reminder failed: ' + (data.error || 'unknown'), true);
   } catch (e) { showToast('Error: ' + e.message, true); }
 }
 
@@ -2315,14 +2373,22 @@ def api_remind():
     delay = max(0, start_ts - now_ts - 60)
     minutes_until = max(0, (start_ts - now_ts) // 60)
 
+    task_id = int(time.time() * 1000)
+    with _web_tasks_lock:
+        _web_tasks.append({"id": task_id, "type": "remind", "title": title,
+                           "ch_name": ch_name, "ch_url": data.get("ch_url", ""),
+                           "start_ts": start_ts})
+
     def _fire():
         time.sleep(delay)
         send_desktop_notification("Term-TV Reminder", f"Starting in ~1 min: {title}")
         print(f"[REMINDER] '{title}' — notification fired")
+        with _web_tasks_lock:
+            _web_tasks[:] = [t for t in _web_tasks if t["id"] != task_id]
 
     threading.Thread(target=_fire, daemon=True).start()
     print(f"[REMIND] '{title}' on {ch_name} — notification in {minutes_until} min")
-    return jsonify({"ok": True, "minutes_until": minutes_until})
+    return jsonify({"ok": True, "minutes_until": minutes_until, "task_id": task_id})
 
 
 @app.route("/api/schedule", methods=["POST"])
@@ -2340,6 +2406,11 @@ def api_schedule():
     delay = max(0, start_ts - now_ts)
     minutes_until = max(0, delay // 60)
 
+    task_id = int(time.time() * 1000)
+    with _web_tasks_lock:
+        _web_tasks.append({"id": task_id, "type": "schedule", "title": title,
+                           "ch_name": ch_name, "ch_url": url, "start_ts": start_ts})
+
     def _schedule():
         notify_wait = max(0, delay - 300)
         time.sleep(notify_wait)
@@ -2347,6 +2418,8 @@ def api_schedule():
             send_desktop_notification("Term-TV", f"Starting in 5 min: {title}")
             print(f"[SCHEDULE] '{title}' — 5-min notification sent")
         time.sleep(delay - notify_wait)
+        with _web_tasks_lock:
+            _web_tasks[:] = [t for t in _web_tasks if t["id"] != task_id]
         try:
             subprocess.Popen(["mpv", "--stream-lavf-o=timeout=10000000", url])
             print(f"[SCHEDULE] '{title}' on {ch_name} — mpv launched")
@@ -2355,7 +2428,7 @@ def api_schedule():
 
     threading.Thread(target=_schedule, daemon=True).start()
     print(f"[SCHEDULE] '{title}' on {ch_name} — playback in {minutes_until} min")
-    return jsonify({"ok": True, "minutes_until": minutes_until})
+    return jsonify({"ok": True, "minutes_until": minutes_until, "task_id": task_id})
 
 
 @app.route("/api/play", methods=["POST"])
@@ -2390,6 +2463,18 @@ def api_record():
         return jsonify({"ok": False, "error": "No URL provided"}), 400
     result = launch_recording(url, channel, show)
     return jsonify(result), (200 if result["ok"] else 500)
+
+
+@app.route("/api/scheduled")
+def api_scheduled():
+    with _web_tasks_lock:
+        tasks = list(_web_tasks)
+    with _recordings_lock:
+        recs = [{"type": "record", "title": r.get("show", r.get("channel", "")),
+                 "ch_name": r.get("channel", ""), "ch_url": r.get("url", ""),
+                 "start_ts": 0}
+                for r in _recordings.values() if r.get("process") and r["process"].poll() is None]
+    return jsonify({"tasks": tasks + recs})
 
 
 @app.route("/api/recordings")
