@@ -1809,17 +1809,21 @@ async function fetchShowMeta(prog, capturedPopupProg) {
       if (parsed) { season = parsed.season; episode = parsed.episode; }
     }
 
-    // Update IMDb button with direct title/season link
+    // Update IMDb button — episode page if we have ep_imdb_id, season page otherwise
     const imdbBtn = document.getElementById('popup-imdb');
     if (imdbBtn) {
       let url   = 'https://www.imdb.com/title/' + meta.imdb_id;
       let label = 'IMDb';
-      if (season) {
+      if (meta.ep_imdb_id) {
+        // Direct link to the specific episode's IMDb page
+        url   = 'https://www.imdb.com/title/' + meta.ep_imdb_id + '/';
+        label = 'IMDb ' + (season && episode ? fmtSE(season, episode) : season ? 'S' + String(season).padStart(2,'0') : '');
+      } else if (season) {
         url  += '/episodes/?season=' + season;
         label = 'IMDb ' + (episode ? fmtSE(season, episode) : 'S' + String(season).padStart(2,'0'));
       }
       imdbBtn.href        = url;
-      imdbBtn.textContent = label;
+      imdbBtn.textContent = label.trim() || 'IMDb';
     }
 
     // Fill description from TVMaze if EPG had none
@@ -2508,13 +2512,36 @@ def _parse_ep_num(raw: str):
 
 
 def _ep_cached_entry(ep: dict) -> dict:
+    """Build a cache entry from a TVMaze episode object."""
     return {
-        "season":   ep.get("season"),
-        "episode":  ep.get("number"),
-        "ep_title": ep.get("name", ""),
-        "ep_desc":  re.sub(r"<[^>]+>", "", ep.get("summary") or ""),
-        "_ts":      time.time(),
+        "season":       ep.get("season"),
+        "episode":      ep.get("number"),
+        "ep_title":     ep.get("name", ""),
+        "ep_desc":      re.sub(r"<[^>]+>", "", ep.get("summary") or ""),
+        "tvmaze_ep_id": ep.get("id"),          # used to fetch episode-level IMDb ID
+        "_ts":          time.time(),
     }
+
+
+def _fetch_ep_imdb_id(tvmaze_ep_id: int) -> Optional[str]:
+    """Return the episode-level IMDb tt-ID from TVMaze, cached 24 h."""
+    if not tvmaze_ep_id:
+        return None
+    cache_key = f"epimdb|{tvmaze_ep_id}"
+    with _tvmaze_lock:
+        cached = _tvmaze_ep_cache.get(cache_key)
+    if cached and time.time() - cached.get("_ts", 0) < 86400:
+        return cached.get("ep_imdb_id")
+    try:
+        r = requests.get(f"https://api.tvmaze.com/episodes/{tvmaze_ep_id}", timeout=5)
+        if r.status_code == 200:
+            ep_imdb = (r.json().get("externals") or {}).get("imdb")
+            with _tvmaze_lock:
+                _tvmaze_ep_cache[cache_key] = {"ep_imdb_id": ep_imdb, "_ts": time.time()}
+            return ep_imdb
+    except Exception:
+        pass
+    return None
 
 
 @app.route("/api/show_meta")
@@ -2557,13 +2584,32 @@ def api_show_meta():
     result  = {k: v for k, v in show_cached.items() if k not in ("_ts", "id")}
 
     # ── 2. Find specific episode ────────────────────────────────────────────
-    # Strategy A: parse XMLTV episode_num directly — fastest, no extra API call
-    ep_info = None
-    parsed  = _parse_ep_num(episode_num)
-    if parsed:
-        ep_info = {"season": parsed[0], "episode": parsed[1]}
+    ep_info   = None
+    ep_cached = None
 
-    # Strategy B: TVMaze episodesbydate using EPG original air_date
+    # Strategy A: episode_num present → /episodebynumber (fastest, precise)
+    parsed = _parse_ep_num(episode_num)
+    if parsed:
+        s, e   = parsed
+        ep_key = f"{show_id}|se|{s}|{e}"
+        with _tvmaze_lock:
+            ep_cached = _tvmaze_ep_cache.get(ep_key)
+        if not ep_cached or time.time() - ep_cached.get("_ts", 0) > 86400:
+            try:
+                r = requests.get(f"https://api.tvmaze.com/shows/{show_id}/episodebynumber",
+                                 params={"season": s, "number": e}, timeout=5)
+                if r.status_code == 200:
+                    ep_cached = _ep_cached_entry(r.json())
+                    with _tvmaze_lock:
+                        _tvmaze_ep_cache[ep_key] = ep_cached
+                else:
+                    ep_cached = {"season": s, "episode": e, "_ts": time.time()}
+            except Exception:
+                ep_cached = {"season": s, "episode": e, "_ts": time.time()}
+        if ep_cached and ep_cached.get("season"):
+            ep_info = {k: v for k, v in ep_cached.items() if k != "_ts"}
+
+    # Strategy B: original air_date → episodesbydate
     if not ep_info and air_date and len(air_date) >= 8:
         ep_key = f"{show_id}|date|{air_date[:8]}"
         with _tvmaze_lock:
@@ -2584,9 +2630,8 @@ def api_show_meta():
         if ep_cached and ep_cached.get("season"):
             ep_info = {k: v for k, v in ep_cached.items() if k != "_ts"}
 
-    # Strategy C: scan full episode list with fuzzy subtitle match
+    # Strategy C: fuzzy subtitle scan across all episodes
     if not ep_info and subtitle:
-        # Strip trailing ellipsis chars that EPG providers sometimes add
         sub_norm = re.sub(r"[.\s…]+$", "", subtitle).lower()
         ep_key   = f"{show_id}|sub|{sub_norm[:60]}"
         with _tvmaze_lock:
@@ -2596,7 +2641,7 @@ def api_show_meta():
                 r = requests.get(f"https://api.tvmaze.com/shows/{show_id}/episodes",
                                  timeout=8)
                 if r.status_code == 200:
-                    def _norm(s): return re.sub(r"[.\s…]+$", "", s).lower()
+                    def _norm(t): return re.sub(r"[.\s…]+$", "", t).lower()
                     match = next(
                         (e for e in r.json()
                          if _norm(e.get("name", "")).startswith(sub_norm)
@@ -2612,8 +2657,14 @@ def api_show_meta():
         if ep_cached and ep_cached.get("season"):
             ep_info = {k: v for k, v in ep_cached.items() if k != "_ts"}
 
+    # ── 3. Enrich with episode-level IMDb ID ───────────────────────────────
+    if ep_info and ep_info.get("tvmaze_ep_id"):
+        ep_imdb = _fetch_ep_imdb_id(ep_info["tvmaze_ep_id"])
+        if ep_imdb:
+            ep_info["ep_imdb_id"] = ep_imdb
+
     if ep_info:
-        result.update(ep_info)
+        result.update({k: v for k, v in ep_info.items() if k != "tvmaze_ep_id"})
 
     return jsonify(result)
 
