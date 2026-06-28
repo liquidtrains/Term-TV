@@ -473,6 +473,10 @@ _recordings_lock: threading.Lock  = threading.Lock()
 _web_tasks:      List[Dict] = []   # [{id, type, title, ch_name, ch_url, start_ts}]
 _web_tasks_lock: threading.Lock = threading.Lock()
 
+_tvmaze_show_cache: Dict[str, Dict] = {}   # title_key → {id, imdb_id, summary, _ts}
+_tvmaze_ep_cache:   Dict[str, Dict] = {}   # ep_key    → {season, episode, ep_title, ep_desc, _ts}
+_tvmaze_lock:       threading.Lock  = threading.Lock()
+
 
 def launch_recording(url: str, channel: str, show: str = "") -> Dict:
     """Start a background mpv recording (no window). Returns status dict."""
@@ -1643,8 +1647,21 @@ function showPopup(prog, ch) {
 
   document.getElementById('popup-ch').textContent    = ch.name + (ch.group ? '  [' + ch.group + ']' : '');
   document.getElementById('popup-title').textContent = prog.title;
-  document.getElementById('popup-ep').textContent    = prog.episode_num || '';
-  document.getElementById('popup-ep').style.display  = prog.episode_num ? '' : 'none';
+  // Format episode_num nicely; subtitle fills ep line when there's no ep number
+  const _epParsed = parseEpNum(prog.episode_num);
+  const _epEl     = document.getElementById('popup-ep');
+  if (_epParsed) {
+    const _se  = fmtSE(_epParsed.season, _epParsed.episode);
+    const _sub = prog.subtitle || '';
+    _epEl.textContent  = _sub ? _se + '  —  ' + _sub : _se;
+    _epEl.style.display = '';
+  } else if (prog.subtitle) {
+    _epEl.textContent  = prog.subtitle;
+    _epEl.style.display = '';
+  } else {
+    _epEl.textContent  = '';
+    _epEl.style.display = 'none';
+  }
   document.getElementById('popup-time').textContent  =
     fmt(prog.start_ts) + ' – ' + fmt(prog.stop_ts) + '  (' + prog.duration_min + ' min)';
   document.getElementById('popup-desc').textContent  = prog.description || 'No description available.';
@@ -1677,10 +1694,12 @@ function showPopup(prog, ch) {
     _taskStatusEl.style.display = 'none';
   }
 
-  const imdbBtn = document.getElementById('popup-imdb');
+  const imdbBtn   = document.getElementById('popup-imdb');
   const imdbQuery = prog.title + (prog.air_date ? ' ' + prog.air_date.slice(0, 4) : '');
-  imdbBtn.href = 'https://www.imdb.com/find/?q=' + encodeURIComponent(imdbQuery) + '&s=tt';
+  imdbBtn.href        = 'https://www.imdb.com/find/?q=' + encodeURIComponent(imdbQuery) + '&s=tt';
+  imdbBtn.textContent = 'IMDb';   // will be updated by fetchShowMeta if match found
   imdbBtn.style.display = '';
+  fetchShowMeta(prog, prog);   // async; updates href/label/desc/ep when ready
 
   const isFuture = prog.start_ts > nt;
   const schedBtn  = document.getElementById('popup-schedule');
@@ -1740,6 +1759,86 @@ async function cancelTask(taskKey, type, taskId) {
     showToast('Cancelled');
     closePopup();
   } catch (e) { showToast('Error: ' + e.message, true); }
+}
+
+// Parse raw XMLTV episode-num strings into {season, episode}
+function parseEpNum(raw) {
+  if (!raw) return null;
+  // xmltv_ns: "1.4.0"  → season=2, episode=5  (0-indexed)
+  if (/^\\d+\\.\\d/.test(raw)) {
+    const p = raw.split('.');
+    const s = parseInt(p[0], 10) + 1;
+    const e = parseInt(p[1], 10) + 1;
+    return (s > 0 && e > 0) ? {season: s, episode: e} : null;
+  }
+  // onscreen: S02E05 or s2e5
+  const m = raw.match(/[Ss](\\d+)[Ee](\\d+)/);
+  if (m) return {season: parseInt(m[1], 10), episode: parseInt(m[2], 10)};
+  // 2x05
+  const m2 = raw.match(/^(\\d+)[xX](\\d+)$/);
+  if (m2) return {season: parseInt(m2[1], 10), episode: parseInt(m2[2], 10)};
+  return null;
+}
+
+function fmtSE(s, e) {
+  return 'S' + String(s).padStart(2,'0') + 'E' + String(e).padStart(2,'0');
+}
+
+const _showMetaCache = new Map();  // title_lower → resolved meta object
+
+async function fetchShowMeta(prog, capturedPopupProg) {
+  const params = new URLSearchParams({title: prog.title});
+  if (prog.subtitle)  params.set('subtitle', prog.subtitle);
+  if (prog.air_date)  params.set('air_date',  prog.air_date);
+  try {
+    const cacheKey = prog.title.toLowerCase() + '|' + (prog.air_date||'') + '|' + (prog.subtitle||'');
+    let meta = _showMetaCache.get(cacheKey);
+    if (!meta) {
+      meta = await (await fetch('/api/show_meta?' + params)).json();
+      if (meta.imdb_id) _showMetaCache.set(cacheKey, meta);
+    }
+    if (!meta || !meta.imdb_id) return;
+    if (popupProg !== capturedPopupProg) return;   // popup switched
+
+    // Determine season — prefer TVMaze match, fall back to parsed EPG episode_num
+    let season  = meta.season;
+    let episode = meta.episode;
+    if (!season) {
+      const parsed = parseEpNum(prog.episode_num);
+      if (parsed) { season = parsed.season; episode = parsed.episode; }
+    }
+
+    // Update IMDb button with direct title/season link
+    const imdbBtn = document.getElementById('popup-imdb');
+    if (imdbBtn) {
+      let url   = 'https://www.imdb.com/title/' + meta.imdb_id;
+      let label = 'IMDb';
+      if (season) {
+        url  += '/episodes/?season=' + season;
+        label = 'IMDb ' + (episode ? fmtSE(season, episode) : 'S' + String(season).padStart(2,'0'));
+      }
+      imdbBtn.href        = url;
+      imdbBtn.textContent = label;
+    }
+
+    // Fill description from TVMaze if EPG had none
+    const descEl = document.getElementById('popup-desc');
+    if (descEl && popupProg === capturedPopupProg && !prog.description) {
+      const fill = meta.ep_desc || meta.summary;
+      if (fill) descEl.textContent = fill;
+    }
+
+    // Fill / improve episode line if TVMaze found season+episode
+    if (season && episode) {
+      const epEl = document.getElementById('popup-ep');
+      if (epEl && popupProg === capturedPopupProg) {
+        const se   = fmtSE(season, episode);
+        const sub  = meta.ep_title || prog.subtitle || '';
+        epEl.textContent = sub ? se + '  —  ' + sub : se;
+        epEl.style.display = '';
+      }
+    }
+  } catch (_) {}
 }
 
 async function schedulePb(prog, ch) {
@@ -2387,6 +2486,110 @@ def api_status():
         "mpv_just_died":  mpv_just_died,
         "mpv_exit_code":  st.get("exit_code"),
     })
+
+
+@app.route("/api/show_meta")
+def api_show_meta():
+    """Return TVMaze show + episode metadata for the IMDb popup link."""
+    title    = request.args.get("title",    "").strip()
+    subtitle = request.args.get("subtitle", "").strip()
+    air_date = request.args.get("air_date", "").strip()   # YYYYMMDD
+    if not title:
+        return jsonify({"error": "No title"}), 400
+
+    title_key = re.sub(r"\s+", " ", title.lower())
+
+    # ── 1. Fetch show-level info (24 h cache) ──────────────────────────────
+    with _tvmaze_lock:
+        show_cached = _tvmaze_show_cache.get(title_key)
+
+    if not show_cached or time.time() - show_cached.get("_ts", 0) > 86400:
+        try:
+            r = requests.get("https://api.tvmaze.com/singlesearch/shows",
+                             params={"q": title}, timeout=5)
+            if r.status_code == 404:
+                return jsonify({"error": "Show not found on TVMaze"}), 404
+            r.raise_for_status()
+            d = r.json()
+            show_cached = {
+                "id":      d["id"],
+                "name":    d.get("name", ""),
+                "imdb_id": (d.get("externals") or {}).get("imdb"),
+                "summary": re.sub(r"<[^>]+>", "", d.get("summary") or ""),
+                "_ts":     time.time(),
+            }
+            with _tvmaze_lock:
+                _tvmaze_show_cache[title_key] = show_cached
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    show_id = show_cached["id"]
+    result  = {k: v for k, v in show_cached.items() if k not in ("_ts", "id")}
+
+    # ── 2. Find specific episode: try air_date first, then subtitle ─────────
+    ep_info   = None
+    ep_cached = None
+
+    if air_date and len(air_date) >= 8:
+        ep_key = f"{show_id}|date|{air_date[:8]}"
+        with _tvmaze_lock:
+            ep_cached = _tvmaze_ep_cache.get(ep_key)
+        if not ep_cached or time.time() - ep_cached.get("_ts", 0) > 86400:
+            try:
+                date_str = f"{air_date[:4]}-{air_date[4:6]}-{air_date[6:8]}"
+                r = requests.get(f"https://api.tvmaze.com/shows/{show_id}/episodesbydate",
+                                 params={"date": date_str}, timeout=5)
+                if r.status_code == 200:
+                    eps = r.json()
+                    if eps:
+                        ep = eps[0]
+                        ep_cached = {
+                            "season":   ep.get("season"),
+                            "episode":  ep.get("number"),
+                            "ep_title": ep.get("name", ""),
+                            "ep_desc":  re.sub(r"<[^>]+>", "", ep.get("summary") or ""),
+                            "_ts":      time.time(),
+                        }
+                        with _tvmaze_lock:
+                            _tvmaze_ep_cache[ep_key] = ep_cached
+            except Exception:
+                pass
+        if ep_cached and ep_cached.get("season"):
+            ep_info = {k: v for k, v in ep_cached.items() if k != "_ts"}
+
+    if not ep_info and subtitle:
+        ep_key = f"{show_id}|sub|{subtitle.lower()[:60]}"
+        with _tvmaze_lock:
+            ep_cached = _tvmaze_ep_cache.get(ep_key)
+        if not ep_cached or time.time() - ep_cached.get("_ts", 0) > 86400:
+            try:
+                r = requests.get(f"https://api.tvmaze.com/shows/{show_id}/episodes",
+                                 timeout=8)
+                if r.status_code == 200:
+                    sub_lower = subtitle.lower()
+                    match = next(
+                        (e for e in r.json() if e.get("name", "").lower() == sub_lower),
+                        None
+                    )
+                    if match:
+                        ep_cached = {
+                            "season":   match.get("season"),
+                            "episode":  match.get("number"),
+                            "ep_title": match.get("name", ""),
+                            "ep_desc":  re.sub(r"<[^>]+>", "", match.get("summary") or ""),
+                            "_ts":      time.time(),
+                        }
+                        with _tvmaze_lock:
+                            _tvmaze_ep_cache[ep_key] = ep_cached
+            except Exception:
+                pass
+        if ep_cached and ep_cached.get("season"):
+            ep_info = {k: v for k, v in ep_cached.items() if k != "_ts"}
+
+    if ep_info:
+        result.update(ep_info)
+
+    return jsonify(result)
 
 
 @app.route("/api/remind", methods=["POST"])
