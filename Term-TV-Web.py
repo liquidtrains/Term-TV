@@ -399,7 +399,7 @@ def launch_mpv(url: str, channel_name: str, show_title: str = "") -> bool:
 
     mpv_args = [
         "mpv",
-        "--stream-lavf-o=reconnect=1,reconnect_at_eof=1,reconnect_streamed=1,reconnect_delay_max=5,timeout=10000000",
+        "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5,timeout=10000000",
         "--cache=yes",
         "--cache-pause=no",
         url,
