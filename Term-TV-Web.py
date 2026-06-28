@@ -397,7 +397,13 @@ def launch_mpv(url: str, channel_name: str, show_title: str = "") -> bool:
     global _mpv_process, _mpv_info, _mpv_log_handle
     stop_mpv()
 
-    mpv_args = ["mpv", "--stream-lavf-o=timeout=10000000", url]
+    mpv_args = [
+        "mpv",
+        "--stream-lavf-o=reconnect=1,reconnect_at_eof=1,reconnect_streamed=1,reconnect_delay_max=5,timeout=10000000",
+        "--cache=yes",
+        "--cache-pause=no",
+        url,
+    ]
     try:
         log_handle = open(MPV_LOG_FILE, "a", encoding="utf-8", errors="replace")
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1809,18 +1815,26 @@ async function fetchShowMeta(prog, capturedPopupProg) {
       if (parsed) { season = parsed.season; episode = parsed.episode; }
     }
 
-    // Update IMDb button — episode page if we have ep_imdb_id, season page otherwise
+    // Update IMDb button — best available link in priority order
     const imdbBtn = document.getElementById('popup-imdb');
     if (imdbBtn) {
-      let url   = 'https://www.imdb.com/title/' + meta.imdb_id;
-      let label = 'IMDb';
+      const _se  = (season && episode) ? fmtSE(season, episode) : season ? 'S' + String(season).padStart(2,'0') : '';
+      let url, label;
       if (meta.ep_imdb_id) {
-        // Direct link to the specific episode's IMDb page
+        // TVMaze has the episode-level IMDb tt-ID — direct episode page
         url   = 'https://www.imdb.com/title/' + meta.ep_imdb_id + '/';
-        label = 'IMDb ' + (season && episode ? fmtSE(season, episode) : season ? 'S' + String(season).padStart(2,'0') : '');
+        label = 'IMDb ' + _se;
+      } else if (meta.ep_title) {
+        // No episode tt-ID but we know the title — IMDb episode search (first result = this ep)
+        url   = 'https://www.imdb.com/find/?q=' + encodeURIComponent((meta.name || prog.title) + ' ' + meta.ep_title) + '&type=episode';
+        label = 'IMDb ' + _se;
       } else if (season) {
-        url  += '/episodes/?season=' + season;
-        label = 'IMDb ' + (episode ? fmtSE(season, episode) : 'S' + String(season).padStart(2,'0'));
+        // Fallback: season episodes list
+        url   = 'https://www.imdb.com/title/' + meta.imdb_id + '/episodes/?season=' + season;
+        label = 'IMDb ' + _se;
+      } else {
+        url   = 'https://www.imdb.com/title/' + meta.imdb_id;
+        label = 'IMDb';
       }
       imdbBtn.href        = url;
       imdbBtn.textContent = label.trim() || 'IMDb';
