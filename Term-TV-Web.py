@@ -65,6 +65,7 @@ from lib.term_tv_core import (
     load_watch_history as _core_load_watch_history,
     get_public_ip as _core_get_public_ip,
     is_new_episode as _core_is_new_episode,
+    send_desktop_notification,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -1141,6 +1142,9 @@ body {
     <div id="popup-ftr">
       <button class="btn btn-primary" id="popup-play">▶ Play in mpv</button>
       <button class="btn" id="popup-record" style="border-color:#7f1d1d;color:#f87171">⏺ Record</button>
+      <button class="btn" id="popup-schedule" style="display:none;border-color:#7c3aed;color:#a78bfa">⏰ Schedule</button>
+      <button class="btn" id="popup-remind"   style="display:none;border-color:#0369a1;color:#38bdf8">🔔 Remind</button>
+      <a id="popup-imdb" class="btn" target="_blank" rel="noopener" style="border-color:#f5c518;color:#f5c518;text-decoration:none;display:none">IMDb</a>
       <button class="btn" onclick="closePopup()">Cancel</button>
     </div>
   </div>
@@ -1632,11 +1636,50 @@ function showPopup(prog, ch) {
   const recBtn = document.getElementById('popup-record');
   recBtn.onclick = () => { startRecording(ch.url, ch.name, prog.title); closePopup(); };
 
+  const imdbBtn = document.getElementById('popup-imdb');
+  const imdbQuery = prog.title + (prog.air_date ? ' ' + prog.air_date.slice(0, 4) : '');
+  imdbBtn.href = 'https://www.imdb.com/find/?q=' + encodeURIComponent(imdbQuery) + '&s=tt';
+  imdbBtn.style.display = '';
+
+  const isFuture = prog.start_ts > nt;
+  const schedBtn  = document.getElementById('popup-schedule');
+  const remindBtn = document.getElementById('popup-remind');
+  schedBtn.style.display  = isFuture ? '' : 'none';
+  remindBtn.style.display = isFuture ? '' : 'none';
+  if (isFuture) {
+    schedBtn.onclick  = () => { schedulePb(prog, ch);  closePopup(); };
+    remindBtn.onclick = () => { remindPb(prog, ch);    closePopup(); };
+  }
+
   document.getElementById('popup-overlay').style.display = 'flex';
 }
 
 function closePopup() {
   document.getElementById('popup-overlay').style.display = 'none';
+}
+
+async function schedulePb(prog, ch) {
+  try {
+    const res  = await fetch('/api/schedule', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url: ch.url, channel_name: ch.name, title: prog.title, start_ts: prog.start_ts})
+    });
+    const data = await res.json();
+    if (data.ok) showToast('Scheduled: ' + prog.title + ' in ' + data.minutes_until + ' min');
+    else         showToast('Schedule failed: ' + (data.error || 'unknown'), true);
+  } catch (e) { showToast('Error: ' + e.message, true); }
+}
+
+async function remindPb(prog, ch) {
+  try {
+    const res  = await fetch('/api/remind', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({start_ts: prog.start_ts, title: prog.title, channel_name: ch.name})
+    });
+    const data = await res.json();
+    if (data.ok) showToast('Reminder set for ' + prog.title + ' (in ' + data.minutes_until + ' min)');
+    else         showToast('Reminder failed: ' + (data.error || 'unknown'), true);
+  } catch (e) { showToast('Error: ' + e.message, true); }
 }
 
 // ── Toast ─────────────────────────────────────────────────────────────────
@@ -2258,6 +2301,58 @@ def api_status():
         "mpv_just_died":  mpv_just_died,
         "mpv_exit_code":  st.get("exit_code"),
     })
+
+
+@app.route("/api/remind", methods=["POST"])
+def api_remind():
+    data       = request.get_json(force=True) or {}
+    start_ts   = int(data.get("start_ts", 0))
+    title      = data.get("title", "Unknown")
+    ch_name    = data.get("channel_name", "")
+    now_ts     = int(datetime.now().astimezone().timestamp())
+    if start_ts <= now_ts:
+        return jsonify({"ok": False, "error": "Show has already started"}), 400
+    delay = max(0, start_ts - now_ts - 60)
+    minutes_until = max(0, (start_ts - now_ts) // 60)
+
+    def _fire():
+        time.sleep(delay)
+        send_desktop_notification("Term-TV Reminder", f"Starting in ~1 min: {title}")
+        logging.info(f"Web reminder fired: {title}")
+
+    threading.Thread(target=_fire, daemon=True).start()
+    return jsonify({"ok": True, "minutes_until": minutes_until})
+
+
+@app.route("/api/schedule", methods=["POST"])
+def api_schedule():
+    data       = request.get_json(force=True) or {}
+    url        = data.get("url", "").strip()
+    ch_name    = data.get("channel_name", "")
+    title      = data.get("title", "Unknown")
+    start_ts   = int(data.get("start_ts", 0))
+    if not url:
+        return jsonify({"ok": False, "error": "No URL provided"}), 400
+    now_ts = int(datetime.now().astimezone().timestamp())
+    if start_ts <= now_ts:
+        return jsonify({"ok": False, "error": "Show has already started"}), 400
+    delay = max(0, start_ts - now_ts)
+    minutes_until = max(0, delay // 60)
+
+    def _schedule():
+        notify_wait = max(0, delay - 300)
+        time.sleep(notify_wait)
+        if notify_wait > 0:
+            send_desktop_notification("Term-TV", f"Starting in 5 min: {title}")
+        time.sleep(delay - notify_wait)
+        try:
+            subprocess.Popen(["mpv", "--stream-lavf-o=timeout=10000000", url])
+            logging.info(f"Scheduled web playback launched: {title} on {ch_name}")
+        except Exception as e:
+            logging.error(f"Scheduled web playback failed: {e}")
+
+    threading.Thread(target=_schedule, daemon=True).start()
+    return jsonify({"ok": True, "minutes_until": minutes_until})
 
 
 @app.route("/api/play", methods=["POST"])
