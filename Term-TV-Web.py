@@ -1145,7 +1145,10 @@ body {
     </div>
     <div id="popup-body">
       <div id="popup-now" class="now-badge" style="display:none">NOW PLAYING</div>
-      <div id="popup-task-status" style="display:none;font-size:11px;font-weight:600;margin-bottom:6px"></div>
+      <div id="popup-task-status" style="display:none;align-items:center;gap:8px;font-size:11px;font-weight:600;margin-bottom:6px">
+        <span id="popup-task-label"></span>
+        <button id="popup-task-cancel" style="font-size:10px;padding:1px 6px;background:none;border:1px solid #555;border-radius:3px;color:#999;cursor:pointer;flex-shrink:0">✕ Cancel</button>
+      </div>
       <h2 id="popup-title"></h2>
       <div id="popup-ep"></div>
       <div id="popup-time"></div>
@@ -1205,7 +1208,7 @@ let vodMode         = false;
 let vodPage         = 1;
 let _vodTotal       = 0;
 let _prevDataLoading  = true;       // U3: start true so first poll always detects load completion
-const _webTasks = new Map();        // key: ch_url+'|'+start_ts  value: 'remind'|'schedule'|'record'
+const _webTasks = new Map();        // key: ch_url+'|'+start_ts  value: {type, taskId}
 let _dataVersion      = -1;         // tracks data_version from /api/status; reload guide when it changes
 let _playingRow       = null;       // Fix-7: cached DOM ref to highlighted guide row
 let _loadGuideActive  = false;      // prevent concurrent loadGuide() calls
@@ -1471,7 +1474,7 @@ function buildBlock(prog, ch, totalW) {
   const _tk = (ch.url || '') + '|' + prog.start_ts;
   b.dataset.tk = _tk;
   const _bt = _webTasks.get(_tk);
-  if (_bt) b.appendChild(_makeTaskBadge(_bt));
+  if (_bt) b.appendChild(_makeTaskBadge(_bt.type));
   return b;
 }
 
@@ -1652,16 +1655,24 @@ function showPopup(prog, ch) {
   playBtn.onclick = () => { play(ch.url, ch.name, prog.title); closePopup(); };
 
   const recBtn = document.getElementById('popup-record');
-  recBtn.onclick = () => { _markTask(ch, prog, 'record'); startRecording(ch.url, ch.name, prog.title); closePopup(); };
+  recBtn.onclick = async () => {
+    closePopup();
+    const recId = await startRecording(ch.url, ch.name, prog.title);
+    if (recId) _markTask(ch, prog, 'record', recId);
+  };
 
   const _taskStatusEl = document.getElementById('popup-task-status');
   const _existingTask = _webTasks.get((ch.url || '') + '|' + prog.start_ts);
   if (_existingTask) {
-    const _taskLabels = {remind: '🔔 Reminder set', schedule: '⏰ Scheduled for playback', record: '⏺ Recording queued'};
+    const _taskLabels = {remind: '🔔 Reminder set', schedule: '⏰ Scheduled for playback', record: '⏺ Recording active'};
     const _taskColors = {remind: '#38bdf8', schedule: '#a78bfa', record: '#f87171'};
-    _taskStatusEl.textContent  = _taskLabels[_existingTask] || _existingTask;
-    _taskStatusEl.style.color  = _taskColors[_existingTask] || '';
-    _taskStatusEl.style.display = '';
+    const _tk = _taskKey(ch, prog);
+    const _type = _existingTask.type;
+    const _tid  = _existingTask.taskId;
+    document.getElementById('popup-task-label').textContent = _taskLabels[_type] || _type;
+    document.getElementById('popup-task-label').style.color = _taskColors[_type] || '';
+    document.getElementById('popup-task-cancel').onclick = () => cancelTask(_tk, _type, _tid);
+    _taskStatusEl.style.display = 'flex';
   } else {
     _taskStatusEl.style.display = 'none';
   }
@@ -1696,24 +1707,39 @@ function _makeTaskBadge(type)  {
   return s;
 }
 function _refreshTaskBadges() {
-  _webTasks.forEach((type, key) => {
+  _webTasks.forEach((entry, key) => {
     document.querySelectorAll('[data-tk="' + key.replace(/"/g, '\\"') + '"]').forEach(cell => {
-      if (!cell.querySelector('.prog-badge')) cell.appendChild(_makeTaskBadge(type));
+      if (!cell.querySelector('.prog-badge')) cell.appendChild(_makeTaskBadge(entry.type));
     });
   });
 }
-function _markTask(ch, prog, type) {
-  _webTasks.set(_taskKey(ch, prog), type);
+function _markTask(ch, prog, type, taskId) {
+  _webTasks.set(_taskKey(ch, prog), {type, taskId});
   _refreshTaskBadges();
 }
 async function _loadScheduled() {
   try {
     const data = await (await fetch('/api/scheduled')).json();
     (data.tasks || []).forEach(t => {
-      if (t.ch_url && t.start_ts) _webTasks.set(t.ch_url + '|' + t.start_ts, t.type);
+      if (t.ch_url && t.start_ts) _webTasks.set(t.ch_url + '|' + t.start_ts, {type: t.type, taskId: t.id});
     });
     _refreshTaskBadges();
   } catch (_) {}
+}
+
+async function cancelTask(taskKey, type, taskId) {
+  const endpoint = type === 'record'
+    ? '/api/recording/' + taskId + '/stop'
+    : '/api/scheduled/' + taskId + '/cancel';
+  try {
+    await fetch(endpoint, {method: 'POST'});
+    _webTasks.delete(taskKey);
+    document.querySelectorAll('[data-tk="' + taskKey.replace(/"/g, '\\"') + '"]').forEach(cell => {
+      cell.querySelectorAll('.prog-badge').forEach(b => b.remove());
+    });
+    showToast('Cancelled');
+    closePopup();
+  } catch (e) { showToast('Error: ' + e.message, true); }
 }
 
 async function schedulePb(prog, ch) {
@@ -1723,7 +1749,7 @@ async function schedulePb(prog, ch) {
       body: JSON.stringify({url: ch.url, channel_name: ch.name, title: prog.title, start_ts: prog.start_ts})
     });
     const data = await res.json();
-    if (data.ok) { _markTask(ch, prog, 'schedule'); showToast('Scheduled: ' + prog.title + ' in ' + data.minutes_until + ' min'); }
+    if (data.ok) { _markTask(ch, prog, 'schedule', data.task_id); showToast('Scheduled: ' + prog.title + ' in ' + data.minutes_until + ' min'); }
     else           showToast('Schedule failed: ' + (data.error || 'unknown'), true);
   } catch (e) { showToast('Error: ' + e.message, true); }
 }
@@ -1735,7 +1761,7 @@ async function remindPb(prog, ch) {
       body: JSON.stringify({start_ts: prog.start_ts, title: prog.title, channel_name: ch.name})
     });
     const data = await res.json();
-    if (data.ok) { _markTask(ch, prog, 'remind'); showToast('Reminder set for ' + prog.title + ' (in ' + data.minutes_until + ' min)'); }
+    if (data.ok) { _markTask(ch, prog, 'remind', data.task_id); showToast('Reminder set for ' + prog.title + ' (in ' + data.minutes_until + ' min)'); }
     else           showToast('Reminder failed: ' + (data.error || 'unknown'), true);
   } catch (e) { showToast('Error: ' + e.message, true); }
 }
@@ -2175,10 +2201,12 @@ async function startRecording(url, channel, show) {
     if (data.ok) {
       showToast('\u23fa Recording: ' + channel + (show ? ' \u2014 ' + show : ''));
       setTimeout(updateRecordings, 600);
+      return data.id;
     } else {
       showToast('Record error: ' + (data.error || 'unknown'), true);
+      return null;
     }
-  } catch (e) { showToast('Error: ' + e.message, true); }
+  } catch (e) { showToast('Error: ' + e.message, true); return null; }
 }
 
 async function stopRecording(id) {
@@ -2373,14 +2401,17 @@ def api_remind():
     delay = max(0, start_ts - now_ts - 60)
     minutes_until = max(0, (start_ts - now_ts) // 60)
 
-    task_id = int(time.time() * 1000)
+    task_id    = int(time.time() * 1000)
+    cancel_evt = threading.Event()
     with _web_tasks_lock:
         _web_tasks.append({"id": task_id, "type": "remind", "title": title,
                            "ch_name": ch_name, "ch_url": data.get("ch_url", ""),
-                           "start_ts": start_ts})
+                           "start_ts": start_ts, "_cancel": cancel_evt})
 
     def _fire():
-        time.sleep(delay)
+        if cancel_evt.wait(timeout=delay):
+            print(f"[REMIND] '{title}' — cancelled")
+            return
         send_desktop_notification("Term-TV Reminder", f"Starting in ~1 min: {title}")
         print(f"[REMINDER] '{title}' — notification fired")
         with _web_tasks_lock:
@@ -2406,18 +2437,24 @@ def api_schedule():
     delay = max(0, start_ts - now_ts)
     minutes_until = max(0, delay // 60)
 
-    task_id = int(time.time() * 1000)
+    task_id    = int(time.time() * 1000)
+    cancel_evt = threading.Event()
     with _web_tasks_lock:
         _web_tasks.append({"id": task_id, "type": "schedule", "title": title,
-                           "ch_name": ch_name, "ch_url": url, "start_ts": start_ts})
+                           "ch_name": ch_name, "ch_url": url, "start_ts": start_ts,
+                           "_cancel": cancel_evt})
 
     def _schedule():
         notify_wait = max(0, delay - 300)
-        time.sleep(notify_wait)
+        if cancel_evt.wait(timeout=notify_wait):
+            print(f"[SCHEDULE] '{title}' — cancelled")
+            return
         if notify_wait > 0:
             send_desktop_notification("Term-TV", f"Starting in 5 min: {title}")
             print(f"[SCHEDULE] '{title}' — 5-min notification sent")
-        time.sleep(delay - notify_wait)
+        if cancel_evt.wait(timeout=delay - notify_wait):
+            print(f"[SCHEDULE] '{title}' — cancelled before launch")
+            return
         with _web_tasks_lock:
             _web_tasks[:] = [t for t in _web_tasks if t["id"] != task_id]
         try:
@@ -2468,13 +2505,28 @@ def api_record():
 @app.route("/api/scheduled")
 def api_scheduled():
     with _web_tasks_lock:
-        tasks = list(_web_tasks)
+        tasks = [{k: v for k, v in t.items() if k != "_cancel"} for t in _web_tasks]
     with _recordings_lock:
-        recs = [{"type": "record", "title": r.get("show", r.get("channel", "")),
+        recs = [{"id": r["id"], "type": "record",
+                 "title": r.get("show", r.get("channel", "")),
                  "ch_name": r.get("channel", ""), "ch_url": r.get("url", ""),
                  "start_ts": 0}
                 for r in _recordings.values() if r.get("process") and r["process"].poll() is None]
     return jsonify({"tasks": tasks + recs})
+
+
+@app.route("/api/scheduled/<int:task_id>/cancel", methods=["POST"])
+def api_cancel_task(task_id):
+    with _web_tasks_lock:
+        for t in _web_tasks:
+            if t["id"] == task_id:
+                ev = t.get("_cancel")
+                if ev:
+                    ev.set()
+                break
+        _web_tasks[:] = [t for t in _web_tasks if t["id"] != task_id]
+    print(f"[CANCEL] task {task_id} cancelled")
+    return jsonify({"ok": True})
 
 
 @app.route("/api/recordings")
