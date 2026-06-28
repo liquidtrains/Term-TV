@@ -2318,9 +2318,10 @@ def api_remind():
     def _fire():
         time.sleep(delay)
         send_desktop_notification("Term-TV Reminder", f"Starting in ~1 min: {title}")
-        logging.info(f"Web reminder fired: {title}")
+        print(f"[REMINDER] '{title}' — notification fired")
 
     threading.Thread(target=_fire, daemon=True).start()
+    print(f"[REMIND] '{title}' on {ch_name} — notification in {minutes_until} min")
     return jsonify({"ok": True, "minutes_until": minutes_until})
 
 
@@ -2344,14 +2345,16 @@ def api_schedule():
         time.sleep(notify_wait)
         if notify_wait > 0:
             send_desktop_notification("Term-TV", f"Starting in 5 min: {title}")
+            print(f"[SCHEDULE] '{title}' — 5-min notification sent")
         time.sleep(delay - notify_wait)
         try:
             subprocess.Popen(["mpv", "--stream-lavf-o=timeout=10000000", url])
-            logging.info(f"Scheduled web playback launched: {title} on {ch_name}")
+            print(f"[SCHEDULE] '{title}' on {ch_name} — mpv launched")
         except Exception as e:
-            logging.error(f"Scheduled web playback failed: {e}")
+            print(f"[SCHEDULE] '{title}' — launch failed: {e}", file=sys.stderr)
 
     threading.Thread(target=_schedule, daemon=True).start()
+    print(f"[SCHEDULE] '{title}' on {ch_name} — playback in {minutes_until} min")
     return jsonify({"ok": True, "minutes_until": minutes_until})
 
 
