@@ -44,6 +44,7 @@ ShowResult = Dict[str, Any]
 WATCH_HISTORY_FILE  = Path(".watch_history.json")
 SEARCH_HISTORY_FILE = Path(".search_history.json")
 FAVORITES_FILE      = Path(".favorites.json")
+CHANNEL_NOTES_FILE  = Path(".channel_notes.json")
 RECORDINGS_DIR      = Path.home() / "Videos" / "Recordings"
 EPG_CACHE_DIR       = Path(".epg_cache")
 M3U_CACHE_DIR       = Path(".m3u_cache")
@@ -1112,6 +1113,46 @@ def send_desktop_notification(title: str, message: str):
         notification.notify(title=title, message=message, timeout=10)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Channel notes (F2)
+# ---------------------------------------------------------------------------
+
+def load_channel_notes() -> Dict[str, str]:
+    """Return saved channel notes as {key: note_text}."""
+    if not CHANNEL_NOTES_FILE.exists():
+        return {}
+    try:
+        with open(CHANNEL_NOTES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.warning(f"Failed to load channel notes: {e}")
+        return {}
+
+
+def _channel_note_key(channel: Channel) -> str:
+    return channel.get("tvg-id") or channel.get("url", "")
+
+
+def get_channel_note(channel: Channel) -> str:
+    """Return saved note for this channel, or empty string if none."""
+    return load_channel_notes().get(_channel_note_key(channel), "")
+
+
+def set_channel_note(channel: Channel, note: str):
+    """Save (or clear) a personal note for this channel."""
+    notes = load_channel_notes()
+    key = _channel_note_key(channel)
+    if note:
+        notes[key] = note
+    else:
+        notes.pop(key, None)
+    try:
+        with open(CHANNEL_NOTES_FILE, "w", encoding="utf-8") as f:
+            json.dump(notes, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save channel notes. {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------

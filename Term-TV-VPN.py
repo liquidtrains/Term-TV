@@ -60,6 +60,7 @@ from lib.term_tv_core import (
     ensure_recordings_dir, extract_subtitles_from_recording, get_safe_filename,
     clean_old_cache_files, get_public_ip, check_vpn_status, input_with_countdown,
     _ch_in_group,
+    get_channel_note, set_channel_note,
 )
 
 # --- Constants ---
@@ -359,13 +360,16 @@ def display_scheduled_tasks():
 
             # Format task type for display
             if task_type == "playback":
-                type_icon = "▶"
+                type_icon = ">"
                 type_label = "PLAYBACK"
             elif task_type == "recording":
-                type_icon = "⏺"
+                type_icon = "o"
                 type_label = "RECORD"
+            elif task_type == "reminder":
+                type_icon = "*"
+                type_label = "REMIND"
             else:
-                type_icon = "•"
+                type_icon = "-"
                 type_label = task_type.upper()
 
             print(f"{type_icon} [{type_label}] {time_str}")
@@ -870,6 +874,20 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
     print(f"  All stream URLs failed and no future reruns found in the next 24 hours")
 
 
+def scheduled_reminder_task(show_title: str, start_time: datetime, channel_name: str, task_id: int, cancel_event: Optional[threading.Event] = None):
+    """Background task: fires a desktop notification ~1 minute before a show starts."""
+    logging.info(f"Reminder task created: {show_title} on {channel_name}")
+    delay_seconds = max(0, int((start_time - datetime.now().astimezone()).total_seconds()) - 60)
+    _evt = cancel_event or threading.Event()
+    if _evt.wait(timeout=delay_seconds):
+        logging.info(f"Reminder cancelled: {show_title}")
+        return
+    with SCHEDULED_TASKS_LOCK:
+        SCHEDULED_TASKS[:] = [t for t in SCHEDULED_TASKS if t.get("id") != task_id]
+    send_desktop_notification("Term-TV Reminder", f"Starting in ~1 min: {show_title}")
+    print(f"\n[REMINDER] '{show_title}' starts in ~1 minute on {channel_name}")
+
+
 # --- Playback & Selection Functions ---
 
 def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
@@ -918,10 +936,15 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
                 print(f"  {label:>10}: {title}{' (' + ep + ')' if ep else ''}{dur}{new_badge}")
             print()
 
+    _note = get_channel_note(channel)
+    if _note:
+        print(f"Note: {_note}")
+
     print("Recording options:")
     print("  w: Watch only (no recording)")
     print("  r: Record while watching")
     print("  s: Schedule recording for later")
+    print("  n: Add/edit note for this channel")
     print("  b: Back")
 
     record_choice = input("\nYour choice (default: w): ").strip().lower()
@@ -930,6 +953,15 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         record_choice = 'w'
 
     if record_choice == 'b':
+        return
+
+    if record_choice == 'n':
+        _current = get_channel_note(channel)
+        if _current:
+            print(f"Current note: {_current}")
+        _new_note = input("Enter note (Enter to clear): ").strip()
+        set_channel_note(channel, _new_note)
+        print(f"  Note {'saved' if _new_note else 'cleared'}.")
         return
 
     # Handle scheduled recording
@@ -1035,6 +1067,12 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         print("⚠️  WARNING: Do NOT change subtitle tracks during recording or it will stop!")
         print("   Subtitles are pre-loaded - press 'v' to show/hide (safe)")
         print("   Press 'q' in mpv window to stop recording and playback")
+
+    if record_choice == 'w':
+        mpv_args.append("--save-position-on-quit")
+        _sleep_input = input("Sleep timer? (minutes, Enter for none): ").strip()
+        if _sleep_input and _sleep_input.isdigit() and int(_sleep_input) > 0:
+            mpv_args.append(f"--length={int(_sleep_input) * 60}")
 
     mpv_args.append(channel_url)
 
@@ -1743,6 +1781,9 @@ def main():
     parser.add_argument("--skip-vpn", action="store_true", help="Skip VPN connection/prompt at startup")
     parser.add_argument("--no-epg", action="store_true", help="Skip EPG loading (channel browsing only)")
     parser.add_argument("--search", metavar="QUERY", help="Jump directly to show search on startup")
+    parser.add_argument("--record", metavar="QUERY", help="Headless: search for show and record immediately")
+    parser.add_argument("--record-channel", metavar="NAME", help="Headless: record a channel by name")
+    parser.add_argument("--duration", type=int, metavar="MINUTES", help="Duration for headless recording (minutes)")
     args = parser.parse_args()
 
     # --- Logging Setup ---
@@ -1908,6 +1949,43 @@ def main():
     # If --search was passed, run the search once before entering the loop
     _startup_search = args.search
 
+    # --- F7: Headless recording mode (--record / --record-channel) ---
+    if args.record or args.record_channel:
+        ensure_recordings_dir()
+        if args.record:
+            _h_results = search_shows_in_timeframe(channels, epg, args.record, hours_ahead=3)
+            if not _h_results:
+                print(f"No show found matching '{args.record}'.", file=sys.stderr)
+                sys.exit(1)
+            _h_result = next((r for r in _h_results if r.get("is_playing_now")), _h_results[0])
+            _h_channel = _h_result["channel"]
+            _h_url = _h_channel.get("url", "")
+            _h_filename = get_safe_filename(_h_channel.get("name", ""), _h_result.get("title", ""))
+            print(f"Recording: {_h_result['title']} on {_h_channel.get('name', '?')}")
+        else:
+            _h_matches = search_channels(channels, args.record_channel)
+            if not _h_matches:
+                print(f"No channel found matching '{args.record_channel}'.", file=sys.stderr)
+                sys.exit(1)
+            _h_channel = _h_matches[0]
+            _h_url = _h_channel.get("url", "")
+            _h_filename = get_safe_filename(_h_channel.get("name", ""))
+            print(f"Recording: {_h_channel.get('name', '?')}")
+        _h_path = RECORDINGS_DIR / _h_filename
+        print(f"Output: {_h_path}")
+        _h_dur = (args.duration or 0) * 60
+        _h_mpv = ["mpv", f"--stream-record={_h_path}", "--sid=auto", "--no-sub-visibility"]
+        if _h_dur:
+            _h_mpv.append(f"--length={_h_dur}")
+        _h_mpv.append(_h_url)
+        try:
+            run_mpv_with_logging(_h_mpv, _h_channel.get("name", ""))
+            extract_subtitles_from_recording(_h_path)
+        except KeyboardInterrupt:
+            print("\nRecording stopped.")
+            extract_subtitles_from_recording(_h_path)
+        sys.exit(0)
+
     # --- Main Interaction Loop ---
     while True:
         # Display favorites
@@ -1945,6 +2023,10 @@ def main():
         print("  c: Search for channel")
         print("  g: Browse by channel group")
         print("  fav: Manage favorites")
+        print("  notes: Manage channel notes")
+        print("  rec: Browse and play recordings")
+        print("  export: Export watch history to CSV")
+        print("  hc: Check channel health")
         if not args.no_epg:
             print("  epg: Refresh EPG data")
         print("  cfg: Reload config")
@@ -1975,6 +2057,122 @@ def main():
         # Task cancellation
         if choice == "t":
             manage_scheduled_tasks()
+            continue
+
+        # F2: Channel notes management
+        if choice == "notes":
+            _nq = input("Search for channel to view/edit note: ").strip()
+            if not _nq:
+                continue
+            _nresults = search_channels(channels, _nq)
+            if not _nresults:
+                print("No channels found.")
+                continue
+            _nch = select_from_channel_list(_nresults, epg)
+            if _nch:
+                _existing_note = get_channel_note(_nch)
+                if _existing_note:
+                    print(f"Current note: {_existing_note}")
+                _new_note = input("Enter note (Enter to clear): ").strip()
+                set_channel_note(_nch, _new_note)
+                print(f"  Note {'saved' if _new_note else 'cleared'}.")
+            continue
+
+        # F5: Browse and play recordings
+        if choice == "rec":
+            ensure_recordings_dir()
+            _recs = sorted(RECORDINGS_DIR.glob("*.mkv"), key=lambda _f: _f.stat().st_mtime, reverse=True)
+            if not _recs:
+                print("No recordings found.")
+                continue
+            _page = _recs[:20]
+            print(f"\nRecordings ({len(_recs)} total, showing latest 20):")
+            for _ri, _rf in enumerate(_page, 1):
+                _sz = _rf.stat().st_size / (1024 * 1024)
+                _mt = datetime.fromtimestamp(_rf.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                print(f"  {_ri:>2}. {_rf.name}  ({_sz:.1f} MB, {_mt})")
+            _rsel = input(f"\nSelect recording (1-{len(_page)}, Enter to cancel): ").strip()
+            if _rsel.isdigit():
+                _ridx = int(_rsel) - 1
+                if 0 <= _ridx < len(_page):
+                    _rp = _page[_ridx]
+                    print(f"\nPlaying: {_rp.name}")
+                    run_mpv_with_logging(["mpv", "--save-position-on-quit", str(_rp)], _rp.name)
+            continue
+
+        # F6: Export watch history to CSV
+        if choice == "export":
+            import csv as _csv
+            _hist = load_watch_history()
+            if not _hist:
+                print("No watch history to export.")
+                continue
+            _efn = f"watch_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            try:
+                with open(_efn, "w", newline="", encoding="utf-8") as _ef:
+                    _fields = ["name", "tvg-id", "url", "watch_count", "total_duration_seconds", "last_watched"]
+                    _wr = _csv.DictWriter(_ef, fieldnames=_fields, extrasaction="ignore")
+                    _wr.writeheader()
+                    _wr.writerows(_hist)
+                print(f"  Exported {len(_hist)} entries to {_efn}")
+            except Exception as _e:
+                print(f"Error exporting history: {_e}", file=sys.stderr)
+            continue
+
+        # F4: Playlist health check
+        if choice == "hc":
+            from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+            _hc_sample = channels
+            if len(channels) > 200:
+                _hc_groups = get_channel_groups(channels)
+                print(f"\n{len(channels)} channels total.")
+                print("  a: Check all (slow)")
+                for _hci, (_hgn, _hgc) in enumerate(_hc_groups[:15], 1):
+                    print(f"  {_hci}: {_hgn} ({_hgc})")
+                _hc_sel = input("Select group number or 'a' for all: ").strip().lower()
+                if _hc_sel == 'a':
+                    print(f"Checking all {len(channels)} channels...")
+                elif _hc_sel.isdigit() and 0 <= int(_hc_sel) - 1 < len(_hc_groups):
+                    _hc_grp = _hc_groups[int(_hc_sel) - 1][0]
+                    _hc_sample = [c for c in channels if _ch_in_group(c, {_hc_grp})]
+                    print(f"Checking {len(_hc_sample)} channels in '{_hc_grp}'...")
+                else:
+                    continue
+            else:
+                print(f"Checking {len(_hc_sample)} channels...")
+
+            def _check_url(ch):
+                url = ch.get("url", "")
+                try:
+                    import requests as _req
+                    r = _req.head(url, timeout=5, allow_redirects=True)
+                    return ch, r.status_code < 400
+                except Exception:
+                    return ch, False
+
+            _hc_alive = 0
+            _hc_dead = []
+            _hc_done = 0
+            with ThreadPoolExecutor(max_workers=20) as _hc_ex:
+                _hc_futs = {_hc_ex.submit(_check_url, c): c for c in _hc_sample}
+                for _hc_fut in _as_completed(_hc_futs):
+                    _hc_ch, _hc_ok = _hc_fut.result()
+                    _hc_done += 1
+                    if _hc_ok:
+                        _hc_alive += 1
+                    else:
+                        _hc_dead.append(_hc_ch)
+                    if _hc_done % 50 == 0:
+                        print(f"  Checked {_hc_done}/{len(_hc_sample)}...")
+            print(f"\nHealth Check ({len(_hc_sample)} channels):")
+            print(f"  Alive: {_hc_alive}  Dead: {len(_hc_dead)}")
+            if _hc_dead:
+                _hc_show = input(f"Show {len(_hc_dead)} dead channel(s)? (y/n): ").strip().lower()
+                if _hc_show == 'y':
+                    for _dc in _hc_dead[:50]:
+                        print(f"  x {_dc.get('name', '?')} [{_dc.get('group-title', '?')}]")
+                    if len(_hc_dead) > 50:
+                        print(f"  ... and {len(_hc_dead) - 50} more")
             continue
 
         # Switch playlist
@@ -2228,6 +2426,7 @@ def main():
                     print("\nOptions:")
                     print("  p: Pop open when show starts (auto-watch)")
                     print("  r: Schedule recording")
+                    print("  n: Notify me when show starts (reminder only)")
                     print("  w: Watch channel now (show not started yet)")
                     print("  b: Back")
 
@@ -2330,6 +2529,28 @@ def main():
                             print(f"  Keep this terminal open until recording starts\n")
                         else:
                             print("Recording not scheduled.")
+                    elif future_choice == 'n':
+                        _r_start = chosen_result.get("start_time")
+                        _r_title = chosen_result.get("title", "Unknown")
+                        _r_chname = channel.get("name", "Unknown")
+                        _r_task_id = int(time.time() * 1000)
+                        _r_cancel = threading.Event()
+                        _r_sched_t = (_r_start - timedelta(seconds=60)) if _r_start else datetime.now().astimezone()
+                        with SCHEDULED_TASKS_LOCK:
+                            SCHEDULED_TASKS.append({
+                                "id": _r_task_id, "type": "reminder",
+                                "channel_name": _r_chname,
+                                "provider": provider,
+                                "show_title": _r_title,
+                                "scheduled_time": _r_sched_t,
+                                "cancel_event": _r_cancel,
+                            })
+                        threading.Thread(
+                            target=scheduled_reminder_task,
+                            args=(_r_title, _r_start, _r_chname, _r_task_id, _r_cancel),
+                            daemon=True,
+                        ).start()
+                        print(f"  Reminder set! You'll be notified 1 minute before '{_r_title}' starts.")
                     elif future_choice == 'w':
                         # Watch channel now even though show hasn't started
                         play_channel(channel, chosen_result)
