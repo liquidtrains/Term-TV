@@ -483,6 +483,8 @@ _tvmaze_show_cache: Dict[str, Dict] = {}   # title_key → {id, imdb_id, summary
 _tvmaze_ep_cache:   Dict[str, Dict] = {}   # ep_key    → {season, episode, ep_title, ep_desc, _ts}
 _tvmaze_lock:       threading.Lock  = threading.Lock()
 
+_tmdb_show_cache:   Dict[str, int]  = {}   # show_imdb_id → tmdb_show_id
+
 
 def launch_recording(url: str, channel: str, show: str = "") -> Dict:
     """Start a background mpv recording (no window). Returns status dict."""
@@ -2558,6 +2560,59 @@ def _fetch_ep_imdb_id(tvmaze_ep_id: int) -> Optional[str]:
     return None
 
 
+def _fetch_ep_imdb_via_tmdb(show_imdb_id: str, season: int, episode: int) -> Optional[str]:
+    """Use TMDB to get an episode-level IMDb ID. Requires tmdb_api_key in config.json."""
+    api_key = (_config or {}).get("tmdb_api_key", "").strip()
+    if not api_key:
+        return None
+
+    # Step 1: IMDb show ID → TMDB show ID (cached indefinitely)
+    with _tvmaze_lock:
+        tmdb_id = _tmdb_show_cache.get(show_imdb_id)
+
+    if not tmdb_id:
+        try:
+            r = requests.get(
+                f"https://api.themoviedb.org/3/find/{show_imdb_id}",
+                params={"external_source": "imdb_id", "api_key": api_key},
+                timeout=5,
+            )
+            if r.status_code == 200:
+                results = r.json().get("tv_results", [])
+                if results:
+                    tmdb_id = results[0]["id"]
+                    with _tvmaze_lock:
+                        _tmdb_show_cache[show_imdb_id] = tmdb_id
+        except Exception:
+            pass
+
+    if not tmdb_id:
+        return None
+
+    # Step 2: TMDB show ID + season + episode → episode external IDs (cached 24 h)
+    ep_key = f"tmdb_ep|{tmdb_id}|{season}|{episode}"
+    with _tvmaze_lock:
+        cached = _tvmaze_ep_cache.get(ep_key)
+    if cached and time.time() - cached.get("_ts", 0) < 86400:
+        return cached.get("ep_imdb_id")
+
+    try:
+        r = requests.get(
+            f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}/episode/{episode}/external_ids",
+            params={"api_key": api_key},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            ep_imdb = r.json().get("imdb_id")
+            with _tvmaze_lock:
+                _tvmaze_ep_cache[ep_key] = {"ep_imdb_id": ep_imdb, "_ts": time.time()}
+            return ep_imdb
+    except Exception:
+        pass
+
+    return None
+
+
 @app.route("/api/show_meta")
 def api_show_meta():
     """Return TVMaze show + episode metadata for the IMDb popup link."""
@@ -2674,6 +2729,10 @@ def api_show_meta():
     # ── 3. Enrich with episode-level IMDb ID ───────────────────────────────
     if ep_info and ep_info.get("tvmaze_ep_id"):
         ep_imdb = _fetch_ep_imdb_id(ep_info["tvmaze_ep_id"])
+        if not ep_imdb and result.get("imdb_id") and ep_info.get("season") and ep_info.get("episode"):
+            ep_imdb = _fetch_ep_imdb_via_tmdb(
+                result["imdb_id"], ep_info["season"], ep_info["episode"]
+            )
         if ep_imdb:
             ep_info["ep_imdb_id"] = ep_imdb
 
