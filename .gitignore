@@ -41,3 +41,6 @@ CLAUDE.md
 # Working / scratch directories
 working/
 screenshots/
+
+# Agent skill docs (local tooling only)
+docs/agents/
