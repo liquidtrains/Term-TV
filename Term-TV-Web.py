@@ -63,8 +63,10 @@ from lib.term_tv_core import (
     load_m3u_cached as _core_load_m3u_cached,
     load_epg as _core_load_epg,
     load_watch_history as _core_load_watch_history,
+    log_channel_watch as _core_log_channel_watch,
     get_public_ip as _core_get_public_ip,
     is_new_episode as _core_is_new_episode,
+    ch_in_group as _core_ch_in_group,
     send_desktop_notification,
 )
 
@@ -188,8 +190,8 @@ def search_shows_web(query: str, hours_ahead: int = 24, groups: Optional[set] = 
 
     tvg_to_channels: Dict[str, List[Dict]] = defaultdict(list)
     for ch in channels:
-        # S2: Respect group filter if provided
-        if groups and ch.get("group-title", "") not in groups:
+        # S2: Respect group filter if provided (handles merged "A, B" group labels)
+        if groups and not _core_ch_in_group(ch, groups):
             continue
         tid = ch.get("tvg-id")
         if tid:
@@ -329,7 +331,7 @@ def connect_vpn(openvpn_exe: str, config_file: str, expected_ip: Optional[str] =
         if _vpn_process.poll() is not None:
             print(f"\nOpenVPN exited unexpectedly (code {_vpn_process.returncode}).", file=sys.stderr)
             return False
-        ip = get_public_ip()
+        ip = get_public_ip_cached()
         if expected_ip and ip == expected_ip:
             print(f"\n✓ VPN Connected  (IP: {ip})")
             print("  VPN will auto-disconnect when this window is closed.")
@@ -453,8 +455,24 @@ def stop_mpv():
             except Exception:
                 pass
             _mpv_log_handle = None
+        info_snapshot = dict(_mpv_info)
         _mpv_process = None
         _mpv_info    = {}
+
+    # Log watch history and invalidate cache so guide re-sorts immediately
+    started_at  = info_snapshot.get("started_at", 0)
+    channel_url = info_snapshot.get("url", "")
+    if started_at and channel_url:
+        duration = int(time.time()) - started_at
+        with _data_lock:
+            ch = next((c for c in _channels if c.get("url") == channel_url), None)
+        if ch:
+            try:
+                _core_log_channel_watch(ch, duration)
+            except Exception as e:
+                logging.warning(f"log_channel_watch error: {e}")
+    with _watch_cache_lock:
+        _watch_cache["ts"] = 0.0
 
 
 def mpv_status() -> Dict:
@@ -486,7 +504,7 @@ _tvmaze_lock:       threading.Lock  = threading.Lock()
 _tmdb_show_cache:   Dict[str, int]  = {}   # show_imdb_id → tmdb_show_id
 
 
-def launch_recording(url: str, channel: str, show: str = "") -> Dict:
+def launch_recording(url: str, channel: str, show: str = "", stop_ts: int = 0) -> Dict:
     """Start a background mpv recording (no window). Returns status dict."""
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
     filename = get_safe_filename(channel, show)
@@ -527,7 +545,17 @@ def launch_recording(url: str, channel: str, show: str = "") -> Dict:
                 "log_handle": log_handle,
             }
         logging.info(f"Recording started: {channel} → {filename}")
-        return {"ok": True, "id": rec_id, "filename": filename, "path": str(out_path)}
+
+        # Auto-stop when the programme ends (server-side, survives page refresh)
+        if stop_ts and stop_ts > int(time.time()):
+            delay = stop_ts - int(time.time())
+            def _auto_stop(rid=rec_id, title=show or channel, d=delay):
+                time.sleep(max(0, d))
+                if stop_recording(rid):
+                    logging.info(f"Auto-stopped recording '{title}' at programme end")
+            threading.Thread(target=_auto_stop, daemon=True).start()
+
+        return {"ok": True, "id": rec_id, "filename": filename, "path": str(out_path), "auto_stop": bool(stop_ts)}
     except FileNotFoundError:
         return {"ok": False, "error": "mpv not found — is it installed?"}
     except Exception as e:
@@ -628,8 +656,10 @@ _epg:                 Dict       = {}
 _config:              Dict       = {}
 _vpn_configured                  = False
 _data_loading                    = True
+_data_error:          Optional[str] = None   # set when M3U load fails entirely
 _data_version:        int        = 0   # increments when M3U or EPG finishes loading
 _active_playlist_idx: int        = 0
+_skip_epg:            bool       = False
 _data_lock                       = threading.Lock()
 
 
@@ -758,6 +788,10 @@ body {
   transition: background .1s;
 }
 .ch-cell:hover { background: var(--surface2); }
+.ch-logo {
+  width: 22px; height: 22px; object-fit: contain; flex-shrink: 0;
+  margin-right: 5px; border-radius: 3px; background: transparent;
+}
 .ch-name {
   font-weight: 500; font-size: 12px; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap;
@@ -871,6 +905,34 @@ body {
 #popup-ftr   { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); }
 .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn-primary:hover { background: #2563eb; border-color: #2563eb; }
+
+/* ── VOD popup ── */
+#vod-popup-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.75);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 200; backdrop-filter: blur(3px);
+}
+#vod-popup-overlay .popup-card { width: min(520px, 94vw); }
+.vod-popup-poster {
+  height: 180px; background: var(--surface2);
+  position: relative; overflow: hidden; flex-shrink: 0;
+}
+.vod-popup-poster img {
+  width: 100%; height: 100%; object-fit: cover; object-position: center top; display: block;
+}
+.vod-popup-poster-ph {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; font-size: 48px; color: var(--dim);
+}
+#vod-popup-hdr {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 16px; border-bottom: 1px solid var(--border);
+}
+#vod-popup-group { font-size: 12px; color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#vod-popup-body  { padding: 14px 16px; overflow-y: auto; flex: 1; }
+#vod-popup-title { font-size: 17px; font-weight: 600; margin-bottom: 8px; }
+#vod-popup-desc  { font-size: 13px; color: var(--muted); line-height: 1.55; }
+#vod-popup-ftr   { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); flex-wrap: wrap; }
 
 /* ── Toast ── */
 #toast {
@@ -1168,11 +1230,35 @@ body {
     </div>
     <div id="popup-ftr">
       <button class="btn btn-primary" id="popup-play">▶ Play in mpv</button>
+      <button class="btn" id="popup-play-new" title="Open in a new mpv window without stopping the current stream">▶▶ New Window</button>
       <button class="btn" id="popup-record" style="border-color:#7f1d1d;color:#f87171">⏺ Record</button>
       <button class="btn" id="popup-schedule" style="display:none;border-color:#7c3aed;color:#a78bfa">⏰ Schedule</button>
       <button class="btn" id="popup-remind"   style="display:none;border-color:#0369a1;color:#38bdf8">🔔 Remind</button>
       <a id="popup-imdb" class="btn" target="_blank" rel="noopener" style="border-color:#f5c518;color:#f5c518;text-decoration:none;display:none">IMDb</a>
       <button class="btn" onclick="closePopup()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- VOD popup -->
+<div id="vod-popup-overlay" style="display:none">
+  <div class="popup-card">
+    <div class="vod-popup-poster" id="vod-popup-poster">
+      <div class="vod-popup-poster-ph" id="vod-popup-poster-ph">&#127916;</div>
+    </div>
+    <div id="vod-popup-hdr">
+      <span id="vod-popup-group"></span>
+      <button class="popup-x" onclick="closeVodPopup()">&#x2715;</button>
+    </div>
+    <div id="vod-popup-body">
+      <h2 id="vod-popup-title"></h2>
+      <p id="vod-popup-desc" style="display:none"></p>
+    </div>
+    <div id="vod-popup-ftr">
+      <button class="btn btn-primary" id="vod-popup-play">&#x25b6; Watch Now</button>
+      <button class="btn" id="vod-popup-record" style="border-color:#7f1d1d;color:#f87171">&#x23fa; Record</button>
+      <a id="vod-popup-imdb" class="btn" target="_blank" rel="noopener" style="border-color:#f5c518;color:#f5c518;text-decoration:none;display:none">IMDb&#x2026;</a>
+      <button class="btn" onclick="closeVodPopup()">Cancel</button>
     </div>
   </div>
 </div>
@@ -1210,7 +1296,8 @@ const TIME_H  = 32;   // time header height
 // ── State ──────────────────────────────────────────────────────────────────
 let guideData       = null;
 let winStartTs      = Math.floor(Date.now() / 1000) - 1800; // Fix-1: start 30 min back
-let searchQ         = '';
+let searchQ         = '';   // original-case query used for display and server search
+let searchQLower    = '';   // lowercase version used for local guide filtering
 let popupCh         = null;
 let popupProg       = null;
 let loadedAt        = null;
@@ -1244,6 +1331,12 @@ async function _boot() {
     return;
   }
 
+  // Restore persisted group filter
+  try {
+    const saved = JSON.parse(localStorage.getItem('termtv_groups') || '[]');
+    if (Array.isArray(saved)) saved.forEach(g => { if (g) selectedGroups.add(g); });
+  } catch (_) {}
+
   // Connectivity test — confirms browser can reach Flask before loading guide
   document.getElementById('loading-msg').textContent = 'Pinging server…';
   try {
@@ -1274,7 +1367,8 @@ _boot();
 function setupEvents() {
   const searchEl = document.getElementById('search');
   searchEl.addEventListener('input', e => {
-    searchQ = e.target.value.toLowerCase().trim();
+    searchQ      = e.target.value.trim();          // preserve original case for display/server
+    searchQLower = searchQ.toLowerCase();          // lowercase for local filtering
     clearTimeout(_searchTimer);
     if (vodMode) {
       vodPage = 1;
@@ -1312,8 +1406,29 @@ function setupEvents() {
   document.getElementById('popup-overlay').addEventListener('click', e => {
     if (e.target.id === 'popup-overlay') closePopup();
   });
+  document.getElementById('vod-popup-overlay').addEventListener('click', e => {
+    if (e.target.id === 'vod-popup-overlay') closeVodPopup();
+  });
   document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') closePopup();
+    if (e.key === 'Escape') { closePopup(); closeVodPopup(); return; }
+    // Global shortcuts — skip when a text field has focus or a popup is open
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+    if (document.getElementById('popup-overlay').style.display     !== 'none') return;
+    if (document.getElementById('vod-popup-overlay').style.display !== 'none') return;
+    switch (e.key) {
+      case 'ArrowLeft':
+        e.preventDefault(); winStartTs -= 7200; loadGuide(); break;
+      case 'ArrowRight':
+        e.preventDefault(); winStartTs += 7200; loadGuide(); break;
+      case 'n': case 'N':
+        winStartTs = Math.floor(Date.now() / 1000) - 1800;
+        loadGuide().then(jumpToNow); break;
+      case 'r': case 'R':
+        vodMode ? loadVod(vodPage) : loadGuide(); break;
+      case '/':
+        e.preventDefault(); document.getElementById('search').focus(); break;
+    }
   });
 }
 
@@ -1379,7 +1494,7 @@ function renderGuide(channels) {
 
 function filterRender() {
   if (!guideData) return;
-  const q  = searchQ;
+  const q  = searchQLower;
   let chs  = guideData.channels;
   if (q) {
     chs = chs.filter(ch => {
@@ -1401,7 +1516,13 @@ function filterRender() {
 function buildTimeRow(totalW) {
   const row    = mk('div', 'row row-time');
   const corner = mk('div', 'ch-cell corner');
-  corner.textContent = (guideData.total || 0) + ' ch';
+  if (guideData.truncated) {
+    corner.textContent = guideData.shown + '/' + guideData.total + ' ch';
+    corner.title = 'Showing first ' + guideData.shown + ' of ' + guideData.total + ' channels — use Groups to filter';
+    corner.style.color = 'var(--accent)';
+  } else {
+    corner.textContent = (guideData.total || 0) + ' ch';
+  }
   row.appendChild(corner);
 
   const area = mk('div', 'prog-area time-area');
@@ -1423,12 +1544,22 @@ function buildTimeRow(totalW) {
 function buildRow(ch, totalW) {
   const row    = mk('div', 'row row-ch');
   const cell   = mk('div', 'ch-cell');
+  if (ch.logo) {
+    const logo    = mk('img', 'ch-logo');
+    logo.src      = ch.logo;
+    logo.alt      = '';
+    logo.onerror  = () => { logo.style.display = 'none'; };
+    cell.appendChild(logo);
+  }
+  const textWrap = mk('div', '');
+  textWrap.style.cssText = 'min-width:0;flex:1';
   const nameEl = mk('span', 'ch-name');
   nameEl.textContent = ch.name;
   const grpEl  = mk('span', 'ch-group');
   grpEl.textContent = ch.group || '';
-  cell.appendChild(nameEl);
-  cell.appendChild(grpEl);
+  textWrap.appendChild(nameEl);
+  textWrap.appendChild(grpEl);
+  cell.appendChild(textWrap);
   cell.title = 'Watch ' + ch.name + ' live';
   cell.addEventListener('click', () => play(ch.url, ch.name, ''));
   row.appendChild(cell);
@@ -1464,7 +1595,7 @@ function buildBlock(prog, ch, totalW) {
   let cls = 'prog';
   if (prog.stop_ts  <= nt) cls += ' past';
   else if (prog.start_ts <= nt) cls += ' now';
-  if (searchQ && prog.title.toLowerCase().includes(searchQ)) cls += ' match';
+  if (searchQLower && prog.title.toLowerCase().includes(searchQLower)) cls += ' match';
 
   const b     = mk('div', cls);
   b.style.left  = x + 'px';
@@ -1591,6 +1722,12 @@ async function updateStatus() {
       }
     }
 
+    // Surface M3U load errors
+    if (!st.data_loading && st.data_error) {
+      const el = document.getElementById('loading-msg');
+      if (el) el.textContent = 'Error: ' + st.data_error;
+    }
+
     // U3: Auto-refresh guide when background data load transitions loading → done
     if (_prevDataLoading && !st.data_loading) {
       loadGuide(true).then(() => { loadGroups(); if (!vodMode) jumpToNow(); });
@@ -1646,6 +1783,19 @@ async function stopMpv() {
   setTimeout(updateStatus, 500);
 }
 
+async function playNew(url, channel, show) {
+  try {
+    const res  = await fetch('/api/play_new', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, channel, show }),
+    });
+    const data = await res.json();
+    if (data.ok) showToast('▶▶ Opened new window: ' + channel);
+    else showToast('Error: ' + (data.error || 'unknown'), true);
+  } catch (e) { showToast('Error: ' + e.message, true); }
+}
+
 // ── Popup ─────────────────────────────────────────────────────────────────
 function showPopup(prog, ch) {
   popupCh   = ch;
@@ -1679,10 +1829,13 @@ function showPopup(prog, ch) {
   playBtn.textContent = isNow ? '▶ Watch Now' : '▶ Play in mpv';
   playBtn.onclick = () => { play(ch.url, ch.name, prog.title); closePopup(); };
 
+  const playNewBtn = document.getElementById('popup-play-new');
+  playNewBtn.onclick = () => { playNew(ch.url, ch.name, prog.title); closePopup(); };
+
   const recBtn = document.getElementById('popup-record');
   recBtn.onclick = async () => {
     closePopup();
-    const recId = await startRecording(ch.url, ch.name, prog.title);
+    const recId = await startRecording(ch.url, ch.name, prog.title, prog.stop_ts || 0);
     if (recId) _markTask(ch, prog, 'record', recId);
   };
 
@@ -1726,6 +1879,86 @@ function closePopup() {
   document.getElementById('popup-overlay').style.display = 'none';
 }
 
+// ── VOD popup ──────────────────────────────────────────────────────────────
+let _vodPopupItem = null;
+
+function showVodPopup(item) {
+  _vodPopupItem = item;
+
+  // Poster
+  const posterEl = document.getElementById('vod-popup-poster');
+  const phEl     = document.getElementById('vod-popup-poster-ph');
+  // Remove any existing img
+  posterEl.querySelectorAll('img').forEach(el => el.remove());
+  if (item.logo) {
+    const img  = document.createElement('img');
+    img.src    = item.logo;
+    img.onerror = () => { img.remove(); phEl.style.display = 'flex'; };
+    phEl.style.display = 'none';
+    posterEl.insertBefore(img, phEl);
+  } else {
+    phEl.style.display = 'flex';
+  }
+
+  document.getElementById('vod-popup-group').textContent = item.group || '';
+  document.getElementById('vod-popup-title').textContent = item.name;
+
+  const descEl = document.getElementById('vod-popup-desc');
+  descEl.textContent  = '';
+  descEl.style.display = 'none';
+
+  // IMDb button — show immediately as loading, fetchVodMeta fills it in
+  const imdbBtn = document.getElementById('vod-popup-imdb');
+  imdbBtn.textContent    = 'IMDb…';
+  imdbBtn.href           = 'https://www.imdb.com/find/?q=' + encodeURIComponent(item.name) + '&s=tt';
+  imdbBtn.style.display  = '';
+
+  document.getElementById('vod-popup-play').onclick   = () => { play(item.url, item.name, ''); closeVodPopup(); };
+  document.getElementById('vod-popup-record').onclick = async () => {
+    closeVodPopup();
+    await startRecording(item.url, item.name, '');
+  };
+
+  document.getElementById('vod-popup-overlay').style.display = 'flex';
+
+  // Async: enrich with TVMaze show description + direct IMDb link
+  fetchVodMeta(item);
+}
+
+function closeVodPopup() {
+  document.getElementById('vod-popup-overlay').style.display = 'none';
+  _vodPopupItem = null;
+}
+
+async function fetchVodMeta(item) {
+  const captured = item;
+  try {
+    const cacheKey = item.name.toLowerCase() + '||';  // no ep/date/subtitle for VOD
+    let meta = _showMetaCache.get(cacheKey);
+    if (!meta) {
+      const params = new URLSearchParams({title: item.name});
+      meta = await (await fetch('/api/show_meta?' + params)).json();
+      if (meta && meta.imdb_id) _showMetaCache.set(cacheKey, meta);
+    }
+    if (_vodPopupItem !== captured) return;  // popup closed or switched
+    if (!meta || !meta.imdb_id) {
+      document.getElementById('vod-popup-imdb').textContent = 'IMDb';
+      return;
+    }
+    const imdbBtn = document.getElementById('vod-popup-imdb');
+    imdbBtn.href        = 'https://www.imdb.com/title/' + meta.imdb_id;
+    imdbBtn.textContent = 'IMDb';
+    // Fill description from TVMaze summary if we have it
+    const descEl = document.getElementById('vod-popup-desc');
+    if (descEl && meta.summary) {
+      descEl.textContent   = meta.summary;
+      descEl.style.display = '';
+    }
+  } catch (_) {
+    if (_vodPopupItem === captured) document.getElementById('vod-popup-imdb').textContent = 'IMDb';
+  }
+}
+
 function _taskKey(ch, prog)    { return (ch.url || '') + '|' + prog.start_ts; }
 function _makeTaskBadge(type)  {
   const s = document.createElement('span');
@@ -1735,8 +1968,9 @@ function _makeTaskBadge(type)  {
 }
 function _refreshTaskBadges() {
   _webTasks.forEach((entry, key) => {
-    document.querySelectorAll('[data-tk="' + key.replace(/"/g, '\\"') + '"]').forEach(cell => {
-      if (!cell.querySelector('.prog-badge')) cell.appendChild(_makeTaskBadge(entry.type));
+    document.querySelectorAll('.prog[data-tk]').forEach(cell => {
+      if (cell.dataset.tk === key && !cell.querySelector('.prog-badge'))
+        cell.appendChild(_makeTaskBadge(entry.type));
     });
   });
 }
@@ -1761,7 +1995,8 @@ async function cancelTask(taskKey, type, taskId) {
   try {
     await fetch(endpoint, {method: 'POST'});
     _webTasks.delete(taskKey);
-    document.querySelectorAll('[data-tk="' + taskKey.replace(/"/g, '\\"') + '"]').forEach(cell => {
+    document.querySelectorAll('.prog[data-tk]').forEach(cell => {
+      if (cell.dataset.tk !== taskKey) return;
       cell.querySelectorAll('.prog-badge').forEach(b => b.remove());
     });
     showToast('Cancelled');
@@ -1933,6 +2168,9 @@ async function loadGroups() {
     const res  = await fetch('/api/groups');
     const data = await res.json();
     _groupsData = data.groups || [];
+    // Drop persisted selections that no longer exist in this playlist
+    const valid = new Set(_groupsData.map(g => g.name));
+    selectedGroups.forEach(g => { if (!valid.has(g)) selectedGroups.delete(g); });
     updateGroupsBtnLabel();
   } catch (_) {}
 }
@@ -1995,10 +2233,15 @@ function renderGroupsPanel() {
 }
 
 let _applyTimer;
+function _saveGroups() {
+  try { localStorage.setItem('termtv_groups', JSON.stringify([...selectedGroups])); } catch (_) {}
+}
+
 function toggleGroup(name, checked) {
   if (checked) selectedGroups.add(name);
   else         selectedGroups.delete(name);
   updateGroupsBtnLabel();
+  _saveGroups();
   clearTimeout(_applyTimer);
   _applyTimer = setTimeout(applyGroupFilter, 600);
 }
@@ -2013,6 +2256,7 @@ function selectAllGroups() {
   _groupsData.forEach(g => selectedGroups.add(g.name));
   renderGroupsPanel();
   updateGroupsBtnLabel();
+  _saveGroups();
   applyGroupFilter();
 }
 
@@ -2020,6 +2264,7 @@ function clearAllGroups() {
   selectedGroups.clear();
   renderGroupsPanel();
   updateGroupsBtnLabel();
+  _saveGroups();
   applyGroupFilter();
 }
 
@@ -2048,7 +2293,7 @@ function switchToVodMode() {
   document.getElementById('btn-fwd').style.display    = 'none';
   document.getElementById('now-line').style.display   = 'none';
   // U1: Clear stale search state on mode switch
-  searchQ = '';
+  searchQ = ''; searchQLower = '';
   document.getElementById('search').value = '';
   clearSearchPanel();
   loadVod(1);
@@ -2062,7 +2307,7 @@ function switchToGuideMode() {
   document.getElementById('btn-now').style.display    = '';
   document.getElementById('btn-fwd').style.display    = '';
   // U1: Clear stale search state on mode switch
-  searchQ = '';
+  searchQ = ''; searchQLower = '';
   document.getElementById('search').value = '';
   clearSearchPanel();
   loadGuide().then(jumpToNow);
@@ -2092,7 +2337,7 @@ function renderVodGrid(data) {
   for (const item of data.items) {
     const card    = mk('div', 'vod-card');
     card.title    = item.name;
-    card.onclick  = () => play(item.url, item.name, '');
+    card.onclick  = () => showVodPopup(item);
 
     // V1: Use <img> with onerror fallback instead of CSS background-image
     const poster = mk('div', 'vod-poster');
@@ -2318,16 +2563,17 @@ function spOpenShow(idx) {
 // ── Recording ──────────────────────────────────────────────────────────────
 let _recTimer = null;
 
-async function startRecording(url, channel, show) {
+async function startRecording(url, channel, show, stop_ts) {
   try {
     const res  = await fetch('/api/record', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ url, channel, show }),
+      body:    JSON.stringify({ url, channel, show, stop_ts: stop_ts || 0 }),
     });
     const data = await res.json();
     if (data.ok) {
-      showToast('\u23fa Recording: ' + channel + (show ? ' \u2014 ' + show : ''));
+      const autoMsg = data.auto_stop ? ' (auto-stops at programme end)' : '';
+      showToast('\u23fa Recording: ' + channel + (show ? ' \u2014 ' + show : '') + autoMsg);
       setTimeout(updateRecordings, 600);
       return data.id;
     } else {
@@ -2427,6 +2673,8 @@ def api_guide():
 
     if _data_loading and not channels:
         return jsonify({"error": "Guide data is still loading — please wait and refresh.", "channels": [], "total": 0})
+    if _data_error and not channels:
+        return jsonify({"error": f"Failed to load channels: {_data_error}", "channels": [], "total": 0})
 
     # Sort channels by watch history (most watched first) — B4: use cached version
     history   = load_watch_history_cached()
@@ -2438,13 +2686,14 @@ def api_guide():
 
     # Build channel list with programmes in the window
     # Fix-3: Count total matching channels but only build EPG data for the first 200
+    GUIDE_CH_LIMIT = 200
     result = []
     total  = 0
     for ch in channels:
-        if grp_filter and ch.get("group-title", "") not in grp_filter:
+        if grp_filter and not _core_ch_in_group(ch, grp_filter):
             continue
         total += 1
-        if total > 200:
+        if total > GUIDE_CH_LIMIT:
             continue  # still count, but skip the expensive EPG build
 
         ch_name = ch.get("name", "")
@@ -2463,10 +2712,12 @@ def api_guide():
                 if et_ts <= start_ts or st_ts >= end_ts:
                     continue
                 desc = p.get("description", "")
+                if len(desc) > 400:
+                    desc = desc[:397] + "…"
                 progs.append({
                     "title":       p.get("title", ""),
                     "subtitle":    p.get("subtitle", ""),
-                    "description": desc[:400] if len(desc) > 400 else desc,
+                    "description": desc,
                     "episode_num": p.get("episode_num", ""),
                     "air_date":    p.get("air_date", ""),
                     "start_ts":    int(st_ts),
@@ -2480,9 +2731,11 @@ def api_guide():
             "name":    ch_name,
             "group":   ch_grp,
             "url":     ch.get("url", ""),
+            "logo":    ch.get("tvg-logo", ""),
             "programs": progs,
         })
 
+    truncated = total > GUIDE_CH_LIMIT
     print(f"api_guide: built result ({len(result)} ch, {sum(len(c['programs']) for c in result)} progs) in {time.time()-_t0:.3f}s")
     resp = jsonify({
         "window_start_ts": int(start_ts),
@@ -2490,6 +2743,8 @@ def api_guide():
         "now_ts":          int(now_ts),
         "channels":        result,
         "total":           total,
+        "truncated":       truncated,
+        "shown":           min(total, GUIDE_CH_LIMIT),
     })
     print(f"api_guide: jsonify done, total {time.time()-_t0:.3f}s")
     return resp
@@ -2511,6 +2766,7 @@ def api_status():
         "vpn_connected":  vpn_is_connected(),
         "vpn_ip":         (get_public_ip_cached() if vpn_is_connected() else None),  # B3: cached
         "data_loading":   _data_loading,
+        "data_error":     _data_error,
         "data_version":   _data_version,
         "mpv_just_died":  mpv_just_died,
         "mpv_exit_code":  st.get("exit_code"),
@@ -2815,7 +3071,7 @@ def api_schedule():
         if cancel_evt.wait(timeout=notify_wait):
             print(f"[SCHEDULE] '{title}' — cancelled")
             return
-        if notify_wait > 0:
+        if delay > 300:  # only fire "5 min" alert when start is actually >5 min away
             send_desktop_notification("Term-TV", f"Starting in 5 min: {title}")
             print(f"[SCHEDULE] '{title}' — 5-min notification sent")
         if cancel_evt.wait(timeout=delay - notify_wait):
@@ -2861,15 +3117,41 @@ def api_stop():
     return jsonify({"ok": True})
 
 
+@app.route("/api/play_new", methods=["POST"])
+def api_play_new():
+    """Launch a second mpv instance without stopping the current one."""
+    data = request.get_json(force=True) or {}
+    url  = data.get("url", "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "No URL provided"}), 400
+    try:
+        kw: Dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        if platform.system() == "Windows":
+            kw["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+        subprocess.Popen([
+            "mpv",
+            "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
+            "--cache=yes", "--cache-pause=no",
+            url,
+        ], **kw)
+        return jsonify({"ok": True})
+    except FileNotFoundError:
+        return jsonify({"ok": False, "error": "mpv not found — is it installed?"}), 500
+    except Exception as e:
+        logging.error(f"api_play_new error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/record", methods=["POST"])
 def api_record():
     data    = request.get_json(force=True) or {}
     url     = data.get("url", "").strip()
     channel = data.get("channel", "").strip()
     show    = data.get("show", "").strip()
+    stop_ts = int(data.get("stop_ts", 0) or 0)
     if not url:
         return jsonify({"ok": False, "error": "No URL provided"}), 400
-    result = launch_recording(url, channel, show)
+    result = launch_recording(url, channel, show, stop_ts=stop_ts)
     return jsonify(result), (200 if result["ok"] else 500)
 
 
@@ -2923,8 +3205,13 @@ def api_vpn_connect():
         return jsonify({"ok": False, "error": "No VPN config loaded"}), 400
     if vpn_is_connected():
         return jsonify({"ok": True, "msg": "Already connected"})
-    ok = connect_vpn(_vpn_exe, _vpn_config_file, _vpn_expected_ip)
-    return jsonify({"ok": ok})
+    # Run the blocking connect loop in a background thread so the UI stays responsive
+    threading.Thread(
+        target=connect_vpn,
+        args=(_vpn_exe, _vpn_config_file, _vpn_expected_ip),
+        daemon=True,
+    ).start()
+    return jsonify({"ok": True, "connecting": True, "msg": "VPN connecting… check VPN badge for status"})
 
 
 @app.route("/api/vpn/disconnect", methods=["POST"])
@@ -2960,7 +3247,7 @@ def api_search():
         {"name": c.get("name", ""), "group": c.get("group-title", ""), "url": c.get("url", "")}
         for c in channels
         if q.lower() in c.get("name", "").lower()
-        and (not grp_filter or c.get("group-title", "") in grp_filter)
+        and (not grp_filter or _core_ch_in_group(c, grp_filter))
     ]
 
     show_results = search_shows_web(q, hours_ahead=hours, groups=grp_filter if grp_filter else None)
@@ -3065,7 +3352,7 @@ def api_set_source():
 # ── Background data loader ────────────────────────────────────────────────────
 
 def _load_data():
-    global _channels, _epg, _data_loading, _data_version, _active_playlist_idx
+    global _channels, _epg, _data_loading, _data_error, _data_version, _active_playlist_idx
     playlists = _config.get("playlists", [])
 
     # B6: Guard against out-of-range playlist index
@@ -3078,17 +3365,28 @@ def _load_data():
         idx = 0
     playlist = playlists[idx] if playlists else {}
 
+    m3u_ok = False
     try:
         if playlist.get("m3u_url"):
             new_ch = load_m3u_cached(playlist["m3u_url"])
             if new_ch:
                 with _data_lock:
-                    _channels = new_ch
+                    _channels  = new_ch
+                    _data_error = None
+                m3u_ok = True
+            else:
+                err = f"M3U returned 0 channels from {playlist['m3u_url'][:60]}"
+                logging.error(err)
+                with _data_lock:
+                    _data_error = err
     except Exception as e:
-        logging.error(f"M3U load error: {e}")
+        err = f"M3U load failed: {e}"
+        logging.error(err)
+        with _data_lock:
+            _data_error = err
 
     try:
-        if playlist.get("epg_url"):
+        if not _skip_epg and playlist.get("epg_url"):
             new_epg = load_epg(playlist["epg_url"])
             if new_epg:
                 with _data_lock:
@@ -3115,12 +3413,14 @@ def _open_browser():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global _config, _vpn_configured
+    global _config, _vpn_configured, _skip_epg
 
     parser = argparse.ArgumentParser(description="Term-TV Web: Browser-based IPTV guide")
-    parser.add_argument("--skip-vpn", action="store_true", help="Skip VPN prompt at startup")
+    parser.add_argument("--skip-vpn",  action="store_true", help="Skip VPN prompt at startup")
+    parser.add_argument("--skip-epg",  action="store_true", help="Skip EPG download for a faster start (no programme data)")
     args = parser.parse_args()
 
+    _skip_epg = args.skip_epg
     setup_logging()
     atexit.register(archive_mpv_log)
     atexit.register(disconnect_vpn)

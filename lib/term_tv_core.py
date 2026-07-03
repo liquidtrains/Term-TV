@@ -265,6 +265,9 @@ def _parse_m3u_lines(lines: List[str]) -> List[Channel]:
             m = re.search(r'tvg-id="([^"]*)"', line)
             if m:
                 current["tvg-id"] = m.group(1)
+            m = re.search(r'tvg-logo="([^"]*)"', line)
+            if m:
+                current["tvg-logo"] = m.group(1)
             m = re.search(r'group-title="([^"]*)"', line)
             if m:
                 current["group-title"] = m.group(1)
@@ -534,14 +537,18 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
 # ---------------------------------------------------------------------------
 
 def parse_epg_time(time_str: str) -> Optional[datetime]:
-    """Parse XMLTV time string (YYYYMMDDHHmmss ±HHmm) to timezone-aware local datetime."""
+    """Parse XMLTV time string (YYYYMMDDHHmmss [±HHmm]) to timezone-aware local datetime.
+
+    The timezone offset is optional — some feeds omit it.  When absent the
+    timestamp is treated as local time so programmes still display correctly.
+    """
     if not time_str:
         return None
     try:
         parts = time_str.split()
-        if len(parts) != 2:
-            return None
         dt = datetime.strptime(parts[0], "%Y%m%d%H%M%S")
+        if len(parts) == 1:
+            return dt.astimezone()
         tz_str = parts[1]
         sign = 1 if tz_str[0] == "+" else -1
         offset = sign * (int(tz_str[1:3]) * 60 + int(tz_str[3:5]))
@@ -571,11 +578,11 @@ def search_channels(channels: List[Channel], query: str) -> List[Channel]:
     return [c for c in channels if q in c.get("name", "").lower()]
 
 
-def _ch_in_group(ch: Channel, groups: set) -> bool:
+def ch_in_group(ch: Channel, groups: set) -> bool:
     """True if the channel belongs to any of *groups*, handling merged group labels.
 
-    F4 dedup can produce group-title like "US HD, US SD" — split on ", " so
-    that filtering by either component still matches.
+    The M3U dedup step can produce group-title like "US HD, US SD" — split on
+    comma so filtering by either component still matches.
     """
     raw = ch.get("group-title", "")
     if raw in groups:
@@ -646,7 +653,7 @@ def search_shows_in_timeframe(
             minutes_until = int((start_time - now).total_seconds() / 60)
             air_date = prog.get("air_date", "")
             for ch in tvg_map[channel_id]:
-                if groups and not _ch_in_group(ch, groups):
+                if groups and not ch_in_group(ch, groups):
                     continue
                 results.append({
                     "channel":      ch,
