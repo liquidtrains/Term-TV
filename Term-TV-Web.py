@@ -68,6 +68,10 @@ from lib.term_tv_core import (
     is_new_episode as _core_is_new_episode,
     ch_in_group as _core_ch_in_group,
     send_desktop_notification,
+    load_favorites as _core_load_favorites,
+    toggle_favorite as _core_toggle_favorite,
+    get_channel_note as _core_get_channel_note,
+    set_channel_note as _core_set_channel_note,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -241,6 +245,7 @@ def search_shows_web(query: str, hours_ahead: int = 24, groups: Optional[set] = 
                     "channel_name":  ch.get("name", ""),
                     "channel_url":   ch.get("url", ""),
                     "channel_group": ch.get("group-title", ""),
+                    "tvg_id":        ch.get("tvg-id", ""),
                     "title":         title,
                     "subtitle":      prog.get("subtitle", ""),
                     "description":   prog.get("description", ""),
@@ -532,8 +537,27 @@ def mpv_status() -> Dict:
 _recordings:      Dict[str, Dict] = {}
 _recordings_lock: threading.Lock  = threading.Lock()
 
-_web_tasks:      List[Dict] = []   # [{id, type, title, ch_name, ch_url, start_ts}]
+_web_tasks:      List[Dict] = []   # [{id, type, title, ch_name, ch_url, start_ts, _cancel}]
 _web_tasks_lock: threading.Lock = threading.Lock()
+WEB_TASKS_FILE = Path(".web_tasks.json")
+
+
+def _save_web_tasks():
+    """F4: persist pending remind/schedule tasks so a server restart restores them."""
+    with _web_tasks_lock:
+        data = [{k: t[k] for k in ("id", "type", "title", "ch_name", "ch_url", "start_ts")}
+                for t in _web_tasks]
+    try:
+        with open(WEB_TASKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logging.warning(f"Could not save web tasks: {e}")
+
+
+def _remove_web_task(task_id: int):
+    with _web_tasks_lock:
+        _web_tasks[:] = [t for t in _web_tasks if t["id"] != task_id]
+    _save_web_tasks()
 
 _tvmaze_show_cache: Dict[str, Dict] = {}   # title_key → {id, imdb_id, summary, _ts}
 _tvmaze_ep_cache:   Dict[str, Dict] = {}   # ep_key    → {season, episode, ep_title, ep_desc, _ts}
@@ -1192,6 +1216,52 @@ body {
 }
 .sp-divider { height: 1px; background: var(--border); }
 .sp-empty { padding: 14px 12px; color: var(--muted); font-size: 12px; font-style: italic; }
+
+/* ── F1: favorite star ── */
+.ch-fav {
+  position: absolute; top: 2px; right: 5px; z-index: 2;
+  font-size: 12px; line-height: 1; color: var(--dim); cursor: pointer;
+  transition: color .1s;
+}
+.ch-fav:hover { color: #fbbf24; }
+.ch-fav.on    { color: #fbbf24; }
+
+/* ── F2: recordings library panel ── */
+#library-panel {
+  position: fixed; width: 430px; max-height: 460px; overflow-y: auto;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: 0 12px 40px rgba(0,0,0,.55); z-index: 150;
+}
+.lib-hdr {
+  padding: 8px 12px; border-bottom: 1px solid var(--border);
+  font-size: 10px; font-weight: 700; letter-spacing: .8px;
+  color: var(--muted); text-transform: uppercase;
+  position: sticky; top: 0; background: var(--surface); z-index: 1;
+}
+.lib-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 12px; border-bottom: 1px solid var(--border); font-size: 12px;
+}
+.lib-item:last-child { border-bottom: none; }
+.lib-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lib-meta { font-size: 10px; color: var(--muted); margin-top: 1px; }
+.lib-btn {
+  background: none; border: 1px solid var(--border); color: var(--text);
+  border-radius: 4px; padding: 2px 8px; cursor: pointer; font-size: 11px; flex-shrink: 0;
+}
+.lib-btn:hover { background: var(--surface2); }
+.lib-btn.danger { border-color: #7f1d1d; color: #f87171; }
+.lib-btn.danger:hover { background: #3b1515; }
+.lib-empty { padding: 14px 12px; color: var(--muted); font-size: 12px; font-style: italic; }
+
+/* ── F7: channel note in popup ── */
+#popup-note-row { display: flex; gap: 6px; margin-top: 14px; }
+#popup-note {
+  flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  border-radius: 5px; padding: 5px 9px; font-size: 12px; outline: none;
+}
+#popup-note:focus { border-color: var(--accent); }
+#popup-note::placeholder { color: var(--dim); }
 </style>
 </head>
 <body>
@@ -1204,6 +1274,7 @@ body {
   <div class="flex1"></div>
   <select id="source-select" title="Switch playlist source"></select>
   <button id="btn-groups" class="btn" title="Filter by group">Groups ▾</button>
+  <button id="btn-library" class="btn" title="Browse finished recordings">📼</button>
   <div id="search-wrap">
     <input id="search" type="search" placeholder="Search shows or channels…" autocomplete="off">
     <div id="search-panel" style="display:none"></div>
@@ -1221,6 +1292,9 @@ body {
 
 <!-- Groups panel (positioned by JS) -->
 <div id="groups-panel" style="display:none"></div>
+
+<!-- F2: Recordings library panel (positioned by JS) -->
+<div id="library-panel" style="display:none"></div>
 
 <!-- VOD view -->
 <div id="vod-view" style="display:none">
@@ -1265,6 +1339,10 @@ body {
       <div id="popup-ep"></div>
       <div id="popup-time"></div>
       <p id="popup-desc"></p>
+      <div id="popup-note-row">
+        <input id="popup-note" type="text" placeholder="Channel note…" maxlength="200" autocomplete="off">
+        <button class="btn" id="popup-note-save">Save</button>
+      </div>
     </div>
     <div id="popup-ftr">
       <button class="btn btn-primary" id="popup-play">▶ Play in mpv</button>
@@ -1442,6 +1520,10 @@ function setupEvents() {
   document.addEventListener('click', e => {
     if (!e.target.closest('#groups-panel') && !e.target.closest('#btn-groups')) closeGroupsPanel();
   });
+  document.getElementById('btn-library').addEventListener('click', e => { e.stopPropagation(); toggleLibraryPanel(); });
+  document.addEventListener('click', e => {
+    if (!e.target.closest('#library-panel') && !e.target.closest('#btn-library')) closeLibraryPanel();
+  });
   document.getElementById('popup-overlay').addEventListener('click', e => {
     if (e.target.id === 'popup-overlay') closePopup();
   });
@@ -1601,6 +1683,14 @@ function buildRow(ch, totalW) {
   cell.appendChild(textWrap);
   cell.title = 'Watch ' + ch.name + ' live';
   cell.addEventListener('click', () => play(ch.url, ch.name, ''));
+
+  // F1: favorite star (absolute — positioned against the sticky cell)
+  const favEl = mk('span', 'ch-fav' + (ch.fav ? ' on' : ''));
+  favEl.textContent = '★';
+  favEl.title = ch.fav ? 'Remove favorite' : 'Add favorite';
+  favEl.addEventListener('click', e => { e.stopPropagation(); toggleFav(ch, favEl); });
+  cell.appendChild(favEl);
+
   row.appendChild(cell);
 
   const area = mk('div', 'prog-area');
@@ -1822,6 +1912,111 @@ async function stopMpv() {
   setTimeout(updateStatus, 500);
 }
 
+// ── F1: Favorites ─────────────────────────────────────────────────────────
+async function toggleFav(ch, el) {
+  try {
+    const res  = await fetch('/api/favorite', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: ch.url || '', name: ch.name || '',
+                             tvg_id: ch.tvg_id || '', group: ch.group || '' })
+    });
+    const data = await res.json();
+    if (!data.ok) { showToast('Favorite failed: ' + (data.error || ''), true); return; }
+    ch.fav = data.fav;
+    if (el) {
+      el.classList.toggle('on', data.fav);
+      el.title = data.fav ? 'Remove favorite' : 'Add favorite';
+    }
+    showToast(data.fav ? '★ Favorite added: ' + ch.name + ' (pins to top on next reload)'
+                       : '☆ Favorite removed: ' + ch.name);
+  } catch (e) { showToast('Error: ' + e.message, true); }
+}
+
+// ── F2: Recordings library ────────────────────────────────────────────────
+let _libFiles = [];
+
+async function toggleLibraryPanel() {
+  const panel = document.getElementById('library-panel');
+  if (panel.style.display !== 'none') { closeLibraryPanel(); return; }
+  const btn  = document.getElementById('btn-library');
+  const rect = btn.getBoundingClientRect();
+  panel.style.display = '';
+  panel.style.top  = (rect.bottom + 4) + 'px';
+  panel.style.left = Math.max(4, rect.right - 430) + 'px';
+  panel.innerHTML  = '<div class="lib-empty">Loading…</div>';
+  await loadLibrary();
+}
+
+function closeLibraryPanel() {
+  document.getElementById('library-panel').style.display = 'none';
+}
+
+async function loadLibrary() {
+  try {
+    const data = await (await fetch('/api/library')).json();
+    renderLibrary(data.files || []);
+  } catch (e) { showToast('Library error: ' + e.message, true); }
+}
+
+function renderLibrary(files) {
+  _libFiles = files;
+  const panel = document.getElementById('library-panel');
+  let html = '<div class="lib-hdr">Recordings (' + files.length + ')</div>';
+  if (!files.length) {
+    html += '<div class="lib-empty">No recordings yet — use ⏺ Record on a programme.</div>';
+    panel.innerHTML = html;
+    return;
+  }
+  files.forEach((f, i) => {
+    const d = new Date(f.mtime_ts * 1000);
+    const when = d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
+                 d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+    const recTag = f.recording ? ' <span style="color:#f87171;font-weight:700">●REC</span>' : '';
+    html += '<div class="lib-item">'
+      + '<div class="lib-name"><div>' + escH(f.name) + recTag + '</div>'
+      + '<div class="lib-meta">' + f.size_mb + ' MB · ' + when + '</div></div>'
+      + '<button class="lib-btn" title="Play in mpv" onclick="libPlay(' + i + ')">▶</button>'
+      + '<button class="lib-btn danger" title="Delete file" id="lib-del-' + i + '" onclick="libDelete(' + i + ')">🗑</button>'
+      + '</div>';
+  });
+  panel.innerHTML = html;
+}
+
+async function libPlay(i) {
+  const f = _libFiles[i];
+  if (!f) return;
+  try {
+    const data = await (await fetch('/api/library/play', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: f.name })
+    })).json();
+    showToast(data.ok ? '▶ Playing: ' + f.name : 'Error: ' + (data.error || 'failed'), !data.ok);
+  } catch (e) { showToast('Error: ' + e.message, true); }
+}
+
+async function libDelete(i) {
+  const f = _libFiles[i];
+  if (!f) return;
+  const btn = document.getElementById('lib-del-' + i);
+  // Two-click confirm: first click arms the button, second (within 3s) deletes
+  if (btn && !btn.dataset.armed) {
+    btn.dataset.armed = '1';
+    btn.textContent = 'Sure?';
+    setTimeout(() => {
+      if (btn.isConnected) { delete btn.dataset.armed; btn.textContent = '🗑'; }
+    }, 3000);
+    return;
+  }
+  try {
+    const data = await (await fetch('/api/library/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: f.name })
+    })).json();
+    if (data.ok) { showToast('Deleted: ' + f.name); loadLibrary(); }
+    else showToast('Delete failed: ' + (data.error || ''), true);
+  } catch (e) { showToast('Error: ' + e.message, true); }
+}
+
 // ── VPN toggle (badge click) ──────────────────────────────────────────────
 let _vpnBusy = false;
 async function toggleVpn() {
@@ -1919,6 +2114,25 @@ function showPopup(prog, ch) {
   imdbBtn.textContent = 'IMDb…';
   imdbBtn.style.display = '';
   fetchShowMeta(prog, prog);   // async; updates href/label/desc/ep when ready
+
+  // F7: channel note — prefill async, save on button click
+  const noteEl  = document.getElementById('popup-note');
+  const noteKey = { url: ch.url || '', tvg_id: ch.tvg_id || '' };
+  noteEl.value  = '';
+  fetch('/api/note?' + new URLSearchParams(noteKey))
+    .then(r => r.json())
+    .then(d => { if (popupCh === ch && d.note) noteEl.value = d.note; })
+    .catch(() => {});
+  document.getElementById('popup-note-save').onclick = async () => {
+    try {
+      const d = await (await fetch('/api/note', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: noteKey.url, tvg_id: noteKey.tvg_id, note: noteEl.value.trim() })
+      })).json();
+      showToast(d.ok ? (noteEl.value.trim() ? '🗒 Note saved' : '🗒 Note cleared')
+                     : 'Note failed: ' + (d.error || ''), !d.ok);
+    } catch (e) { showToast('Error: ' + e.message, true); }
+  };
 
   const isFuture = prog.start_ts > nt;
   const schedBtn  = document.getElementById('popup-schedule');
@@ -2614,7 +2828,7 @@ function spOpenShow(idx) {
     { title: s.title, subtitle: s.subtitle, description: s.description,
       episode_num: s.episode_num, air_date: s.air_date, start_ts: s.start_ts,
       stop_ts: stopTs, duration_min: s.duration_min },
-    { name: s.channel_name, group: s.channel_group, url: s.channel_url }
+    { name: s.channel_name, group: s.channel_group, url: s.channel_url, tvg_id: s.tvg_id || '' }
   );
 }
 
@@ -2734,10 +2948,20 @@ def api_guide():
     if _data_error and not channels:
         return jsonify({"error": f"Failed to load channels: {_data_error}", "channels": [], "total": 0})
 
-    # Sort channels by watch history (most watched first) — B4: use cached version
+    # Sort channels: favorites pinned first (F1), then by watch history — B4: cached
     history   = load_watch_history_cached()
     watch_map = {e.get("url", ""): e.get("total_duration_seconds", 0) for e in history}
-    channels.sort(key=lambda c: watch_map.get(c.get("url", ""), 0), reverse=True)
+    fav_keys: set = set()
+    for f in _core_load_favorites():
+        if f.get("tvg-id"):
+            fav_keys.add(f["tvg-id"])
+        if f.get("url"):
+            fav_keys.add(f["url"])
+
+    def _is_fav(c):
+        return c.get("tvg-id", "") in fav_keys or c.get("url", "") in fav_keys
+
+    channels.sort(key=lambda c: (not _is_fav(c), -watch_map.get(c.get("url", ""), 0)))
     print(f"api_guide: sorted {len(channels)} channels in {time.time()-_t0:.3f}s")
 
     grp_filter = set(request.args.getlist("groups"))
@@ -2790,6 +3014,7 @@ def api_guide():
             "group":   ch_grp,
             "url":     ch.get("url", ""),
             "logo":    ch.get("tvg-logo", ""),
+            "fav":     _is_fav(ch),
             "programs": progs,
         })
 
@@ -3068,6 +3293,122 @@ def api_show_meta():
     return jsonify(result)
 
 
+def _spawn_remind_task(task_id: int, title: str, start_ts: int, cancel_evt: threading.Event):
+    """Fire a desktop notification ~1 min before start_ts. Delay computed at spawn
+    time so restored tasks (F4) wait the correct remaining interval."""
+    def _fire():
+        delay = max(0, start_ts - int(time.time()) - 60)
+        if cancel_evt.wait(timeout=delay):
+            print(f"[REMIND] '{title}' — cancelled")
+            return
+        send_desktop_notification("Term-TV Reminder", f"Starting in ~1 min: {title}")
+        print(f"[REMINDER] '{title}' — notification fired")
+        _remove_web_task(task_id)
+
+    threading.Thread(target=_fire, daemon=True).start()
+
+
+def _try_mpv_stream(url: str, title: str) -> bool:
+    """Launch mpv in a visible window; success = still running after 12s
+    (stream is playing) or a clean exit (user closed it)."""
+    try:
+        proc = subprocess.Popen([
+            "mpv",
+            "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
+            "--cache=yes", "--cache-pause=no",
+            url,
+        ], stdin=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"[SCHEDULE] '{title}' — mpv launch failed: {e}", file=sys.stderr)
+        return False
+    time.sleep(12)
+    rc = proc.poll()
+    return rc is None or rc in (0, 4)
+
+
+def _spawn_schedule_task(task_id: int, title: str, ch_name: str, url: str,
+                         start_ts: int, cancel_evt: threading.Event):
+    """Wait until start_ts then launch mpv, with F5 failover: retry once, then
+    try up to 3 other channels currently airing the same title."""
+    def _run():
+        delay       = max(0, start_ts - int(time.time()))
+        notify_wait = max(0, delay - 300)
+        if cancel_evt.wait(timeout=notify_wait):
+            print(f"[SCHEDULE] '{title}' — cancelled")
+            return
+        if delay > 300:  # only fire "5 min" alert when start is actually >5 min away
+            send_desktop_notification("Term-TV", f"Starting in 5 min: {title}")
+            print(f"[SCHEDULE] '{title}' — 5-min notification sent")
+        if cancel_evt.wait(timeout=delay - notify_wait):
+            print(f"[SCHEDULE] '{title}' — cancelled before launch")
+            return
+        _remove_web_task(task_id)
+
+        if _try_mpv_stream(url, title):
+            print(f"[SCHEDULE] '{title}' on {ch_name} — mpv launched")
+            return
+        print(f"[SCHEDULE] '{title}' — stream failed, retrying in 5s")
+        time.sleep(5)
+        if _try_mpv_stream(url, title):
+            print(f"[SCHEDULE] '{title}' on {ch_name} — mpv launched (retry)")
+            return
+
+        print(f"[SCHEDULE] '{title}' — searching alternative channels")
+        try:
+            alts = [s for s in search_shows_web(title, hours_ahead=0)
+                    if s.get("is_now") and s.get("channel_url") and s["channel_url"] != url]
+        except Exception as e:
+            logging.warning(f"Alternative search failed: {e}")
+            alts = []
+        for alt in alts[:3]:
+            print(f"[SCHEDULE] '{title}' — trying {alt.get('channel_name', '?')}")
+            if _try_mpv_stream(alt["channel_url"], title):
+                send_desktop_notification("Term-TV", f"{title}: switched to {alt.get('channel_name', 'alternative')}")
+                print(f"[SCHEDULE] '{title}' — playing via {alt.get('channel_name', '?')}")
+                return
+
+        send_desktop_notification("Term-TV", f"Stream failed: {title} — no working source found")
+        print(f"[SCHEDULE] '{title}' — all sources failed", file=sys.stderr)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _restore_web_tasks():
+    """F4: re-arm remind/schedule tasks saved by a previous server run."""
+    if not WEB_TASKS_FILE.exists():
+        return
+    try:
+        with open(WEB_TASKS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except Exception as e:
+        logging.warning(f"Could not load web tasks: {e}")
+        return
+    now = int(time.time())
+    restored = 0
+    for t in saved:
+        try:
+            start_ts = int(t.get("start_ts", 0))
+            if start_ts <= now:
+                continue  # expired while the server was down
+            cancel_evt = threading.Event()
+            task = {"id": int(t["id"]), "type": t.get("type", "schedule"),
+                    "title": t.get("title", "Unknown"), "ch_name": t.get("ch_name", ""),
+                    "ch_url": t.get("ch_url", ""), "start_ts": start_ts, "_cancel": cancel_evt}
+            with _web_tasks_lock:
+                _web_tasks.append(task)
+            if task["type"] == "remind":
+                _spawn_remind_task(task["id"], task["title"], start_ts, cancel_evt)
+            else:
+                _spawn_schedule_task(task["id"], task["title"], task["ch_name"],
+                                     task["ch_url"], start_ts, cancel_evt)
+            restored += 1
+        except Exception as e:
+            logging.warning(f"Skipping bad saved task: {e}")
+    _save_web_tasks()  # prune expired entries from disk
+    if restored:
+        print(f"Restored {restored} scheduled task(s) from {WEB_TASKS_FILE}")
+
+
 @app.route("/api/remind", methods=["POST"])
 def api_remind():
     data       = request.get_json(force=True) or {}
@@ -3077,7 +3418,6 @@ def api_remind():
     now_ts     = int(datetime.now().astimezone().timestamp())
     if start_ts <= now_ts:
         return jsonify({"ok": False, "error": "Show has already started"}), 400
-    delay = max(0, start_ts - now_ts - 60)
     minutes_until = max(0, (start_ts - now_ts) // 60)
 
     task_id    = int(time.time() * 1000)
@@ -3089,17 +3429,8 @@ def api_remind():
         _web_tasks.append({"id": task_id, "type": "remind", "title": title,
                            "ch_name": ch_name, "ch_url": data.get("ch_url", ""),
                            "start_ts": start_ts, "_cancel": cancel_evt})
-
-    def _fire():
-        if cancel_evt.wait(timeout=delay):
-            print(f"[REMIND] '{title}' — cancelled")
-            return
-        send_desktop_notification("Term-TV Reminder", f"Starting in ~1 min: {title}")
-        print(f"[REMINDER] '{title}' — notification fired")
-        with _web_tasks_lock:
-            _web_tasks[:] = [t for t in _web_tasks if t["id"] != task_id]
-
-    threading.Thread(target=_fire, daemon=True).start()
+    _save_web_tasks()
+    _spawn_remind_task(task_id, title, start_ts, cancel_evt)
     print(f"[REMIND] '{title}' on {ch_name} — notification in {minutes_until} min")
     return jsonify({"ok": True, "minutes_until": minutes_until, "task_id": task_id})
 
@@ -3116,8 +3447,7 @@ def api_schedule():
     now_ts = int(datetime.now().astimezone().timestamp())
     if start_ts <= now_ts:
         return jsonify({"ok": False, "error": "Show has already started"}), 400
-    delay = max(0, start_ts - now_ts)
-    minutes_until = max(0, delay // 60)
+    minutes_until = max(0, (start_ts - now_ts) // 60)
 
     task_id    = int(time.time() * 1000)
     cancel_evt = threading.Event()
@@ -3128,32 +3458,8 @@ def api_schedule():
         _web_tasks.append({"id": task_id, "type": "schedule", "title": title,
                            "ch_name": ch_name, "ch_url": url, "start_ts": start_ts,
                            "_cancel": cancel_evt})
-
-    def _schedule():
-        notify_wait = max(0, delay - 300)
-        if cancel_evt.wait(timeout=notify_wait):
-            print(f"[SCHEDULE] '{title}' — cancelled")
-            return
-        if delay > 300:  # only fire "5 min" alert when start is actually >5 min away
-            send_desktop_notification("Term-TV", f"Starting in 5 min: {title}")
-            print(f"[SCHEDULE] '{title}' — 5-min notification sent")
-        if cancel_evt.wait(timeout=delay - notify_wait):
-            print(f"[SCHEDULE] '{title}' — cancelled before launch")
-            return
-        with _web_tasks_lock:
-            _web_tasks[:] = [t for t in _web_tasks if t["id"] != task_id]
-        try:
-            subprocess.Popen([
-            "mpv",
-            "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
-            "--cache=yes", "--cache-pause=no",
-            url,
-        ])
-            print(f"[SCHEDULE] '{title}' on {ch_name} — mpv launched")
-        except Exception as e:
-            print(f"[SCHEDULE] '{title}' — launch failed: {e}", file=sys.stderr)
-
-    threading.Thread(target=_schedule, daemon=True).start()
+    _save_web_tasks()
+    _spawn_schedule_task(task_id, title, ch_name, url, start_ts, cancel_evt)
     print(f"[SCHEDULE] '{title}' on {ch_name} — playback in {minutes_until} min")
     return jsonify({"ok": True, "minutes_until": minutes_until, "task_id": task_id})
 
@@ -3240,7 +3546,7 @@ def api_cancel_task(task_id):
                 if ev:
                     ev.set()
                 break
-        _web_tasks[:] = [t for t in _web_tasks if t["id"] != task_id]
+    _remove_web_task(task_id)
     print(f"[CANCEL] task {task_id} cancelled")
     return jsonify({"ok": True})
 
@@ -3400,6 +3706,114 @@ def api_vod():
     })
 
 
+# ── F1: Favorites ──────────────────────────────────────────────────────────
+
+@app.route("/api/favorite", methods=["POST"])
+def api_toggle_favorite():
+    data = request.get_json(force=True) or {}
+    ch = {
+        "name":        data.get("name", ""),
+        "tvg-id":      data.get("tvg_id", ""),
+        "url":         data.get("url", ""),
+        "group-title": data.get("group", ""),
+    }
+    if not ch["url"] and not ch["tvg-id"]:
+        return jsonify({"ok": False, "error": "No channel key"}), 400
+    added = _core_toggle_favorite(ch)
+    return jsonify({"ok": True, "fav": added})
+
+
+# ── F7: Channel notes ──────────────────────────────────────────────────────
+
+@app.route("/api/note")
+def api_get_note():
+    ch = {"tvg-id": request.args.get("tvg_id", ""), "url": request.args.get("url", "")}
+    return jsonify({"note": _core_get_channel_note(ch)})
+
+
+@app.route("/api/note", methods=["POST"])
+def api_set_note():
+    data = request.get_json(force=True) or {}
+    ch = {"tvg-id": data.get("tvg_id", ""), "url": data.get("url", "")}
+    if not ch["tvg-id"] and not ch["url"]:
+        return jsonify({"ok": False, "error": "No channel key"}), 400
+    _core_set_channel_note(ch, data.get("note", "").strip())
+    return jsonify({"ok": True})
+
+
+# ── F2: Recordings library ─────────────────────────────────────────────────
+
+def _safe_recording_path(name: str) -> Optional[Path]:
+    """Resolve a bare filename inside RECORDINGS_DIR; reject path traversal."""
+    if not name or Path(name).name != name:
+        return None
+    p = RECORDINGS_DIR / name
+    return p if p.exists() and p.is_file() else None
+
+
+@app.route("/api/library")
+def api_library():
+    if not RECORDINGS_DIR.exists():
+        return jsonify({"files": [], "dir": str(RECORDINGS_DIR)})
+    vids: List[Path] = []
+    for pattern in ("*.mkv", "*.mp4", "*.ts"):
+        vids.extend(RECORDINGS_DIR.glob(pattern))
+    vids.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    with _recordings_lock:
+        active = {r["path"] for r in _recordings.values()}
+    files = []
+    for f in vids[:200]:
+        st = f.stat()
+        files.append({
+            "name":      f.name,
+            "size_mb":   round(st.st_size / (1024 * 1024), 1),
+            "mtime_ts":  int(st.st_mtime),
+            "recording": str(f) in active,
+        })
+    return jsonify({"files": files, "dir": str(RECORDINGS_DIR)})
+
+
+@app.route("/api/library/play", methods=["POST"])
+def api_library_play():
+    name = (request.get_json(force=True) or {}).get("name", "")
+    p = _safe_recording_path(name)
+    if not p:
+        return jsonify({"ok": False, "error": "File not found"}), 404
+    try:
+        kw: Dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        if platform.system() == "Windows":
+            kw["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+        subprocess.Popen(["mpv", "--save-position-on-quit", str(p)], **kw)
+        return jsonify({"ok": True})
+    except FileNotFoundError:
+        return jsonify({"ok": False, "error": "mpv not found — is it installed?"}), 500
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/library/delete", methods=["POST"])
+def api_library_delete():
+    name = (request.get_json(force=True) or {}).get("name", "")
+    p = _safe_recording_path(name)
+    if not p:
+        return jsonify({"ok": False, "error": "File not found"}), 404
+    with _recordings_lock:
+        if any(r["path"] == str(p) for r in _recordings.values()):
+            return jsonify({"ok": False, "error": "Recording in progress — stop it first"}), 400
+    try:
+        p.unlink()
+        # Remove extracted subtitle siblings too
+        for srt in RECORDINGS_DIR.glob(p.stem + "*.srt"):
+            try:
+                srt.unlink()
+            except Exception:
+                pass
+        logging.info(f"Deleted recording: {name}")
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/sources")
 def api_sources():
     playlists = _config.get("playlists", [])
@@ -3487,6 +3901,26 @@ def _load_data():
     print(f"✓ Guide data ready  ({len(_channels)} channels, {len(_epg)} EPG entries)")
 
 
+# ── F6: Periodic guide auto-refresh ──────────────────────────────────────────
+
+def _auto_refresh_loop():
+    """Re-download M3U/EPG every epg_refresh_hours (config, default 6) so a
+    long-running server doesn't go stale. The UI picks up the new data via
+    the data_version bump in /api/status."""
+    try:
+        interval = max(1.0, float(_config.get("epg_refresh_hours", 6))) * 3600
+    except (TypeError, ValueError):
+        interval = 6 * 3600
+    while True:
+        time.sleep(interval)
+        with _data_lock:
+            busy = _data_loading
+        if busy:
+            continue
+        logging.info("Periodic guide auto-refresh")
+        _load_data()
+
+
 # ── Open browser after short delay ───────────────────────────────────────────
 
 def _open_browser():
@@ -3500,11 +3934,12 @@ def _open_browser():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global _config, _vpn_configured, _skip_epg
+    global _config, _vpn_configured, _skip_epg, WEB_PORT, WEB_URL
 
     parser = argparse.ArgumentParser(description="Term-TV Web: Browser-based IPTV guide")
     parser.add_argument("--skip-vpn",  action="store_true", help="Skip VPN prompt at startup")
     parser.add_argument("--skip-epg",  action="store_true", help="Skip EPG download for a faster start (no programme data)")
+    parser.add_argument("--port", type=int, metavar="N", help="Web server port (default: config web_port, else 8891)")
     args = parser.parse_args()
 
     _skip_epg = args.skip_epg
@@ -3527,6 +3962,16 @@ def main():
     if not playlists:
         print("Error: No playlists defined in config.json.", file=sys.stderr)
         sys.exit(1)
+
+    # F8: configurable port (--port beats config web_port beats default)
+    if args.port:
+        WEB_PORT = args.port
+    elif _config.get("web_port"):
+        try:
+            WEB_PORT = int(_config["web_port"])
+        except (TypeError, ValueError):
+            print(f"⚠  Invalid web_port in config.json — using {WEB_PORT}", file=sys.stderr)
+    WEB_URL = f"http://{WEB_HOST}:{WEB_PORT}"
 
     # VPN setup (optional)
     vpn_cfg = _config.get("openvpn", {})
@@ -3559,8 +4004,14 @@ def main():
     elif not args.skip_vpn and vpn_cfg.get("enabled"):
         _vpn_configured = True
 
+    # F4: re-arm scheduled tasks saved by a previous run
+    _restore_web_tasks()
+
     # Start data loading in background
     threading.Thread(target=_load_data, daemon=True).start()
+
+    # F6: periodic guide auto-refresh
+    threading.Thread(target=_auto_refresh_loop, daemon=True).start()
 
     # Open browser
     threading.Thread(target=_open_browser, daemon=True).start()

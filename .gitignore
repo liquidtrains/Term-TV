@@ -4,6 +4,9 @@ config.json
 # Runtime data
 .watch_history.json
 .search_history.json
+.favorites.json
+.channel_notes.json
+.web_tasks.json
 
 # Cache directories
 .epg_cache/
