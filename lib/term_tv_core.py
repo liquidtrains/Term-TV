@@ -45,6 +45,7 @@ WATCH_HISTORY_FILE  = Path(".watch_history.json")
 SEARCH_HISTORY_FILE = Path(".search_history.json")
 FAVORITES_FILE      = Path(".favorites.json")
 CHANNEL_NOTES_FILE  = Path(".channel_notes.json")
+SCHEDULED_TASKS_FILE = Path(".scheduled_tasks.json")
 RECORDINGS_DIR      = Path.home() / "Videos" / "Recordings"
 EPG_CACHE_DIR       = Path(".epg_cache")
 M3U_CACHE_DIR       = Path(".m3u_cache")
@@ -1169,6 +1170,69 @@ def set_channel_note(channel: Channel, note: str):
             json.dump(notes, f, indent=2)
     except Exception as e:
         print(f"Warning: Could not save channel notes. {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Scheduled-task persistence (CLI)
+# ---------------------------------------------------------------------------
+
+def save_scheduled_tasks(tasks: List[Dict[str, Any]]):
+    """Persist scheduled tasks so a CLI restart can re-arm them.
+
+    Serialises only the JSON-safe payload fields; live objects
+    (cancel_event threads) are skipped. Pass a snapshot of the list.
+    """
+    data = []
+    for t in tasks:
+        entry: Dict[str, Any] = {
+            k: t[k]
+            for k in ("id", "type", "channel_name", "provider", "show_title",
+                      "url", "episode_num", "duration_seconds", "extract_subs")
+            if k in t
+        }
+        st = t.get("scheduled_time")
+        entry["scheduled_time"] = st.isoformat() if st else None
+        ost = t.get("original_start_time")
+        if ost:
+            entry["original_start_time"] = ost.isoformat()
+        if "output_path" in t:
+            entry["output_path"] = str(t["output_path"])
+        data.append(entry)
+    try:
+        with open(SCHEDULED_TASKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logging.warning(f"Could not save scheduled tasks: {e}")
+
+
+def load_scheduled_tasks() -> List[Dict[str, Any]]:
+    """Load persisted scheduled tasks, dropping ones whose time has passed.
+
+    ISO datetime strings are parsed back into aware datetimes.
+    """
+    if not SCHEDULED_TASKS_FILE.exists():
+        return []
+    try:
+        with open(SCHEDULED_TASKS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logging.warning(f"Could not load scheduled tasks: {e}")
+        return []
+    now = datetime.now().astimezone()
+    tasks: List[Dict[str, Any]] = []
+    for t in data:
+        try:
+            st_raw = t.get("scheduled_time")
+            st = datetime.fromisoformat(st_raw) if st_raw else None
+            if not st or st <= now:
+                continue  # expired while the CLI was closed
+            t["scheduled_time"] = st
+            if t.get("original_start_time"):
+                t["original_start_time"] = datetime.fromisoformat(t["original_start_time"])
+            tasks.append(t)
+        except Exception as e:
+            logging.warning(f"Skipping bad saved task: {e}")
+    return tasks
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ config.json
 .favorites.json
 .channel_notes.json
 .web_tasks.json
+.scheduled_tasks.json
 
 # Cache directories
 .epg_cache/

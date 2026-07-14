@@ -63,6 +63,7 @@ from lib.term_tv_core import (
     clean_old_cache_files, get_public_ip, check_vpn_status, input_with_countdown,
     ch_in_group,
     get_channel_note, set_channel_note,
+    save_scheduled_tasks, load_scheduled_tasks,
 )
 
 # --- Constants ---
@@ -79,6 +80,68 @@ SCHEDULED_TASKS_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()  # Protects channels_global / epg_global during EPG refresh
 channels_global: list = []
 epg_global: dict = {}
+
+
+def _persist_tasks():
+    """Snapshot SCHEDULED_TASKS to .scheduled_tasks.json so a restart can restore them."""
+    with SCHEDULED_TASKS_LOCK:
+        snapshot = list(SCHEDULED_TASKS)
+    save_scheduled_tasks(snapshot)
+
+
+def _remove_task(task_id: int):
+    """Remove a task from the live list and persist the change."""
+    with SCHEDULED_TASKS_LOCK:
+        SCHEDULED_TASKS[:] = [t for t in SCHEDULED_TASKS if t.get("id") != task_id]
+    _persist_tasks()
+
+
+def _restore_scheduled_tasks():
+    """Re-arm tasks saved by a previous session (expired ones are dropped by the loader)."""
+    restored = load_scheduled_tasks()
+    if not restored:
+        return
+    now = datetime.now().astimezone()
+    count = 0
+    for t in restored:
+        delay = max(0, int((t["scheduled_time"] - now).total_seconds()))
+        cancel_event = threading.Event()
+        t["cancel_event"] = cancel_event
+        with SCHEDULED_TASKS_LOCK:
+            SCHEDULED_TASKS.append(t)
+        ttype = t.get("type", "playback")
+        if ttype == "recording":
+            threading.Thread(
+                target=scheduled_recording_task,
+                args=(t.get("url", ""), Path(t.get("output_path", "")), delay,
+                      t.get("channel_name", "?"), t.get("show_title", "?"),
+                      t.get("provider", ""), t.get("extract_subs", True),
+                      t.get("id", 0), t.get("episode_num", ""),
+                      t.get("original_start_time"), t.get("duration_seconds", 0),
+                      cancel_event),
+                daemon=True,
+            ).start()
+        elif ttype == "reminder":
+            start_time = t.get("original_start_time") or (t["scheduled_time"] + timedelta(seconds=60))
+            threading.Thread(
+                target=scheduled_reminder_task,
+                args=(t.get("show_title", "?"), start_time,
+                      t.get("channel_name", "?"), t.get("id", 0), cancel_event),
+                daemon=True,
+            ).start()
+        else:  # playback
+            threading.Thread(
+                target=scheduled_playback_task,
+                args=(t.get("url", ""), delay, t.get("channel_name", "?"),
+                      t.get("show_title", "?"), t.get("provider", ""),
+                      t.get("id", 0), t.get("episode_num", ""),
+                      t.get("original_start_time"), cancel_event),
+                daemon=True,
+            ).start()
+        count += 1
+    print(f"\n✓ Restored {count} scheduled task(s) from previous session.")
+    logging.info(f"Restored {count} scheduled task(s) from {_core.SCHEDULED_TASKS_FILE}")
+    _persist_tasks()  # rewrite file without the expired entries
 
 # --- Logging Configuration ---
 def setup_logging():
@@ -427,8 +490,7 @@ def manage_scheduled_tasks():
     cancel_event = task.get("cancel_event")
     if cancel_event:
         cancel_event.set()
-    with SCHEDULED_TASKS_LOCK:
-        SCHEDULED_TASKS[:] = [t for t in SCHEDULED_TASKS if t.get("id") != task.get("id")]
+    _remove_task(task.get("id"))
     print(f"✓ Cancelled: {task.get('show_title', 'task')}")
 
 
@@ -472,9 +534,8 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
         logging.info(f"Playback task cancelled after notification: {show_title}")
         return
 
-    # Remove from scheduled tasks list
-    with SCHEDULED_TASKS_LOCK:
-        SCHEDULED_TASKS[:] = [t for t in SCHEDULED_TASKS if t.get("id") != task_id]
+    # Remove from scheduled tasks list (and persist)
+    _remove_task(task_id)
 
     # Start playback with retry logic
     print(f"\n[PLAYBACK STARTED] {channel_name} [{provider}] - {show_title}")
@@ -630,8 +691,12 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
                     "provider": next_provider,
                     "show_title": show_title,
                     "scheduled_time": datetime.now().astimezone() + timedelta(seconds=new_delay),
+                    "url": next_url,
+                    "episode_num": episode_num,
+                    "original_start_time": next_start,
                     "cancel_event": new_cancel_event,
                 })
+            _persist_tasks()
 
             thread = threading.Thread(
                 target=scheduled_playback_task,
@@ -691,9 +756,8 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
         logging.info(f"Recording task cancelled after notification: {show_title}")
         return
 
-    # Remove from scheduled tasks list
-    with SCHEDULED_TASKS_LOCK:
-        SCHEDULED_TASKS[:] = [t for t in SCHEDULED_TASKS if t.get("id") != task_id]
+    # Remove from scheduled tasks list (and persist)
+    _remove_task(task_id)
 
     # Start recording with retry logic
     print(f"\n[RECORDING STARTED] {channel_name} [{provider}] - {show_title}")
@@ -877,8 +941,15 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
                     "provider": next_provider,
                     "show_title": show_title,
                     "scheduled_time": datetime.now().astimezone() + timedelta(seconds=new_delay),
+                    "url": next_url,
+                    "episode_num": episode_num,
+                    "original_start_time": next_start,
+                    "output_path": str(output_path),
+                    "duration_seconds": duration_seconds,
+                    "extract_subs": extract_subs,
                     "cancel_event": new_cancel_event,
                 })
+            _persist_tasks()
 
             thread = threading.Thread(
                 target=scheduled_recording_task,
@@ -905,8 +976,7 @@ def scheduled_reminder_task(show_title: str, start_time: datetime, channel_name:
     if _evt.wait(timeout=delay_seconds):
         logging.info(f"Reminder cancelled: {show_title}")
         return
-    with SCHEDULED_TASKS_LOCK:
-        SCHEDULED_TASKS[:] = [t for t in SCHEDULED_TASKS if t.get("id") != task_id]
+    _remove_task(task_id)
     send_desktop_notification("Term-TV Reminder", f"Starting in ~1 min: {show_title}")
     print(f"\n[REMINDER] '{show_title}' starts in ~1 minute on {channel_name}")
 
@@ -1042,8 +1112,15 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
                 "provider": provider,
                 "show_title": show_title,
                 "scheduled_time": scheduled_time,
+                "url": channel_url,
+                "episode_num": episode_num,
+                "original_start_time": start_time,
+                "output_path": str(output_path),
+                "duration_seconds": rec_duration_seconds,
+                "extract_subs": True,
                 "cancel_event": cancel_event,
             })
+        _persist_tasks()
 
         thread = threading.Thread(
             target=scheduled_recording_task,
@@ -2040,6 +2117,9 @@ def main():
             extract_subtitles_from_recording(_h_path)
         sys.exit(0)
 
+    # --- Restore scheduled tasks from a previous session ---
+    _restore_scheduled_tasks()
+
     # --- Main Interaction Loop ---
     while True:
         # Display favorites
@@ -2449,8 +2529,12 @@ def main():
                             "provider": _ch.get("group-title", ""),
                             "show_title": _title,
                             "scheduled_time": _sched_time,
+                            "url": _ch.get("url", ""),
+                            "episode_num": _ep,
+                            "original_start_time": _st,
                             "cancel_event": _cancel,
                         })
+                    _persist_tasks()
                     threading.Thread(
                         target=scheduled_playback_task,
                         args=(_ch.get("url", ""), _delay, _ch.get("name", "?"), _title,
@@ -2530,8 +2614,12 @@ def main():
                                     "provider": provider,
                                     "show_title": show_title,
                                     "scheduled_time": scheduled_time,
+                                    "url": channel_url,
+                                    "episode_num": episode_num,
+                                    "original_start_time": start_time,
                                     "cancel_event": cancel_event,
                                 })
+                            _persist_tasks()
 
                             thread = threading.Thread(
                                 target=scheduled_playback_task,
@@ -2579,8 +2667,15 @@ def main():
                                     "provider": provider,
                                     "show_title": show_title,
                                     "scheduled_time": scheduled_time,
+                                    "url": channel_url,
+                                    "episode_num": episode_num,
+                                    "original_start_time": start_time,
+                                    "output_path": str(output_path),
+                                    "duration_seconds": future_rec_duration,
+                                    "extract_subs": True,
                                     "cancel_event": cancel_event,
                                 })
+                            _persist_tasks()
 
                             thread = threading.Thread(
                                 target=scheduled_recording_task,
@@ -2608,8 +2703,10 @@ def main():
                                 "provider": provider,
                                 "show_title": _r_title,
                                 "scheduled_time": _r_sched_t,
+                                "original_start_time": _r_start,
                                 "cancel_event": _r_cancel,
                             })
+                        _persist_tasks()
                         threading.Thread(
                             target=scheduled_reminder_task,
                             args=(_r_title, _r_start, _r_chname, _r_task_id, _r_cancel),
