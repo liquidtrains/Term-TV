@@ -41,6 +41,8 @@ import platform
 import shutil
 import os
 
+import lib.term_tv_core as _core
+
 from lib.term_tv_core import (
     Channel, EpgData, ShowResult,
     WATCH_HISTORY_FILE, SEARCH_HISTORY_FILE, FAVORITES_FILE, RECORDINGS_DIR,
@@ -59,7 +61,7 @@ from lib.term_tv_core import (
     send_desktop_notification,
     ensure_recordings_dir, extract_subtitles_from_recording, get_safe_filename,
     clean_old_cache_files, get_public_ip, check_vpn_status, input_with_countdown,
-    _ch_in_group,
+    ch_in_group,
     get_channel_note, set_channel_note,
 )
 
@@ -67,12 +69,14 @@ from lib.term_tv_core import (
 CONFIG_FILE = Path("config.json")
 LOG_FILE = Path("term-tv.log")
 MPV_LOG_FILE = Path("mpv-output.log")
+RECORDINGS_LOG_FILE = Path("recordings.log")
 MPV_LOG_ARCHIVE_DIR = Path("mpv-log-archive")
 MPV_LOG_CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB per chunk
 
 # --- Shared global state (for scheduled background tasks) ---
 SCHEDULED_TASKS: list = []
 SCHEDULED_TASKS_LOCK = threading.Lock()
+DATA_LOCK = threading.RLock()  # Protects channels_global / epg_global during EPG refresh
 channels_global: list = []
 epg_global: dict = {}
 
@@ -99,6 +103,9 @@ def setup_logging():
     # Set console handler to WARNING level (file still gets DEBUG)
     console_handler = logging.getLogger().handlers[1]
     console_handler.setLevel(logging.WARNING)
+
+    # Keep urllib3 wire-level chatter out of the DEBUG file log
+    logging.getLogger("urllib3").setLevel(logging.INFO)
 
     # Log startup
     logging.info("="*80)
@@ -185,7 +192,7 @@ def archive_mpv_log():
 
 
 
-def log_mpv_output(channel_name: str, command: List[str], stdout: str = "", stderr: str = "", returncode: Optional[int] = None):
+def log_mpv_output(channel_name: str, command: List[str], stdout: str = "", stderr: str = "", returncode: Optional[int] = None, log_path: Optional[Path] = None):
     """
     Logs mpv console output to the dedicated mpv log file.
 
@@ -195,9 +202,10 @@ def log_mpv_output(channel_name: str, command: List[str], stdout: str = "", stde
         stdout: Standard output from mpv
         stderr: Standard error from mpv
         returncode: Exit code from mpv process
+        log_path: Override target log file (e.g. recordings.log)
     """
     try:
-        with open(MPV_LOG_FILE, 'a', encoding='utf-8') as f:
+        with open(log_path or MPV_LOG_FILE, 'a', encoding='utf-8') as f:
             # Write header with timestamp
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             f.write(f"\n{'='*80}\n")
@@ -224,13 +232,14 @@ def log_mpv_output(channel_name: str, command: List[str], stdout: str = "", stde
     except Exception as e:
         logging.warning(f"Failed to write mpv output to log: {e}")
 
-def run_mpv_with_logging(mpv_args: List[str], channel_name: str) -> subprocess.CompletedProcess:
+def run_mpv_with_logging(mpv_args: List[str], channel_name: str, log_path: Optional[Path] = None) -> subprocess.CompletedProcess:
     """
     Runs mpv with output displayed in terminal AND logged to file.
 
     Args:
         mpv_args: Command arguments for mpv
         channel_name: Channel name for logging
+        log_path: Override target log file (e.g. recordings.log)
 
     Returns:
         subprocess.CompletedProcess with returncode
@@ -240,7 +249,7 @@ def run_mpv_with_logging(mpv_args: List[str], channel_name: str) -> subprocess.C
     log_file = None
     try:
         try:
-            log_file = open(MPV_LOG_FILE, 'a', encoding='utf-8')
+            log_file = open(log_path or MPV_LOG_FILE, 'a', encoding='utf-8')
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             log_file.write(f"\n{'='*80}\n")
             log_file.write(f"[{timestamp}] Channel: {channel_name}\n")
@@ -439,6 +448,12 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
     logging.info(f"  Delay: {delay_seconds} seconds ({delay_seconds // 60} minutes)")
     logging.info(f"  Episode: {episode_num}")
 
+    # Snapshot globals once at the start so the task works with a consistent dataset
+    # even if an EPG refresh happens while this thread is running.
+    with DATA_LOCK:
+        _channels = channels_global
+        _epg = epg_global
+
     print(f"\n[SCHEDULED] Playback will start in {delay_seconds // 60} minutes...")
     print(f"[SCHEDULED] Channel: {channel_name} [{provider}]")
     print(f"[SCHEDULED] Show: {show_title}")
@@ -521,10 +536,10 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
     logging.warning(f"Original stream failed after 2 attempts, searching for alternatives")
     print(f"\n[PLAYBACK] Original stream failed, searching for alternative providers...")
 
-    if episode_num and original_start_time and channels_global and epg_global:
+    if episode_num and original_start_time and _channels and _epg:
         alternatives = find_alternative_streams(
-            channels_global,
-            epg_global,
+            _channels,
+            _epg,
             show_title,
             episode_num,
             original_start_time,
@@ -579,10 +594,10 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
     logging.warning(f"All streams failed, searching for future reruns")
     print(f"\n[PLAYBACK] All streams failed, searching for future reruns...")
 
-    if episode_num and channels_global and epg_global:
+    if episode_num and _channels and _epg:
         reruns = find_future_reruns(
-            channels_global,
-            epg_global,
+            _channels,
+            _epg,
             show_title,
             episode_num,
             hours_ahead=24
@@ -651,6 +666,12 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
     logging.info(f"  Delay: {delay_seconds} seconds ({delay_seconds // 60} minutes)")
     logging.info(f"  Episode: {episode_num}")
 
+    # Snapshot globals once at the start so the task works with a consistent dataset
+    # even if an EPG refresh happens while this thread is running.
+    with DATA_LOCK:
+        _channels = channels_global
+        _epg = epg_global
+
     print(f"\n[SCHEDULED] Recording will start in {delay_seconds // 60} minutes...")
     print(f"[SCHEDULED] Channel: {channel_name} [{provider}]")
     print(f"[SCHEDULED] Show: {show_title}")
@@ -709,11 +730,12 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
                 stdout, stderr = proc.communicate()
                 returncode = proc.returncode
 
-            # Log mpv output to dedicated log file
+            # Log mpv output to dedicated recordings log file
             log_mpv_output(
                 channel_name=f"{channel_name} [{provider}] - {show_title} (recording)",
                 command=mpv_cmd,
                 stdout=stdout,
+                log_path=RECORDINGS_LOG_FILE,
                 stderr=stderr,
                 returncode=returncode
             )
@@ -748,10 +770,10 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
     logging.warning(f"Original stream failed after 2 attempts, searching for alternatives")
     print(f"\n[RECORDING] Original stream failed, searching for alternative providers...")
 
-    if episode_num and original_start_time and channels_global and epg_global:
+    if episode_num and original_start_time and _channels and _epg:
         alternatives = find_alternative_streams(
-            channels_global,
-            epg_global,
+            _channels,
+            _epg,
             show_title,
             episode_num,
             original_start_time,
@@ -791,11 +813,12 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
                     stdout, stderr = proc.communicate()
                     returncode = proc.returncode
 
-                # Log mpv output to dedicated log file
+                # Log mpv output to dedicated recordings log file
                 log_mpv_output(
                     channel_name=f"{alt_name} [{alt_provider}] - {show_title} (recording alternative)",
                     command=mpv_cmd,
                     stdout=stdout,
+                    log_path=RECORDINGS_LOG_FILE,
                     stderr=stderr,
                     returncode=returncode
                 )
@@ -818,10 +841,10 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
     logging.warning(f"All streams failed, searching for future reruns")
     print(f"\n[RECORDING] All streams failed, searching for future reruns...")
 
-    if episode_num and channels_global and epg_global:
+    if episode_num and _channels and _epg:
         reruns = find_future_reruns(
-            channels_global,
-            epg_global,
+            _channels,
+            _epg,
             show_title,
             episode_num,
             hours_ahead=24
@@ -921,7 +944,9 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
     # F6: show what's currently on / coming up for this channel
     if not show_result:
         tvg_id = channel.get("tvg-id", "")
-        schedule = get_channel_schedule(epg_global, tvg_id, upcoming=3)
+        with DATA_LOCK:
+            _epg = epg_global
+        schedule = get_channel_schedule(_epg, tvg_id, upcoming=3)
         if schedule:
             now = datetime.now().astimezone()
             print()
@@ -1090,7 +1115,8 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         # Run mpv (blocks until player exits or fails to connect)
         # If mpv hangs connecting to stream, press Ctrl+C to cancel
         logging.info("Starting mpv subprocess...")
-        result = run_mpv_with_logging(mpv_args, f"{channel_name} [{provider}]")
+        result = run_mpv_with_logging(mpv_args, f"{channel_name} [{provider}]",
+                                      log_path=RECORDINGS_LOG_FILE if record_choice == 'r' else None)
         logging.info(f"mpv exited with return code: {result.returncode}")
 
         # Check if mpv exited with an error
@@ -1375,11 +1401,13 @@ def check_required_tools():
                 print("  brew install mpv", file=sys.stderr)
             sys.exit(1)
 
-    # --- ffmpeg (optional, subtitle extraction) ---
-    if not shutil.which("ffmpeg"):
-        logging.info("ffmpeg not found — subtitle extraction disabled")
-        print("Note: ffmpeg not found. Subtitle extraction from recordings will be disabled.")
-        print("      Install ffmpeg to enable: https://ffmpeg.org/download.html\n")
+    # --- ffmpeg/ffprobe (optional, subtitle extraction) ---
+    for _tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(_tool):
+            logging.info(f"{_tool} not found — subtitle extraction disabled")
+            print(f"Note: {_tool} not found. Subtitle extraction from recordings will be disabled.")
+            print("      Install ffmpeg to enable: https://ffmpeg.org/download.html\n")
+            break
 
 
 # Global handle to the running OpenVPN process
@@ -1717,17 +1745,35 @@ def toggle_vpn_menu():
     else:
         print(f"  Status : Disconnected")
         print(f"  Current IP : {current_ip or 'unknown'}")
-        if _vpn_exe and _vpn_config_file:
-            print(f"  Config : {_vpn_config_file}")
+
+        # Fall back to config.json when no connection was made this session
+        # (e.g. auto_connect is false) so 'vpn' can do a first-time connect.
+        vpn_exe, vpn_cfg_file, vpn_exp_ip = _vpn_exe, _vpn_config_file, _vpn_expected_ip
+        if not (vpn_exe and vpn_cfg_file):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as _f:
+                    _cfg = json.load(_f)
+                _ovpn = _cfg.get("openvpn", {})
+                vpn_cfg_file = _ovpn.get("config_file", "")
+                vpn_exe = find_openvpn_executable(_ovpn.get("executable", "")) if vpn_cfg_file else None
+                vpn_exp_ip = _cfg.get("vpn_ip")
+            except Exception as _e:
+                logging.warning(f"toggle_vpn_menu: could not read config: {_e}")
+
+        if vpn_exe and vpn_cfg_file:
+            print(f"  Config : {vpn_cfg_file}")
             print()
-            print("  r: Reconnect VPN")
+            print("  r: Connect VPN")
             print("  b: Back")
             choice = input("\nYour choice: ").strip().lower()
             if choice == 'r':
-                connect_vpn(_vpn_exe, _vpn_config_file, _vpn_expected_ip)
+                if connect_vpn(vpn_exe, vpn_cfg_file, vpn_exp_ip):
+                    # Ensure cleanup even when the startup path never registered it
+                    atexit.register(disconnect_vpn)
+                    _register_vpn_signal_handlers()
         else:
             print()
-            print("  No VPN config available to reconnect.")
+            print("  No VPN config available to connect (check openvpn section in config.json).")
             input("  Press Enter to go back...")
 
 
@@ -1816,6 +1862,12 @@ def main():
     if not playlists:
         print("Error: No playlists defined in config.json.", file=sys.stderr)
         sys.exit(1)
+
+    # Apply optional recordings_dir override from config
+    global RECORDINGS_DIR
+    if "recordings_dir" in config:
+        RECORDINGS_DIR = Path(config["recordings_dir"]).expanduser()
+        _core.RECORDINGS_DIR = RECORDINGS_DIR
 
     # Get expected VPN IP from config (optional)
     expected_vpn_ip = config.get("vpn_ip")
@@ -1926,7 +1978,8 @@ def main():
     print(f"Loaded {len(channels)} channels.")
 
     # Store in global for scheduled tasks
-    channels_global = channels
+    with DATA_LOCK:
+        channels_global = channels
 
     epg = {}
     if args.no_epg:
@@ -1944,7 +1997,8 @@ def main():
             print("  (Show search and EPG features will be limited)\n")
 
     # Store in global for scheduled tasks
-    epg_global = epg
+    with DATA_LOCK:
+        epg_global = epg
 
     # If --search was passed, run the search once before entering the loop
     _startup_search = args.search
@@ -1979,7 +2033,7 @@ def main():
             _h_mpv.append(f"--length={_h_dur}")
         _h_mpv.append(_h_url)
         try:
-            run_mpv_with_logging(_h_mpv, _h_channel.get("name", ""))
+            run_mpv_with_logging(_h_mpv, _h_channel.get("name", ""), log_path=RECORDINGS_LOG_FILE)
             extract_subtitles_from_recording(_h_path)
         except KeyboardInterrupt:
             print("\nRecording stopped.")
@@ -2134,7 +2188,7 @@ def main():
                     print(f"Checking all {len(channels)} channels...")
                 elif _hc_sel.isdigit() and 0 <= int(_hc_sel) - 1 < len(_hc_groups):
                     _hc_grp = _hc_groups[int(_hc_sel) - 1][0]
-                    _hc_sample = [c for c in channels if _ch_in_group(c, {_hc_grp})]
+                    _hc_sample = [c for c in channels if ch_in_group(c, {_hc_grp})]
                     print(f"Checking {len(_hc_sample)} channels in '{_hc_grp}'...")
                 else:
                     continue
@@ -2145,8 +2199,12 @@ def main():
                 url = ch.get("url", "")
                 try:
                     import requests as _req
-                    r = _req.head(url, timeout=5, allow_redirects=True)
-                    return ch, r.status_code < 400
+                    # GET with stream=True: many IPTV servers reject HEAD (405)
+                    # even when the stream is alive. We never read the body.
+                    r = _req.get(url, timeout=5, stream=True, allow_redirects=True)
+                    alive = r.status_code < 400
+                    r.close()
+                    return ch, alive
                 except Exception:
                     return ch, False
 
@@ -2194,7 +2252,8 @@ def main():
                         if not channels:
                             print("Could not load channels.", file=sys.stderr)
                         else:
-                            channels_global = channels
+                            with DATA_LOCK:
+                                channels_global = channels
                             epg = {}
                             if not args.no_epg and chosen_playlist.get("epg_url"):
                                 print("Loading EPG data...")
@@ -2203,7 +2262,8 @@ def main():
                                     print(f"✓ Loaded EPG for {len(epg)} channels.")
                                 else:
                                     print("⚠ EPG unavailable.")
-                            epg_global = epg
+                            with DATA_LOCK:
+                                epg_global = epg
                             print(f"✓ Switched to {chosen_playlist['name']} ({len(channels)} channels)")
                 else:
                     print("Invalid selection.", file=sys.stderr)
@@ -2216,7 +2276,8 @@ def main():
             elif chosen_playlist.get("epg_url"):
                 print("\nRefreshing EPG data...")
                 epg = load_epg(chosen_playlist["epg_url"])
-                epg_global = epg
+                with DATA_LOCK:
+                    epg_global = epg
                 if epg:
                     logging.info(f"EPG refreshed and global state updated")
                     print(f"✓ Refreshed EPG for {len(epg)} channels.")
@@ -2233,6 +2294,9 @@ def main():
                     _new_cfg = json.load(_f)
                 playlists = _new_cfg.get("playlists", playlists)
                 expected_vpn_ip = _new_cfg.get("vpn_ip", expected_vpn_ip)
+                if "recordings_dir" in _new_cfg:
+                    RECORDINGS_DIR = Path(_new_cfg["recordings_dir"]).expanduser()
+                    _core.RECORDINGS_DIR = RECORDINGS_DIR
                 print(f"✓ Config reloaded — {len(playlists)} playlist(s) found.")
                 logging.info("Config reloaded from disk")
             except Exception as _e:
@@ -2290,7 +2354,7 @@ def main():
                 print("Invalid selection.", file=sys.stderr)
                 continue
             _selected_group = groups[_gidx][0]
-            _group_channels = [c for c in channels if _ch_in_group(c, {_selected_group})]
+            _group_channels = [c for c in channels if ch_in_group(c, {_selected_group})]
             print(f"\n{_selected_group} — {len(_group_channels)} channel(s):")
             _gc = select_from_channel_list(_group_channels, epg)
             if _gc:
@@ -2313,6 +2377,7 @@ def main():
 
         # Show search
         if choice == 's':
+            recent_searches = []
             if _startup_search:
                 query_input = _startup_search
                 _startup_search = None  # only auto-run once
@@ -2366,7 +2431,7 @@ def main():
                 scheduled_count = 0
                 for _mr in chosen_result:
                     _mu = _mr.get("minutes_until", 0)
-                    if _mu <= 5:
+                    if _mu <= 0:
                         print(f"Skipped (already started): {_mr['title']}")
                         continue
                     _ch = _mr["channel"]
@@ -2413,7 +2478,7 @@ def main():
 
                 # For future shows only (not currently playing or already started), offer scheduling
                 # If show already started (minutes_until <= 0) or is playing now, use normal playback
-                if not is_playing_now and minutes_until > 5:
+                if not is_playing_now and minutes_until > 0:
                     start_time = chosen_result.get("start_time")
                     stop_time = chosen_result.get("stop_time")
 

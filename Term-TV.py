@@ -73,7 +73,7 @@ from lib.term_tv_core import (
     send_desktop_notification,
     ensure_recordings_dir, extract_subtitles_from_recording, get_safe_filename,
     clean_old_cache_files, get_public_ip, check_vpn_status, input_with_countdown,
-    _ch_in_group,
+    ch_in_group,
     get_channel_note, set_channel_note,
 )
 
@@ -108,6 +108,9 @@ def setup_logging():
     # Set console handler to WARNING level (file still gets DEBUG)
     console_handler = logging.getLogger().handlers[1]
     console_handler.setLevel(logging.WARNING)
+
+    # Keep urllib3 wire-level chatter out of the DEBUG file log
+    logging.getLogger("urllib3").setLevel(logging.INFO)
 
     # Log startup
     logging.info("="*80)
@@ -1631,7 +1634,7 @@ def main():
                     print(f"Checking all {len(channels)} channels...")
                 elif _hc_sel.isdigit() and 0 <= int(_hc_sel) - 1 < len(_hc_groups):
                     _hc_grp = _hc_groups[int(_hc_sel) - 1][0]
-                    _hc_sample = [c for c in channels if _ch_in_group(c, {_hc_grp})]
+                    _hc_sample = [c for c in channels if ch_in_group(c, {_hc_grp})]
                     print(f"Checking {len(_hc_sample)} channels in '{_hc_grp}'...")
                 else:
                     continue
@@ -1642,8 +1645,12 @@ def main():
                 url = ch.get("url", "")
                 try:
                     import requests as _req
-                    r = _req.head(url, timeout=5, allow_redirects=True)
-                    return ch, r.status_code < 400
+                    # GET with stream=True: many IPTV servers reject HEAD (405)
+                    # even when the stream is alive. We never read the body.
+                    r = _req.get(url, timeout=5, stream=True, allow_redirects=True)
+                    alive = r.status_code < 400
+                    r.close()
+                    return ch, alive
                 except Exception:
                     return ch, False
 
@@ -1739,7 +1746,7 @@ def main():
                 print("Invalid selection.", file=sys.stderr)
                 continue
             _selected_group = groups[_gidx][0]
-            _group_channels = [c for c in channels if _ch_in_group(c, {_selected_group})]
+            _group_channels = [c for c in channels if ch_in_group(c, {_selected_group})]
             print(f"\n{_selected_group} — {len(_group_channels)} channel(s):")
             _gc = select_from_channel_list(_group_channels, epg)
             if _gc:
@@ -1816,6 +1823,7 @@ def main():
 
         # Show search
         if choice == 's':
+            recent_searches = []
             if _startup_search:
                 query_input = _startup_search
                 _startup_search = None  # only auto-run once
@@ -1869,7 +1877,7 @@ def main():
                 scheduled_count = 0
                 for _mr in chosen_result:
                     _mu = _mr.get("minutes_until", 0)
-                    if _mu <= 5:
+                    if _mu <= 0:
                         print(f"Skipped (already started): {_mr['title']}")
                         continue
                     _ch = _mr["channel"]
@@ -1916,7 +1924,7 @@ def main():
 
                 # For future shows only (not currently playing or already started), offer scheduling
                 # If show already started (minutes_until <= 0) or is playing now, use normal playback
-                if not is_playing_now and minutes_until > 5:
+                if not is_playing_now and minutes_until > 0:
                     start_time = chosen_result.get("start_time")
                     stop_time = chosen_result.get("stop_time")
 

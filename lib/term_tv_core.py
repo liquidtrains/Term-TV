@@ -83,8 +83,11 @@ def clean_old_cache_files(max_age_days: int = 15):
                 st = file_path.stat()
                 age_seconds = (now - datetime.fromtimestamp(st.st_mtime)).total_seconds()
                 if age_seconds > max_age_seconds:
-                    # Delete the data file and its .meta sidecar together
-                    meta_file = file_path.with_suffix(".meta")
+                    # Delete the data file and its .meta sidecar together.
+                    # Sidecars are named {hash}.meta, so strip ALL suffixes
+                    # (with_suffix only replaces the last one and would miss
+                    # the .meta of a {hash}.xml.gz cache file).
+                    meta_file = cache_dir / (file_path.name.split(".", 1)[0] + ".meta")
                     file_path.unlink()
                     total_deleted += 1
                     total_freed_bytes += st.st_size
@@ -271,8 +274,14 @@ def _parse_m3u_lines(lines: List[str]) -> List[Channel]:
             m = re.search(r'group-title="([^"]*)"', line)
             if m:
                 current["group-title"] = m.group(1)
-            name_part = line.split(",")[-1]
-            if name_part:
+            # Channel name is everything after the comma that ends the
+            # attribute section.  Splitting on the LAST comma would truncate
+            # names like "NCIS, Los Angeles", so find the first comma after
+            # the final quoted attribute instead.
+            last_quote = line.rfind('"')
+            comma_idx = line.find(",", last_quote + 1) if last_quote != -1 else line.find(",")
+            name_part = line[comma_idx + 1:] if comma_idx != -1 else ""
+            if name_part.strip():
                 current["name"] = name_part.strip()
         elif line and not line.startswith("#") and current is not None:
             if "name" in current:

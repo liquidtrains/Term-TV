@@ -104,6 +104,8 @@ def setup_logging():
         ],
     )
     logging.getLogger().handlers[1].setLevel(logging.WARNING)
+    # Keep urllib3 wire-level chatter out of the DEBUG file log
+    logging.getLogger("urllib3").setLevel(logging.INFO)
     logging.info("Term-TV Web started")
 
 # ── Core data functions (delegated to lib.term_tv_core) ──────────────────────
@@ -132,6 +134,13 @@ def get_public_ip_cached() -> Optional[str]:
         _cached_ip_ts  = now
         _cached_ip_vpn = vpn_now
     return new_ip
+
+
+def _invalidate_ip_cache():
+    """Force the next get_public_ip_cached() call to refetch."""
+    global _cached_ip_ts
+    with _cached_ip_lock:
+        _cached_ip_ts = 0.0
 
 
 def load_m3u_cached(url: str) -> List[Dict]:
@@ -236,6 +245,7 @@ def search_shows_web(query: str, hours_ahead: int = 24, groups: Optional[set] = 
                     "subtitle":      prog.get("subtitle", ""),
                     "description":   prog.get("description", ""),
                     "episode_num":   prog.get("episode_num", ""),
+                    "air_date":      prog.get("air_date", ""),
                     "start_ts":      int(start_time.timestamp()),
                     "stop_ts":       stop_ts,
                     "duration_min":  dur_min,
@@ -331,14 +341,19 @@ def connect_vpn(openvpn_exe: str, config_file: str, expected_ip: Optional[str] =
         if _vpn_process.poll() is not None:
             print(f"\nOpenVPN exited unexpectedly (code {_vpn_process.returncode}).", file=sys.stderr)
             return False
-        ip = get_public_ip_cached()
+        # Must use the UNCACHED fetch here: the 60s cache would keep returning
+        # the pre-VPN IP for the whole 40s polling window and the connect
+        # would always appear to fail.
+        ip = get_public_ip()
         if expected_ip and ip == expected_ip:
             print(f"\n✓ VPN Connected  (IP: {ip})")
             print("  VPN will auto-disconnect when this window is closed.")
+            _invalidate_ip_cache()
             return True
         elif not expected_ip and time.time() - start >= 8:
             print(f"\n✓ VPN process running  (IP: {ip or 'unknown'})")
             print("  VPN will auto-disconnect when this window is closed.")
+            _invalidate_ip_cache()
             return True
 
     print(f"\n⚠  VPN did not connect within {timeout}s.", file=sys.stderr)
@@ -358,6 +373,7 @@ def disconnect_vpn():
         _vpn_process.kill()
     except Exception as e:
         logging.warning(f"VPN disconnect error: {e}")
+    _invalidate_ip_cache()
 
 
 def _register_vpn_signal_handlers():
@@ -387,15 +403,34 @@ def _register_vpn_signal_handlers():
         ctypes.windll.kernel32.SetConsoleCtrlHandler(_ctrl_handler, True)
 
 
+def _register_vpn_signal_handlers_safe():
+    """Thread-safe wrapper: signal.signal() only works in the main thread.
+    When called from a Flask worker thread we skip it — the atexit hook
+    registered in main() still guarantees the VPN is disconnected on exit."""
+    try:
+        _register_vpn_signal_handlers()
+    except ValueError:
+        logging.info("Signal handlers skipped (not main thread); atexit still covers VPN cleanup")
+
+
 # ── MPV playback management ───────────────────────────────────────────────────
 
 _mpv_process: Optional[subprocess.Popen] = None
 _mpv_log_handle = None
 _mpv_info: Dict = {}
 _mpv_lock = threading.Lock()
+# Serialises whole launch sequences (stop old + start new) so two rapid
+# /api/play calls can't each spawn an mpv with one becoming untracked.
+_mpv_launch_lock = threading.Lock()
 
 
 def launch_mpv(url: str, channel_name: str, show_title: str = "") -> bool:
+    global _mpv_process, _mpv_info, _mpv_log_handle
+    with _mpv_launch_lock:
+        return _launch_mpv_locked(url, channel_name, show_title)
+
+
+def _launch_mpv_locked(url: str, channel_name: str, show_title: str = "") -> bool:
     global _mpv_process, _mpv_info, _mpv_log_handle
     stop_mpv()
 
@@ -459,11 +494,14 @@ def stop_mpv():
         _mpv_process = None
         _mpv_info    = {}
 
-    # Log watch history and invalidate cache so guide re-sorts immediately
+    # Log watch history and invalidate cache so guide re-sorts immediately.
+    # Clamp to exit_time when mpv already died (e.g. user pressed 'q' in the
+    # window hours ago) so idle time isn't counted as watch time.
     started_at  = info_snapshot.get("started_at", 0)
     channel_url = info_snapshot.get("url", "")
     if started_at and channel_url:
-        duration = int(time.time()) - started_at
+        end_ts   = info_snapshot.get("exit_time") or int(time.time())
+        duration = max(0, int(end_ts) - started_at)
         with _data_lock:
             ch = next((c for c in _channels if c.get("url") == channel_url), None)
         if ch:
@@ -738,7 +776,7 @@ body {
 }
 #search:focus { border-color: var(--accent); }
 #search::placeholder { color: var(--muted); }
-.vpn-badge { font-size: 11px; padding: 3px 8px; border-radius: 4px; font-weight: 600; white-space: nowrap; }
+.vpn-badge { font-size: 11px; padding: 3px 8px; border-radius: 4px; font-weight: 600; white-space: nowrap; cursor: pointer; }
 .vpn-on  { background: #14532d; color: #4ade80; }
 .vpn-off { background: #3b1515; color: #f87171; }
 #clock { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -1397,6 +1435,7 @@ function setupEvents() {
   };
   document.getElementById('btn-stop').onclick    = stopMpv;
   document.getElementById('btn-refresh').onclick = () => vodMode ? loadVod(vodPage) : loadGuide();
+  document.getElementById('vpn-badge').addEventListener('click', toggleVpn);
   document.getElementById('source-select').addEventListener('change', e => switchSource(parseInt(e.target.value)));
   document.getElementById('vod-sort').addEventListener('change', () => { if (vodMode) loadVod(vodPage); }); // V2
   document.getElementById('btn-groups').addEventListener('click', e => { e.stopPropagation(); toggleGroupsPanel(); });
@@ -1685,11 +1724,11 @@ async function updateStatus() {
       if (st.vpn_connected) {
         vb.textContent = '● VPN';
         vb.className   = 'vpn-badge vpn-on';
-        vb.title       = 'VPN Connected: ' + (st.vpn_ip || '');
+        vb.title       = 'VPN Connected: ' + (st.vpn_ip || '') + ' — click to disconnect';
       } else {
         vb.textContent = '○ VPN Off';
         vb.className   = 'vpn-badge vpn-off';
-        vb.title       = 'VPN disconnected';
+        vb.title       = 'VPN disconnected — click to connect';
       }
     } else {
       vb.style.display = 'none';
@@ -1781,6 +1820,25 @@ async function stopMpv() {
   await fetch('/api/stop', { method: 'POST' });
   showToast('■ Stopped mpv');
   setTimeout(updateStatus, 500);
+}
+
+// ── VPN toggle (badge click) ──────────────────────────────────────────────
+let _vpnBusy = false;
+async function toggleVpn() {
+  if (_vpnBusy) return;
+  _vpnBusy = true;
+  try {
+    const st = await (await fetch('/api/status')).json();
+    const ep = st.vpn_connected ? '/api/vpn/disconnect' : '/api/vpn/connect';
+    const data = await (await fetch(ep, { method: 'POST' })).json();
+    if (data.ok) showToast(st.vpn_connected ? '○ VPN disconnected' : (data.msg || 'VPN connecting…'));
+    else showToast('VPN: ' + (data.error || 'failed'), true);
+    setTimeout(updateStatus, 1000);
+  } catch (e) {
+    showToast('VPN error: ' + e.message, true);
+  } finally {
+    _vpnBusy = false;
+  }
 }
 
 async function playNew(url, channel, show) {
@@ -2554,8 +2612,8 @@ function spOpenShow(idx) {
   const stopTs = s.stop_ts || (s.start_ts + s.duration_min * 60);
   showPopup(
     { title: s.title, subtitle: s.subtitle, description: s.description,
-      episode_num: s.episode_num, start_ts: s.start_ts, stop_ts: stopTs,
-      duration_min: s.duration_min },
+      episode_num: s.episode_num, air_date: s.air_date, start_ts: s.start_ts,
+      stop_ts: stopTs, duration_min: s.duration_min },
     { name: s.channel_name, group: s.channel_group, url: s.channel_url }
   );
 }
@@ -2777,10 +2835,15 @@ def _parse_ep_num(raw: str):
     """Parse XMLTV episode-num to (season, episode). Returns None if not parseable."""
     if not raw:
         return None
-    # xmltv_ns: "8.3.0" → Season 9, Episode 4  (0-indexed)
-    if re.match(r"^\d+\.\d", raw):
-        parts = raw.split(".")
-        s, e = int(parts[0]) + 1, int(parts[1]) + 1
+    raw = raw.strip()
+    # xmltv_ns: "8.3.0" → Season 9, Episode 4 (0-indexed).  Fields may carry a
+    # "/total" part ("8.3/6.0") and optional whitespace ("8 . 3/6 . 0").
+    if re.match(r"^\d+\s*\.", raw):
+        parts = [p.split("/")[0].strip() for p in raw.split(".")]
+        try:
+            s, e = int(parts[0]) + 1, int(parts[1]) + 1
+        except (ValueError, IndexError):
+            return None
         return (s, e) if s > 0 and e > 0 else None
     m = re.match(r"[Ss](\d+)[Ee](\d+)", raw)
     if m:
@@ -3201,16 +3264,29 @@ def api_stop_recording(rec_id):
 
 @app.route("/api/vpn/connect", methods=["POST"])
 def api_vpn_connect():
-    if not _vpn_exe or not _vpn_config_file:
-        return jsonify({"ok": False, "error": "No VPN config loaded"}), 400
     if vpn_is_connected():
         return jsonify({"ok": True, "msg": "Already connected"})
+
+    # _vpn_exe/_vpn_config_file are only populated by a prior connect_vpn()
+    # call; fall back to config.json so the button works even when the VPN
+    # was declined at startup.
+    exe, cfg_file, exp_ip = _vpn_exe, _vpn_config_file, _vpn_expected_ip
+    if not exe or not cfg_file:
+        vpn_cfg  = _config.get("openvpn", {})
+        cfg_file = vpn_cfg.get("config_file", "")
+        exe      = find_openvpn_executable(vpn_cfg.get("executable", "")) if cfg_file else None
+        exp_ip   = _config.get("vpn_ip")
+    if not exe or not cfg_file:
+        return jsonify({"ok": False, "error": "No VPN config in config.json (openvpn section)"}), 400
+    if not check_admin_privileges():
+        return jsonify({"ok": False, "error": "Server not running as administrator — OpenVPN needs elevation"}), 400
+
     # Run the blocking connect loop in a background thread so the UI stays responsive
-    threading.Thread(
-        target=connect_vpn,
-        args=(_vpn_exe, _vpn_config_file, _vpn_expected_ip),
-        daemon=True,
-    ).start()
+    def _connect_bg():
+        if connect_vpn(exe, cfg_file, exp_ip):
+            _register_vpn_signal_handlers_safe()
+
+    threading.Thread(target=_connect_bg, daemon=True).start()
     return jsonify({"ok": True, "connecting": True, "msg": "VPN connecting… check VPN badge for status"})
 
 
@@ -3293,7 +3369,8 @@ def api_vod():
         if not _is_vod_ch(ch):
             continue
         grp = ch.get("group-title", "")
-        if grp_filter and grp not in grp_filter:
+        # ch_in_group handles merged "A, B" labels produced by M3U dedup
+        if grp_filter and not _core_ch_in_group(ch, grp_filter):
             continue
         name = ch.get("name", "")
         if q and q not in name.lower():
@@ -3351,52 +3428,62 @@ def api_set_source():
 
 # ── Background data loader ────────────────────────────────────────────────────
 
+_load_gen = 0  # incremented per _load_data run; stale runs must not commit
+
+
 def _load_data():
-    global _channels, _epg, _data_loading, _data_error, _data_version, _active_playlist_idx
+    global _channels, _epg, _data_loading, _data_error, _data_version, _active_playlist_idx, _load_gen
     playlists = _config.get("playlists", [])
 
-    # B6: Guard against out-of-range playlist index
+    # Generation guard: a manual refresh racing a source switch must not
+    # overwrite the newer load's data (last-writer-wins would show the OLD
+    # playlist after the switch). Only the newest generation may commit.
     with _data_lock:
+        _load_gen += 1
+        my_gen = _load_gen
+        # B6: Guard against out-of-range playlist index
         idx = _active_playlist_idx
-    if playlists and idx >= len(playlists):
-        logging.error(f"Playlist index {idx} out of range ({len(playlists)} playlists), resetting to 0")
-        with _data_lock:
+        if playlists and idx >= len(playlists):
+            logging.error(f"Playlist index {idx} out of range ({len(playlists)} playlists), resetting to 0")
             _active_playlist_idx = 0
-        idx = 0
+            idx = 0
     playlist = playlists[idx] if playlists else {}
 
-    m3u_ok = False
     try:
         if playlist.get("m3u_url"):
             new_ch = load_m3u_cached(playlist["m3u_url"])
-            if new_ch:
-                with _data_lock:
-                    _channels  = new_ch
-                    _data_error = None
-                m3u_ok = True
-            else:
-                err = f"M3U returned 0 channels from {playlist['m3u_url'][:60]}"
-                logging.error(err)
-                with _data_lock:
-                    _data_error = err
+            with _data_lock:
+                if my_gen == _load_gen:
+                    if new_ch:
+                        _channels   = new_ch
+                        _data_error = None
+                    else:
+                        _data_error = f"M3U returned 0 channels from {playlist['m3u_url'][:60]}"
+                        logging.error(_data_error)
     except Exception as e:
         err = f"M3U load failed: {e}"
         logging.error(err)
         with _data_lock:
-            _data_error = err
+            if my_gen == _load_gen:
+                _data_error = err
 
     try:
         if not _skip_epg and playlist.get("epg_url"):
             new_epg = load_epg(playlist["epg_url"])
             if new_epg:
                 with _data_lock:
-                    _epg = new_epg
+                    if my_gen == _load_gen:
+                        _epg = new_epg
     except Exception as e:
         logging.error(f"EPG load error: {e}")
 
     with _data_lock:
-        _data_loading = False
-        _data_version += 1
+        if my_gen == _load_gen:
+            _data_loading = False
+            _data_version += 1
+        else:
+            logging.info(f"Stale data load (gen {my_gen} < {_load_gen}) discarded")
+            return
     print(f"✓ Guide data ready  ({len(_channels)} channels, {len(_epg)} EPG entries)")
 
 
