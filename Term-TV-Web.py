@@ -575,8 +575,9 @@ def launch_recording(url: str, channel: str, show: str = "", stop_ts: int = 0) -
     mpv_cmd = [
         "mpv",
         f"--stream-record={out_path}",
-        "--video=no", "--audio=no",          # background — no window
-        "--stream-lavf-o=timeout=10000000",
+        "--vo=null", "--ao=null",             # background — no window, but keep tracks selected so stream-record has data
+        "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
+        "--cache=yes", "--cache-pause=no",
         url,
     ]
     rec_id = str(int(time.time() * 1000))
