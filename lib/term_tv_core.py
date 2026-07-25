@@ -10,6 +10,7 @@ import sys
 import re
 import gzip
 import zlib
+import lzma
 import xml.etree.ElementTree as ET
 from io import BytesIO
 import json
@@ -20,7 +21,7 @@ import platform
 import time
 from pathlib import Path
 from collections import defaultdict
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -49,6 +50,29 @@ SCHEDULED_TASKS_FILE = Path(".scheduled_tasks.json")
 RECORDINGS_DIR      = Path.home() / "Videos" / "Recordings"
 EPG_CACHE_DIR       = Path(".epg_cache")
 M3U_CACHE_DIR       = Path(".m3u_cache")
+
+# ---------------------------------------------------------------------------
+# Config validation
+# ---------------------------------------------------------------------------
+
+def validate_playlists(playlists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop playlist entries missing required keys, warning for each one dropped.
+
+    A playlist dict needs at least "name" and "m3u_url" — everything downstream
+    indexes these directly, so a malformed entry would otherwise crash with a
+    raw KeyError instead of the friendly config errors used elsewhere.
+    """
+    valid = []
+    for i, pl in enumerate(playlists, 1):
+        missing = [k for k in ("name", "m3u_url") if not pl.get(k)]
+        if missing:
+            msg = f"Skipping playlist #{i} in config.json — missing required key(s): {', '.join(missing)}"
+            logging.warning(msg)
+            print(f"Warning: {msg}", file=sys.stderr)
+            continue
+        valid.append(pl)
+    return valid
+
 
 # ---------------------------------------------------------------------------
 # Cache helpers
@@ -801,6 +825,268 @@ def find_future_reruns(
     return reruns
 
 # ---------------------------------------------------------------------------
+# Shared mpv resilience flags
+# ---------------------------------------------------------------------------
+
+# Reconnect on stream drop, tolerate a slow initial connect, and don't stall
+# on a filling cache. Term-TV-Web.py's launch_mpv()/launch_recording() have
+# always used these; the CLIs' scheduled tasks only had the timeout half and
+# interactive playback had none of it — now applied consistently everywhere.
+MPV_RESILIENCE_ARGS = [
+    "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
+    "--cache=yes",
+    "--cache-pause=no",
+]
+
+
+# ---------------------------------------------------------------------------
+# Log archiving
+# ---------------------------------------------------------------------------
+
+def archive_log_file(log_file: Path, archive_dir: Path, prefix: str,
+                      chunk_size: int = 5 * 1024 * 1024, max_age_days: int = 365):
+    """Archive *log_file* with LZMA compression (splitting into chunk_size
+    pieces if needed), clear it, and purge archives older than max_age_days.
+
+    Shared implementation behind archive_mpv_log() (mpv-output.log) and
+    recordings.log archiving in Term-TV.py/Term-TV-VPN.py — previously only
+    mpv-output.log was ever rotated; recordings.log grew unbounded.
+    """
+    if not log_file.exists() or log_file.stat().st_size == 0:
+        return
+
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    try:
+        data = log_file.read_bytes()
+    except Exception as e:
+        logging.warning(f"archive_log_file({log_file.name}): could not read log: {e}")
+        return
+
+    try:
+        if len(data) <= chunk_size:
+            archive_path = archive_dir / f"{prefix}-{timestamp}.log.xz"
+            with lzma.open(archive_path, "wb", preset=9) as xz_f:
+                xz_f.write(data)
+            orig_kb = len(data) // 1024
+            comp_kb = archive_path.stat().st_size // 1024
+            print(f"{log_file.name} archived: {archive_path.name}  ({orig_kb} KB → {comp_kb} KB compressed)")
+            logging.info(f"{log_file.name} archived to {archive_path.name} ({orig_kb} KB raw, {comp_kb} KB compressed)")
+        else:
+            total = (len(data) + chunk_size - 1) // chunk_size
+            for idx in range(total):
+                chunk = data[idx * chunk_size:(idx + 1) * chunk_size]
+                archive_path = archive_dir / f"{prefix}-{timestamp}-part{idx + 1:03d}of{total:03d}.log.xz"
+                with lzma.open(archive_path, "wb", preset=9) as xz_f:
+                    xz_f.write(chunk)
+            orig_mb = len(data) / (1024 * 1024)
+            print(f"{log_file.name} split into {total} chunk(s) and archived  ({orig_mb:.1f} MB total)")
+            logging.info(f"{log_file.name} archived in {total} chunks ({orig_mb:.1f} MB)")
+        log_file.write_bytes(b"")
+    except Exception as e:
+        logging.warning(f"archive_log_file({log_file.name}): compression failed: {e}")
+        return
+
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    deleted = 0
+    try:
+        for archive in archive_dir.iterdir():
+            if not archive.is_file() or not archive.name.startswith(f"{prefix}-"):
+                continue
+            try:
+                if datetime.fromtimestamp(archive.stat().st_mtime) < cutoff:
+                    archive.unlink()
+                    deleted += 1
+            except Exception:
+                pass
+    except Exception as e:
+        logging.warning(f"archive_log_file({log_file.name}): purge scan failed: {e}")
+    if deleted:
+        print(f"{log_file.name} archive: Deleted {deleted} archive(s) older than {max_age_days} days.")
+
+
+# ---------------------------------------------------------------------------
+# Shared scheduled-task retry/failover engine
+# ---------------------------------------------------------------------------
+
+def run_scheduled_stream(
+    kind: str,
+    channel_url: str,
+    delay_seconds: int,
+    channel_name: str,
+    show_title: str,
+    provider: str,
+    task_id: int,
+    episode_num: str,
+    original_start_time: Optional[datetime],
+    channels: List[Channel],
+    epg: EpgData,
+    cancel_event,
+    remove_task_fn: Callable[[int], None],
+    mpv_cmd_builder: Callable[[str], List[str]],
+    log_fn: Callable[..., None],
+    on_success: Optional[Callable[[], None]] = None,
+    vpn_check: Optional[Callable[[], bool]] = None,
+    on_stream_start: Optional[Callable[[], None]] = None,
+    on_stream_stop: Optional[Callable[[], None]] = None,
+) -> Dict[str, Any]:
+    """Wait, then try-and-fail-over a scheduled stream (playback or recording).
+
+    Waits until the scheduled time (cancellable via cancel_event), fires a
+    5-min-out desktop notification, tries the original URL (one retry), then
+    up to a few same-episode alternative channels, then searches for a future
+    rerun. This is the ~500-line engine that used to be duplicated between
+    scheduled_playback_task/scheduled_recording_task in each of Term-TV.py and
+    Term-TV-VPN.py — those differed only in the mpv command (mpv_cmd_builder),
+    where output is logged (log_fn), and what happens on success (on_success,
+    e.g. subtitle extraction for recordings).
+
+    mpv_cmd_builder(url) must return the full mpv argv (including "mpv" and a
+    trailing "--" before url). log_fn must accept the same keyword arguments
+    as log_mpv_output (channel_name, command, stdout, stderr, returncode).
+    vpn_check, if given, is called right before the first launch attempt —
+    if it returns False the task aborts without touching mpv (Term-TV-VPN.py
+    only, so a dropped tunnel doesn't let a scheduled task air unprotected).
+    on_stream_start/on_stream_stop bracket each individual mpv attempt (used
+    by Term-TV-VPN.py to gate its Ctrl+C VPN-teardown guard during recording).
+
+    Returns {"status": "cancelled" | "success" | "failed"} or
+    {"status": "rerun_found", "rerun": <dict from find_future_reruns>, "new_delay": int}
+    — the caller is responsible for building/persisting the reschedule task
+    (its shape differs between playback and recording) and recursing.
+    """
+    tag = kind.upper()
+    logging.info(f"Scheduled {kind} task created: {show_title} on {channel_name} [{provider}]")
+    logging.info(f"  URL: {channel_url}")
+    logging.info(f"  Delay: {delay_seconds} seconds ({delay_seconds // 60} minutes)")
+    logging.info(f"  Episode: {episode_num}")
+
+    print(f"\n[SCHEDULED] {kind.capitalize()} will start in {delay_seconds // 60} minutes...")
+    print(f"[SCHEDULED] Channel: {channel_name} [{provider}]")
+    print(f"[SCHEDULED] Show: {show_title}")
+    print(f"[SCHEDULED] Will auto-launch when show starts\n")
+
+    notify_wait = max(0, delay_seconds - 300)
+    if cancel_event.wait(timeout=notify_wait):
+        logging.info(f"{kind.capitalize()} task cancelled: {show_title}")
+        return {"status": "cancelled"}
+    if notify_wait > 0:
+        send_desktop_notification("Term-TV", f"{kind.capitalize()} in 5 min: {show_title}")
+        logging.info(f"Desktop notification sent for: {show_title}")
+    if cancel_event.wait(timeout=delay_seconds - notify_wait):
+        logging.info(f"{kind.capitalize()} task cancelled after notification: {show_title}")
+        return {"status": "cancelled"}
+
+    remove_task_fn(task_id)
+
+    if vpn_check is not None and not vpn_check():
+        logging.warning(f"VPN not connected — aborting scheduled {kind}: {show_title}")
+        print(f"\n[{tag} FAILED] VPN is not connected — refusing to start {kind} for {show_title}")
+        send_desktop_notification("Term-TV", f"{kind.capitalize()} skipped (VPN down): {show_title}")
+        return {"status": "failed"}
+
+    print(f"\n[{tag} STARTED] {channel_name} [{provider}] - {show_title}")
+    logging.info(f"Starting {kind}: {show_title}")
+
+    def _try_url(url: str, label: str) -> bool:
+        """Launch mpv for *url*; wait up to 10s for an early failure, then wait
+        for exit. Returns True on success (returncode 0 or 4 == user quit)."""
+        mpv_cmd = mpv_cmd_builder(url)
+        if on_stream_start:
+            on_stream_start()
+        try:
+            proc = subprocess.Popen(mpv_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                stdout, stderr = proc.communicate(timeout=10)
+                returncode = proc.returncode
+            except subprocess.TimeoutExpired:
+                stdout, stderr = proc.communicate()
+                returncode = proc.returncode
+        finally:
+            if on_stream_stop:
+                on_stream_stop()
+
+        log_fn(channel_name=label, command=mpv_cmd, stdout=stdout, stderr=stderr, returncode=returncode)
+
+        if returncode in (0, 4):
+            logging.info(f"{kind.capitalize()} completed successfully (exit code: {returncode})")
+            if on_success:
+                on_success()
+            return True
+
+        logging.warning(f"mpv exited with code {returncode}")
+        logging.debug(f"mpv stderr: {(stderr or '')[:500]}")
+        return False
+
+    # Try original URL (with one retry)
+    for attempt in range(2):
+        attempt_num = attempt + 1
+        logging.info(f"Attempt {attempt_num}/2: Trying original URL {channel_url}")
+        print(f"[{tag}] Attempt {attempt_num}/2: {channel_name} [{provider}]")
+        try:
+            if _try_url(channel_url, f"{channel_name} [{provider}] - {show_title}"):
+                print(f"\n[{tag} COMPLETE]")
+                return {"status": "success"}
+        except FileNotFoundError:
+            logging.error("mpv command not found")
+            print("\nError: 'mpv' command not found. Is mpv installed?", file=sys.stderr)
+            return {"status": "failed"}
+        except Exception as e:
+            logging.error(f"Attempt {attempt_num} failed with exception: {e}")
+            print(f"[{tag}] Error: {e}")
+        if attempt == 0:
+            print(f"[{tag}] Retrying in 5 seconds...")
+            time.sleep(5)
+
+    # Original URL failed, try alternatives
+    logging.warning("Original stream failed after 2 attempts, searching for alternatives")
+    print(f"\n[{tag}] Original stream failed, searching for alternative providers...")
+
+    if episode_num and original_start_time and channels and epg:
+        alternatives = find_alternative_streams(
+            channels, epg, show_title, episode_num, original_start_time, tolerance_minutes=5)
+        for alt in alternatives:
+            alt_channel = alt["channel"]
+            alt_url = alt_channel.get("url", "")
+            alt_provider = alt_channel.get("group-title", "Unknown Provider")
+            alt_name = alt_channel.get("name", "Unknown")
+            logging.info(f"Trying alternative: {alt_name} [{alt_provider}] - {alt_url}")
+            print(f"[{tag}] Trying alternative: {alt_name} [{alt_provider}]")
+            try:
+                if _try_url(alt_url, f"{alt_name} [{alt_provider}] - {show_title} (alternative)"):
+                    print(f"\n[{tag} COMPLETE]")
+                    print(f"[{tag}] Used alternative provider: {alt_provider}")
+                    return {"status": "success"}
+                logging.warning("Alternative failed")
+            except Exception as e:
+                logging.error(f"Alternative stream failed: {e}")
+
+    # All streams failed, search for future reruns
+    logging.warning("All streams failed, searching for future reruns")
+    print(f"\n[{tag}] All streams failed, searching for future reruns...")
+
+    if episode_num and channels and epg:
+        reruns = find_future_reruns(channels, epg, show_title, episode_num, hours_ahead=24)
+        if reruns:
+            next_rerun = reruns[0]
+            next_start = next_rerun["start_time"]
+            new_delay = max(0, int((next_start - datetime.now().astimezone()).total_seconds()))
+            next_channel = next_rerun["channel"]
+            logging.info(f"Found future rerun in {new_delay // 60} minutes on "
+                         f"{next_channel.get('name', 'Unknown')} [{next_channel.get('group-title', 'Unknown Provider')}]")
+            print(f"[{tag}] Found future rerun:")
+            print(f"  Channel: {next_channel.get('name', 'Unknown')} [{next_channel.get('group-title', 'Unknown Provider')}]")
+            print(f"  Time: {next_rerun['time_status']}")
+            return {"status": "rerun_found", "rerun": next_rerun, "new_delay": new_delay}
+
+    logging.error(f"{kind.capitalize()} failed completely: {show_title} - no alternatives or reruns found")
+    print(f"\n[{tag} FAILED] Could not {kind} {show_title}")
+    print(f"  All stream URLs failed and no future reruns found in the next 24 hours")
+    return {"status": "failed"}
+
+
+# ---------------------------------------------------------------------------
 # Watch history
 # ---------------------------------------------------------------------------
 
@@ -827,7 +1113,8 @@ def load_watch_history() -> List[Dict[str, Any]]:
             except Exception:
                 pass
         return history
-    except Exception:
+    except Exception as e:
+        logging.warning(f"Failed to load watch history: {e}")
         return []
 
 
@@ -1084,11 +1371,18 @@ def display_favorites(favorites: List[Dict[str, Any]], start_index: int = 1):
 # ---------------------------------------------------------------------------
 
 def get_channel_groups(channels: List[Channel]) -> List[tuple]:
-    """Return a sorted list of (group_name, channel_count) tuples."""
+    """Return a sorted list of (group_name, channel_count) tuples.
+
+    The M3U dedup step can merge group-title labels for duplicate-URL
+    channels into e.g. "US HD, US SD" — split on comma so each real
+    group is counted under its own name, matching ch_in_group().
+    """
     counts: Dict[str, int] = defaultdict(int)
     for ch in channels:
-        group = ch.get("group-title", "")
-        if group:
+        raw = ch.get("group-title", "")
+        if not raw:
+            continue
+        for group in {g.strip() for g in raw.split(",") if g.strip()}:
             counts[group] += 1
     return sorted(counts.items(), key=lambda x: x[0].lower())
 

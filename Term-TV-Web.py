@@ -44,6 +44,7 @@ import re
 import json
 import lzma
 import time
+import signal
 import logging
 import argparse
 import threading
@@ -444,6 +445,7 @@ def _launch_mpv_locked(url: str, channel_name: str, show_title: str = "") -> boo
         "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
         "--cache=yes",
         "--cache-pause=no",
+        "--",
         url,
     ]
     try:
@@ -536,6 +538,104 @@ def mpv_status() -> Dict:
 
 _recordings:      Dict[str, Dict] = {}
 _recordings_lock: threading.Lock  = threading.Lock()
+ACTIVE_RECORDINGS_FILE = Path(".active_recordings.json")
+
+
+def _pid_alive(pid: Optional[int]) -> bool:
+    """Best-effort liveness check for a PID, no extra dependencies (no psutil)."""
+    if not pid:
+        return False
+    if platform.system() == "Windows":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _kill_pid(pid: int):
+    """Terminate a PID we don't hold a subprocess.Popen handle for (a reattached recording)."""
+    if platform.system() == "Windows":
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(0.5)
+        if _pid_alive(pid):
+            os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _save_active_recordings():
+    """Persist in-progress recordings so a server restart can reattach to them.
+
+    Only future _web_tasks were restart-safe before this — a recording already
+    running when the server restarted became an orphaned, untracked mpv process
+    with no Stop control and no auto-stop. Called on every start/stop.
+    """
+    with _recordings_lock:
+        data = []
+        for r in _recordings.values():
+            proc = r.get("process")
+            pid = proc.pid if proc else r.get("pid")
+            data.append({
+                "id": r["id"], "channel": r.get("channel", ""), "show": r.get("show", ""),
+                "url": r.get("url", ""), "path": r.get("path", ""), "filename": r.get("filename", ""),
+                "started_at": r.get("started_at", 0), "stop_ts": r.get("stop_ts", 0), "pid": pid,
+            })
+    try:
+        with open(ACTIVE_RECORDINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logging.warning(f"Could not save active recordings: {e}")
+
+
+def _restore_active_recordings():
+    """Reattach to recordings that were still running when the server last stopped."""
+    if not ACTIVE_RECORDINGS_FILE.exists():
+        return
+    try:
+        with open(ACTIVE_RECORDINGS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except Exception as e:
+        logging.warning(f"Could not load active recordings: {e}")
+        return
+    reattached = 0
+    for r in saved:
+        pid = r.get("pid")
+        if not _pid_alive(pid):
+            continue  # finished or was killed while the server was down — nothing to reattach
+        rec_id = str(r.get("id") or int(time.time() * 1000))
+        with _recordings_lock:
+            _recordings[rec_id] = {
+                "id": rec_id, "channel": r.get("channel", ""), "show": r.get("show", ""),
+                "url": r.get("url", ""), "path": r.get("path", ""), "filename": r.get("filename", ""),
+                "started_at": r.get("started_at") or int(time.time()),
+                "stop_ts": r.get("stop_ts", 0),
+                "process": None, "pid": pid, "log_handle": None,
+            }
+        stop_ts = r.get("stop_ts", 0)
+        if stop_ts and stop_ts > int(time.time()):
+            delay = stop_ts - int(time.time())
+            def _auto_stop(rid=rec_id, title=r.get("show") or r.get("channel", ""), d=delay):
+                time.sleep(max(0, d))
+                if stop_recording(rid):
+                    logging.info(f"Auto-stopped reattached recording '{title}' at programme end")
+            threading.Thread(target=_auto_stop, daemon=True).start()
+        reattached += 1
+        logging.info(f"Reattached to in-progress recording: {r.get('filename', '?')} (pid {pid})")
+    _save_active_recordings()  # rewrite, dropping entries that didn't reattach
+    if reattached:
+        print(f"Reattached to {reattached} in-progress recording(s) from a previous session.")
+
 
 _web_tasks:      List[Dict] = []   # [{id, type, title, ch_name, ch_url, start_ts, stop_ts, _cancel}]
 _web_tasks_lock: threading.Lock = threading.Lock()
@@ -545,8 +645,11 @@ WEB_TASKS_FILE = Path(".web_tasks.json")
 def _save_web_tasks():
     """F4: persist pending remind/schedule tasks so a server restart restores them."""
     with _web_tasks_lock:
-        data = [{k: t.get(k, 0) for k in ("id", "type", "title", "ch_name", "ch_url", "start_ts", "stop_ts")}
-                for t in _web_tasks]
+        data = [
+            dict({k: t.get(k, 0) for k in ("id", "type", "title", "ch_name", "ch_url", "start_ts", "stop_ts")},
+                 epg_meta=t.get("epg_meta"))
+            for t in _web_tasks
+        ]
     try:
         with open(WEB_TASKS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -565,8 +668,43 @@ _tvmaze_lock:       threading.Lock  = threading.Lock()
 
 _tmdb_show_cache:   Dict[str, int]  = {}   # show_imdb_id → tmdb_show_id
 
+_META_CACHE_MAX = 2000  # per-cache cap so a long-running server doesn't grow these forever
 
-def launch_recording(url: str, channel: str, show: str = "", stop_ts: int = 0) -> Dict:
+
+def _cache_put(cache: Dict, key, value):
+    """Insert into a metadata cache with simple FIFO eviction once it hits _META_CACHE_MAX.
+
+    Caller must already hold _tvmaze_lock — this is a plain dict op, not itself locked.
+    """
+    if key not in cache and len(cache) >= _META_CACHE_MAX:
+        cache.pop(next(iter(cache)), None)
+    cache[key] = value
+
+
+def _write_recording_sidecar(out_path: Path, channel: str, show: str, url: str,
+                              stop_ts: int, epg_meta: Optional[Dict]):
+    """Save everything the EPG popup knew about this episode next to the recording,
+    to help with classifying/organizing recordings later."""
+    epg_meta = epg_meta or {}
+    payload = {
+        "channel": epg_meta.get("channel") or {"name": channel, "url": url},
+        "programme": epg_meta.get("programme") or {"title": show},
+        "metadata": epg_meta.get("metadata"),
+        "recording": {
+            "started_at": datetime.now().astimezone().isoformat(),
+            "output_file": out_path.name,
+            "stop_ts": stop_ts or None,
+        },
+    }
+    try:
+        out_path.with_suffix(".json").write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logging.warning(f"Could not write recording metadata sidecar for {out_path.name}: {e}")
+
+
+def launch_recording(url: str, channel: str, show: str = "", stop_ts: int = 0,
+                      epg_meta: Optional[Dict] = None) -> Dict:
     """Start a background mpv recording (no window). Returns status dict."""
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
     filename = get_safe_filename(channel, show)
@@ -578,6 +716,7 @@ def launch_recording(url: str, channel: str, show: str = "", stop_ts: int = 0) -
         "--vo=null", "--ao=null",             # background — no window, but keep tracks selected so stream-record has data
         "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
         "--cache=yes", "--cache-pause=no",
+        "--",
         url,
     ]
     rec_id = str(int(time.time() * 1000))
@@ -604,9 +743,12 @@ def launch_recording(url: str, channel: str, show: str = "", stop_ts: int = 0) -
                 "path":       str(out_path),
                 "filename":   filename,
                 "started_at": int(time.time()),
+                "stop_ts":    stop_ts,
                 "process":    proc,
                 "log_handle": log_handle,
             }
+        _save_active_recordings()
+        _write_recording_sidecar(out_path, channel, show, url, stop_ts, epg_meta)
         logging.info(f"Recording started: {channel} → {filename}")
 
         # Auto-stop when the programme ends (server-side, survives page refresh)
@@ -633,6 +775,7 @@ def stop_recording(rec_id: str) -> bool:
         if not rec:
             return False
         proc = rec.get("process")
+        pid  = rec.get("pid")
         lh   = rec.get("log_handle")
     if proc and proc.poll() is None:
         proc.terminate()
@@ -640,6 +783,10 @@ def stop_recording(rec_id: str) -> bool:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
+    elif not proc and pid and _pid_alive(pid):
+        # Reattached recording (server restarted while it was running) — no
+        # subprocess.Popen handle to terminate(), kill by PID instead.
+        _kill_pid(pid)
     if lh:
         try:
             lh.write(f"{'='*80}\n[Stopped by web UI]\n")
@@ -648,6 +795,7 @@ def stop_recording(rec_id: str) -> bool:
             pass
     with _recordings_lock:
         _recordings.pop(rec_id, None)
+    _save_active_recordings()
     logging.info(f"Recording stopped: {rec_id}")
     return True
 
@@ -664,7 +812,8 @@ def recordings_status() -> List[Dict]:
             "filename":   r["filename"],
             "path":       r["path"],
             "started_at": r["started_at"],
-            "running":    r.get("process") is not None and r["process"].poll() is None,
+            "running":    (r.get("process") is not None and r["process"].poll() is None)
+                          or (r.get("process") is None and _pid_alive(r.get("pid"))),
             "duration_s": int(time.time()) - r["started_at"],
         }
         for r in recs
@@ -674,6 +823,18 @@ def recordings_status() -> List[Dict]:
 # ── MPV log archiving (reference: Term-TV.py) ─────────────────────────────────
 
 def archive_mpv_log():
+    # mpv playback and recordings both append to this same log file via an
+    # inherited handle; truncating it while one is still alive corrupts the
+    # tail of their output. Skip archiving this run — it'll be picked up
+    # cleanly on the next graceful shutdown once nothing is writing to it.
+    with _mpv_lock:
+        mpv_alive = _mpv_process is not None and _mpv_process.poll() is None
+    with _recordings_lock:
+        recording_alive = any(r.get("process") and r["process"].poll() is None
+                               for r in _recordings.values())
+    if mpv_alive or recording_alive:
+        logging.info("archive_mpv_log: skipped — mpv/recording process still writing to the log")
+        return
     if not MPV_LOG_FILE.exists() or MPV_LOG_FILE.stat().st_size == 0:
         return
     MPV_LOG_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1568,6 +1729,8 @@ async function loadGuide(silent = false) {
   if (!silent) setLoading(true);
   const p = new URLSearchParams({ start_ts: winStartTs, hours: WIN_HRS });
   selectedGroups.forEach(g => p.append('groups', g));
+  let hadError = false;  // keep the overlay (with its message) visible on error/retry instead
+                          // of hiding it in finally the instant it's set
   try {
     // AbortController inside try so any throw is caught and finally always dismisses the overlay
     const _ctrl    = new AbortController();
@@ -1578,6 +1741,7 @@ async function loadGuide(silent = false) {
     guideData = await res.json();
     loadedAt  = Date.now();
     if (guideData.error) {
+      hadError = true;
       if (!silent) document.getElementById('loading-msg').textContent = guideData.error;
       // Data still loading — retry in 3s without waiting for updateStatus poll
       _guideRetryTimer = setTimeout(() => loadGuide(), 3000);
@@ -1587,6 +1751,7 @@ async function loadGuide(silent = false) {
     updateInfoBar();
     setLoading(false);  // always dismiss overlay on successful render (even if silent)
   } catch (e) {
+    hadError = true;
     const msg = 'Failed to load guide: ' + e.message;
     showToast(msg, true);
     if (!silent) {
@@ -1595,7 +1760,7 @@ async function loadGuide(silent = false) {
     }
   } finally {
     _loadGuideActive = false;
-    if (!silent) setLoading(false);  // dismiss overlay on error/exception for non-silent calls
+    if (!silent && !hadError) setLoading(false);  // dismiss overlay on success; leave error/retry message visible otherwise
   }
 }
 
@@ -2093,10 +2258,11 @@ function showPopup(prog, ch) {
   recBtn.textContent = isFuture ? '⏺ Schedule Recording' : '⏺ Record';
   recBtn.onclick = async () => {
     closePopup();
+    const epgMeta = buildEpgMeta(prog, ch);
     if (isFuture) {
-      await scheduleRecording(prog, ch);
+      await scheduleRecording(prog, ch, epgMeta);
     } else {
-      const recId = await startRecording(ch.url, ch.name, prog.title, prog.stop_ts || 0);
+      const recId = await startRecording(ch.url, ch.name, prog.title, prog.stop_ts || 0, epgMeta);
       if (recId) _markTask(ch, prog, 'record', recId);
     }
   };
@@ -2196,7 +2362,12 @@ function showVodPopup(item) {
   document.getElementById('vod-popup-play').onclick   = () => { play(item.url, item.name, ''); closeVodPopup(); };
   document.getElementById('vod-popup-record').onclick = async () => {
     closeVodPopup();
-    await startRecording(item.url, item.name, '');
+    const epgMeta = {
+      channel: { name: item.name || '', url: item.url || '', group: item.group || '' },
+      programme: { title: item.name || '' },
+      metadata: null,
+    };
+    await startRecording(item.url, item.name, '', 0, epgMeta);
   };
 
   document.getElementById('vod-popup-overlay').style.display = 'flex';
@@ -2218,7 +2389,7 @@ async function fetchVodMeta(item) {
     if (!meta) {
       const params = new URLSearchParams({title: item.name});
       meta = await (await fetch('/api/show_meta?' + params)).json();
-      if (meta && meta.imdb_id) _showMetaCache.set(cacheKey, meta);
+      if (meta && meta.imdb_id) _showMetaCacheSet(cacheKey, meta);
     }
     if (_vodPopupItem !== captured) return;  // popup closed or switched
     if (!meta || !meta.imdb_id) {
@@ -2308,6 +2479,13 @@ function fmtSE(s, e) {
 }
 
 const _showMetaCache = new Map();  // title_lower → resolved meta object
+const _SHOW_META_CACHE_MAX = 500;  // FIFO cap so a long browser session doesn't grow this forever
+function _showMetaCacheSet(key, val) {
+  if (!_showMetaCache.has(key) && _showMetaCache.size >= _SHOW_META_CACHE_MAX) {
+    _showMetaCache.delete(_showMetaCache.keys().next().value);
+  }
+  _showMetaCache.set(key, val);
+}
 
 async function fetchShowMeta(prog, capturedPopupProg) {
   const params = new URLSearchParams({title: prog.title});
@@ -2319,7 +2497,7 @@ async function fetchShowMeta(prog, capturedPopupProg) {
     let meta = _showMetaCache.get(cacheKey);
     if (!meta) {
       meta = await (await fetch('/api/show_meta?' + params)).json();
-      if (meta.imdb_id) _showMetaCache.set(cacheKey, meta);
+      if (meta.imdb_id) _showMetaCacheSet(cacheKey, meta);
     }
     if (!meta || !meta.imdb_id) {
       if (popupProg === capturedPopupProg) {
@@ -2396,12 +2574,13 @@ async function schedulePb(prog, ch) {
   } catch (e) { showToast('Error: ' + e.message, true); }
 }
 
-async function scheduleRecording(prog, ch) {
+async function scheduleRecording(prog, ch, epgMeta) {
   try {
     const res  = await fetch('/api/schedule_record', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({url: ch.url, channel_name: ch.name, title: prog.title,
-                             start_ts: prog.start_ts, stop_ts: prog.stop_ts || 0})
+                             start_ts: prog.start_ts, stop_ts: prog.stop_ts || 0,
+                             epg_meta: epgMeta || null})
     });
     const data = await res.json();
     if (data.ok && data.already_set) { showToast('Recording already scheduled: ' + prog.title); }
@@ -2857,12 +3036,33 @@ function spOpenShow(idx) {
 // ── Recording ──────────────────────────────────────────────────────────────
 let _recTimer = null;
 
-async function startRecording(url, channel, show, stop_ts) {
+// Everything the EPG popup knows about an episode, saved alongside its recording
+// (as a .json sidecar next to the .mkv) to help classify recordings later.
+function buildEpgMeta(prog, ch) {
+  const cacheKey = prog.title.toLowerCase() + '|' + (prog.episode_num||'') + '|' + (prog.air_date||'') + '|' + (prog.subtitle||'');
+  const meta = _showMetaCache.get(cacheKey) || null;
+  return {
+    channel: { name: ch.name || '', url: ch.url || '', tvg_id: ch.tvg_id || '', group: ch.group || '' },
+    programme: {
+      title: prog.title || '', subtitle: prog.subtitle || '', description: prog.description || '',
+      episode_num: prog.episode_num || '', air_date: prog.air_date || '',
+      start_ts: prog.start_ts || 0, stop_ts: prog.stop_ts || 0, duration_min: prog.duration_min || 0,
+    },
+    metadata: meta ? {
+      imdb_id: meta.imdb_id || null, ep_imdb_id: meta.ep_imdb_id || null,
+      season: meta.season || null, episode: meta.episode || null,
+      ep_title: meta.ep_title || null, ep_desc: meta.ep_desc || null,
+      summary: meta.summary || null, name: meta.name || null,
+    } : null,
+  };
+}
+
+async function startRecording(url, channel, show, stop_ts, epgMeta) {
   try {
     const res  = await fetch('/api/record', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ url, channel, show, stop_ts: stop_ts || 0 }),
+      body:    JSON.stringify({ url, channel, show, stop_ts: stop_ts || 0, epg_meta: epgMeta || null }),
     });
     const data = await res.json();
     if (data.ok) {
@@ -3127,7 +3327,7 @@ def _fetch_ep_imdb_id(tvmaze_ep_id: int) -> Optional[str]:
         if r.status_code == 200:
             ep_imdb = (r.json().get("externals") or {}).get("imdb")
             with _tvmaze_lock:
-                _tvmaze_ep_cache[cache_key] = {"ep_imdb_id": ep_imdb, "_ts": time.time()}
+                _cache_put(_tvmaze_ep_cache, cache_key, {"ep_imdb_id": ep_imdb, "_ts": time.time()})
             return ep_imdb
     except Exception:
         pass
@@ -3156,7 +3356,7 @@ def _fetch_ep_imdb_via_tmdb(show_imdb_id: str, season: int, episode: int) -> Opt
                 if results:
                     tmdb_id = results[0]["id"]
                     with _tvmaze_lock:
-                        _tmdb_show_cache[show_imdb_id] = tmdb_id
+                        _cache_put(_tmdb_show_cache, show_imdb_id, tmdb_id)
         except Exception:
             pass
 
@@ -3178,7 +3378,7 @@ def _fetch_ep_imdb_via_tmdb(show_imdb_id: str, season: int, episode: int) -> Opt
         )
         ep_imdb = r.json().get("imdb_id") if r.status_code == 200 else None
         with _tvmaze_lock:
-            _tvmaze_ep_cache[ep_key] = {"ep_imdb_id": ep_imdb, "_ts": time.time()}
+            _cache_put(_tvmaze_ep_cache, ep_key, {"ep_imdb_id": ep_imdb, "_ts": time.time()})
         return ep_imdb
     except Exception:
         pass
@@ -3218,7 +3418,7 @@ def api_show_meta():
                 "_ts":     time.time(),
             }
             with _tvmaze_lock:
-                _tvmaze_show_cache[title_key] = show_cached
+                _cache_put(_tvmaze_show_cache, title_key, show_cached)
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
@@ -3243,7 +3443,7 @@ def api_show_meta():
                 if r.status_code == 200:
                     ep_cached = _ep_cached_entry(r.json())
                     with _tvmaze_lock:
-                        _tvmaze_ep_cache[ep_key] = ep_cached
+                        _cache_put(_tvmaze_ep_cache, ep_key, ep_cached)
                 else:
                     ep_cached = {"season": s, "episode": e, "_ts": time.time()}
             except Exception:
@@ -3266,7 +3466,7 @@ def api_show_meta():
                     if eps:
                         ep_cached = _ep_cached_entry(eps[0])
                         with _tvmaze_lock:
-                            _tvmaze_ep_cache[ep_key] = ep_cached
+                            _cache_put(_tvmaze_ep_cache, ep_key, ep_cached)
             except Exception:
                 pass
         if ep_cached and ep_cached.get("season"):
@@ -3293,7 +3493,7 @@ def api_show_meta():
                     if match:
                         ep_cached = _ep_cached_entry(match)
                         with _tvmaze_lock:
-                            _tvmaze_ep_cache[ep_key] = ep_cached
+                            _cache_put(_tvmaze_ep_cache, ep_key, ep_cached)
             except Exception:
                 pass
         if ep_cached and ep_cached.get("season"):
@@ -3332,12 +3532,23 @@ def _spawn_remind_task(task_id: int, title: str, start_ts: int, cancel_evt: thre
 
 def _try_mpv_stream(url: str, title: str) -> bool:
     """Launch mpv in a visible window; success = still running after 12s
-    (stream is playing) or a clean exit (user closed it)."""
+    (stream is playing) or a clean exit (user closed it).
+
+    Intentionally untracked: unlike launch_mpv()/launch_recording(), this does
+    not touch _mpv_process/_mpv_info, so a fired "Schedule" (playback) task
+    won't appear in /api/status, won't get a watch-history entry, and won't
+    interrupt whatever the user is currently watching through the main player.
+    This is a deliberate choice (confirmed 2026-07-25) — scheduled playback
+    always opens as its own separate mpv window rather than taking over the
+    tracked player. Scheduled *recording* is unaffected: it already goes
+    through the fully tracked launch_recording() below.
+    """
     try:
         proc = subprocess.Popen([
             "mpv",
             "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
             "--cache=yes", "--cache-pause=no",
+            "--",
             url,
         ], stdin=subprocess.DEVNULL)
     except Exception as e:
@@ -3396,7 +3607,8 @@ def _spawn_schedule_task(task_id: int, title: str, ch_name: str, url: str,
 
 
 def _spawn_schedule_record_task(task_id: int, title: str, ch_name: str, url: str,
-                                start_ts: int, stop_ts: int, cancel_evt: threading.Event):
+                                start_ts: int, stop_ts: int, cancel_evt: threading.Event,
+                                epg_meta: Optional[Dict] = None):
     """Wait until start_ts then start a background recording (mirrors _spawn_schedule_task,
     but records instead of opening a visible mpv window)."""
     def _run():
@@ -3413,7 +3625,7 @@ def _spawn_schedule_record_task(task_id: int, title: str, ch_name: str, url: str
             return
         _remove_web_task(task_id)
 
-        result = launch_recording(url, ch_name, title, stop_ts=stop_ts)
+        result = launch_recording(url, ch_name, title, stop_ts=stop_ts, epg_meta=epg_meta)
         if result.get("ok"):
             send_desktop_notification("Term-TV", f"Recording started: {title}")
             print(f"[SCHEDULE-REC] '{title}' on {ch_name} — recording started")
@@ -3443,17 +3655,18 @@ def _restore_web_tasks():
                 continue  # expired while the server was down
             cancel_evt = threading.Event()
             stop_ts = int(t.get("stop_ts", 0) or 0)
+            epg_meta = t.get("epg_meta") if isinstance(t.get("epg_meta"), dict) else None
             task = {"id": int(t["id"]), "type": t.get("type", "schedule"),
                     "title": t.get("title", "Unknown"), "ch_name": t.get("ch_name", ""),
                     "ch_url": t.get("ch_url", ""), "start_ts": start_ts, "stop_ts": stop_ts,
-                    "_cancel": cancel_evt}
+                    "epg_meta": epg_meta, "_cancel": cancel_evt}
             with _web_tasks_lock:
                 _web_tasks.append(task)
             if task["type"] == "remind":
                 _spawn_remind_task(task["id"], task["title"], start_ts, cancel_evt)
             elif task["type"] == "record_scheduled":
                 _spawn_schedule_record_task(task["id"], task["title"], task["ch_name"],
-                                            task["ch_url"], start_ts, stop_ts, cancel_evt)
+                                            task["ch_url"], start_ts, stop_ts, cancel_evt, epg_meta)
             else:
                 _spawn_schedule_task(task["id"], task["title"], task["ch_name"],
                                      task["ch_url"], start_ts, cancel_evt)
@@ -3480,6 +3693,7 @@ def api_remind():
     cancel_evt = threading.Event()
     with _web_tasks_lock:
         if any(t["type"] == "remind" and t["title"] == title and t["start_ts"] == start_ts
+               and t.get("ch_name") == ch_name
                for t in _web_tasks):
             return jsonify({"ok": True, "already_set": True, "minutes_until": minutes_until})
         _web_tasks.append({"id": task_id, "type": "remind", "title": title,
@@ -3509,6 +3723,7 @@ def api_schedule():
     cancel_evt = threading.Event()
     with _web_tasks_lock:
         if any(t["type"] == "schedule" and t["title"] == title and t["start_ts"] == start_ts
+               and t.get("ch_url") == url
                for t in _web_tasks):
             return jsonify({"ok": True, "already_set": True, "minutes_until": minutes_until})
         _web_tasks.append({"id": task_id, "type": "schedule", "title": title,
@@ -3528,6 +3743,7 @@ def api_schedule_record():
     title      = data.get("title", "Unknown")
     start_ts   = int(data.get("start_ts", 0))
     stop_ts    = int(data.get("stop_ts", 0) or 0)
+    epg_meta   = data.get("epg_meta") if isinstance(data.get("epg_meta"), dict) else None
     if not url:
         return jsonify({"ok": False, "error": "No URL provided"}), 400
     now_ts = int(datetime.now().astimezone().timestamp())
@@ -3539,13 +3755,14 @@ def api_schedule_record():
     cancel_evt = threading.Event()
     with _web_tasks_lock:
         if any(t["type"] == "record_scheduled" and t["title"] == title and t["start_ts"] == start_ts
+               and t.get("ch_url") == url
                for t in _web_tasks):
             return jsonify({"ok": True, "already_set": True, "minutes_until": minutes_until})
         _web_tasks.append({"id": task_id, "type": "record_scheduled", "title": title,
                            "ch_name": ch_name, "ch_url": url, "start_ts": start_ts,
-                           "stop_ts": stop_ts, "_cancel": cancel_evt})
+                           "stop_ts": stop_ts, "epg_meta": epg_meta, "_cancel": cancel_evt})
     _save_web_tasks()
-    _spawn_schedule_record_task(task_id, title, ch_name, url, start_ts, stop_ts, cancel_evt)
+    _spawn_schedule_record_task(task_id, title, ch_name, url, start_ts, stop_ts, cancel_evt, epg_meta)
     print(f"[SCHEDULE-REC] '{title}' on {ch_name} — recording in {minutes_until} min")
     return jsonify({"ok": True, "minutes_until": minutes_until, "task_id": task_id})
 
@@ -3587,6 +3804,7 @@ def api_play_new():
             "mpv",
             "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
             "--cache=yes", "--cache-pause=no",
+            "--",
             url,
         ], **kw)
         return jsonify({"ok": True})
@@ -3599,14 +3817,15 @@ def api_play_new():
 
 @app.route("/api/record", methods=["POST"])
 def api_record():
-    data    = request.get_json(force=True) or {}
-    url     = data.get("url", "").strip()
-    channel = data.get("channel", "").strip()
-    show    = data.get("show", "").strip()
-    stop_ts = int(data.get("stop_ts", 0) or 0)
+    data     = request.get_json(force=True) or {}
+    url      = data.get("url", "").strip()
+    channel  = data.get("channel", "").strip()
+    show     = data.get("show", "").strip()
+    stop_ts  = int(data.get("stop_ts", 0) or 0)
+    epg_meta = data.get("epg_meta") if isinstance(data.get("epg_meta"), dict) else None
     if not url:
         return jsonify({"ok": False, "error": "No URL provided"}), 400
-    result = launch_recording(url, channel, show, stop_ts=stop_ts)
+    result = launch_recording(url, channel, show, stop_ts=stop_ts, epg_meta=epg_meta)
     return jsonify(result), (200 if result["ok"] else 500)
 
 
@@ -3639,10 +3858,11 @@ def api_cancel_task(task_id):
 
 @app.route("/api/recordings")
 def api_recordings():
-    # Prune finished recordings (clean up dead processes)
+    # Prune finished recordings (clean up dead processes, including reattached ones)
     with _recordings_lock:
         dead = [rid for rid, r in _recordings.items()
-                if r.get("process") and r["process"].poll() is not None]
+                if (r.get("process") and r["process"].poll() is not None)
+                or (r.get("process") is None and not _pid_alive(r.get("pid")))]
     for rid in dead:
         stop_recording(rid)
     return jsonify({"recordings": recordings_status()})
@@ -4092,6 +4312,7 @@ def main():
 
     # F4: re-arm scheduled tasks saved by a previous run
     _restore_web_tasks()
+    _restore_active_recordings()
 
     # Start data loading in background
     threading.Thread(target=_load_data, daemon=True).start()

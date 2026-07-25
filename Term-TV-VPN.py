@@ -25,7 +25,6 @@ _ensure_dependencies()
 
 import requests
 import re
-import lzma
 import json
 import argparse
 from pathlib import Path
@@ -50,7 +49,6 @@ from lib.term_tv_core import (
     load_m3u, load_m3u_cached, load_epg,
     parse_epg_time, is_new_episode,
     search_channels, search_shows_in_timeframe,
-    find_alternative_streams, find_future_reruns,
     log_channel_watch, load_watch_history, get_frequent_channels,
     display_frequent_channels, get_search_history_now_playing,
     display_search_history_now_playing,
@@ -64,6 +62,8 @@ from lib.term_tv_core import (
     ch_in_group,
     get_channel_note, set_channel_note,
     save_scheduled_tasks, load_scheduled_tasks,
+    validate_playlists,
+    MPV_RESILIENCE_ARGS, archive_log_file, run_scheduled_stream,
 )
 
 # --- Constants ---
@@ -86,7 +86,7 @@ def _persist_tasks():
     """Snapshot SCHEDULED_TASKS to .scheduled_tasks.json so a restart can restore them."""
     with SCHEDULED_TASKS_LOCK:
         snapshot = list(SCHEDULED_TASKS)
-    save_scheduled_tasks(snapshot)
+        save_scheduled_tasks(snapshot)
 
 
 def _remove_task(task_id: int):
@@ -189,69 +189,13 @@ def archive_mpv_log():
       - Active log is cleared after successful archiving.
       - Archives older than 1 year are deleted from mpv-log-archive/.
     """
-    if not MPV_LOG_FILE.exists() or MPV_LOG_FILE.stat().st_size == 0:
-        return
+    archive_log_file(MPV_LOG_FILE, MPV_LOG_ARCHIVE_DIR, "mpv-output", chunk_size=MPV_LOG_CHUNK_SIZE)
 
-    MPV_LOG_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    try:
-        data = MPV_LOG_FILE.read_bytes()
-    except Exception as e:
-        logging.warning(f"archive_mpv_log: could not read log: {e}")
-        return
-
-    try:
-        if len(data) <= MPV_LOG_CHUNK_SIZE:
-            # Fits in a single archive
-            archive_path = MPV_LOG_ARCHIVE_DIR / f"mpv-output-{timestamp}.log.xz"
-            with lzma.open(archive_path, "wb", preset=9) as xz_f:
-                xz_f.write(data)
-            orig_kb = len(data) // 1024
-            comp_kb = archive_path.stat().st_size // 1024
-            print(f"MPV log archived: {archive_path.name}  ({orig_kb} KB → {comp_kb} KB compressed)")
-            logging.info(f"MPV log archived to {archive_path.name} ({orig_kb} KB raw, {comp_kb} KB compressed)")
-        else:
-            # Too large — split into 5 MB chunks
-            total = (len(data) + MPV_LOG_CHUNK_SIZE - 1) // MPV_LOG_CHUNK_SIZE
-            for idx in range(total):
-                chunk = data[idx * MPV_LOG_CHUNK_SIZE : (idx + 1) * MPV_LOG_CHUNK_SIZE]
-                archive_path = (
-                    MPV_LOG_ARCHIVE_DIR
-                    / f"mpv-output-{timestamp}-part{idx + 1:03d}of{total:03d}.log.xz"
-                )
-                with lzma.open(archive_path, "wb", preset=9) as xz_f:
-                    xz_f.write(chunk)
-            orig_mb = len(data) / (1024 * 1024)
-            print(f"MPV log split into {total} chunk(s) and archived  ({orig_mb:.1f} MB total)")
-            logging.info(f"MPV log archived in {total} chunks ({orig_mb:.1f} MB)")
-
-        # Clear the active log so the next session starts fresh
-        MPV_LOG_FILE.write_bytes(b"")
-
-    except Exception as e:
-        logging.warning(f"archive_mpv_log: compression failed: {e}")
-        return
-
-    # Purge archives older than 1 year
-    cutoff = datetime.now() - timedelta(days=365)
-    deleted = 0
-    try:
-        for archive in MPV_LOG_ARCHIVE_DIR.iterdir():
-            if not archive.is_file() or not archive.name.startswith("mpv-output-"):
-                continue
-            try:
-                if datetime.fromtimestamp(archive.stat().st_mtime) < cutoff:
-                    archive.unlink()
-                    deleted += 1
-                    logging.info(f"Deleted old MPV log archive: {archive.name}")
-            except Exception:
-                pass
-    except Exception as e:
-        logging.warning(f"archive_mpv_log: purge scan failed: {e}")
-
-    if deleted:
-        print(f"MPV log archive: Deleted {deleted} archive(s) older than 1 year.")
+def archive_recordings_log():
+    """Same as archive_mpv_log() but for recordings.log — previously unrotated,
+    growing unbounded over time as scheduled/headless recordings ran."""
+    archive_log_file(RECORDINGS_LOG_FILE, MPV_LOG_ARCHIVE_DIR, "recordings", chunk_size=MPV_LOG_CHUNK_SIZE)
 
 
 
@@ -498,474 +442,157 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
     """
     Background task that waits then launches playback with retry logic.
 
-    If the original stream fails:
-    1. Retries once on the same URL
-    2. Searches for alternative streams (same episode, different providers)
-    3. If all fail, searches for future reruns and schedules the next one
+    Thin wrapper around run_scheduled_stream() (lib/term_tv_core.py) — see
+    there for the shared wait/retry/alternative-channel/future-rerun engine.
+    This function supplies the playback-specific mpv command, a VPN
+    connectivity pre-flight check (vpn_check), and on a rerun hit builds/
+    persists the next "playback" task and recurses.
     """
     global SCHEDULED_TASKS, channels_global, epg_global
 
-    logging.info(f"Scheduled playback task created: {show_title} on {channel_name} [{provider}]")
-    logging.info(f"  URL: {channel_url}")
-    logging.info(f"  Delay: {delay_seconds} seconds ({delay_seconds // 60} minutes)")
-    logging.info(f"  Episode: {episode_num}")
-
-    # Snapshot globals once at the start so the task works with a consistent dataset
-    # even if an EPG refresh happens while this thread is running.
     with DATA_LOCK:
         _channels = channels_global
         _epg = epg_global
 
-    print(f"\n[SCHEDULED] Playback will start in {delay_seconds // 60} minutes...")
-    print(f"[SCHEDULED] Channel: {channel_name} [{provider}]")
-    print(f"[SCHEDULED] Show: {show_title}")
-    print(f"[SCHEDULED] Will auto-launch when show starts\n")
-
-    # Wait for the scheduled time; fire a desktop notification 5 min before start
-    _evt = cancel_event or threading.Event()
-    _notify_wait = max(0, delay_seconds - 300)
-    if _evt.wait(timeout=_notify_wait):
-        logging.info(f"Playback task cancelled: {show_title}")
-        return
-    if _notify_wait > 0:
-        send_desktop_notification("Term-TV", f"Starting in 5 min: {show_title}")
-        logging.info(f"Desktop notification sent for: {show_title}")
-    if _evt.wait(timeout=delay_seconds - _notify_wait):
-        logging.info(f"Playback task cancelled after notification: {show_title}")
+    evt = cancel_event or threading.Event()
+    result = run_scheduled_stream(
+        kind="playback",
+        channel_url=channel_url, delay_seconds=delay_seconds, channel_name=channel_name,
+        show_title=show_title, provider=provider, task_id=task_id, episode_num=episode_num,
+        original_start_time=original_start_time, channels=_channels, epg=_epg, cancel_event=evt,
+        remove_task_fn=_remove_task,
+        mpv_cmd_builder=lambda url: ["mpv", *MPV_RESILIENCE_ARGS, "--", url],
+        log_fn=lambda **kw: log_mpv_output(**kw),
+        vpn_check=vpn_is_connected,
+    )
+    if result["status"] != "rerun_found":
         return
 
-    # Remove from scheduled tasks list (and persist)
-    _remove_task(task_id)
+    next_rerun    = result["rerun"]
+    next_channel  = next_rerun["channel"]
+    next_url      = next_channel.get("url", "")
+    next_provider = next_channel.get("group-title", "Unknown Provider")
+    next_name     = next_channel.get("name", "Unknown")
+    next_start    = next_rerun["start_time"]
+    new_delay     = result["new_delay"]
 
-    # Start playback with retry logic
-    print(f"\n[PLAYBACK STARTED] {channel_name} [{provider}] - {show_title}")
-    logging.info(f"Starting playback: {show_title}")
+    new_task_id = int(time.time() * 1000)
+    new_cancel_event = threading.Event()
+    with SCHEDULED_TASKS_LOCK:
+        SCHEDULED_TASKS.append({
+            "id": new_task_id,
+            "type": "playback",
+            "channel_name": next_name,
+            "provider": next_provider,
+            "show_title": show_title,
+            "scheduled_time": datetime.now().astimezone() + timedelta(seconds=new_delay),
+            "url": next_url,
+            "episode_num": episode_num,
+            "original_start_time": next_start,
+            "cancel_event": new_cancel_event,
+        })
+    _persist_tasks()
 
-    # Try original URL (with one retry)
-    for attempt in range(2):
-        attempt_num = attempt + 1
-        logging.info(f"Attempt {attempt_num}/2: Trying original URL {channel_url}")
-        print(f"[PLAYBACK] Attempt {attempt_num}/2: {channel_name} [{provider}]")
+    thread = threading.Thread(
+        target=scheduled_playback_task,
+        args=(next_url, new_delay, next_name, show_title, next_provider, new_task_id, episode_num, next_start, new_cancel_event),
+        daemon=True
+    )
+    thread.start()
 
-        try:
-            mpv_cmd = ["mpv", "--stream-lavf-o=timeout=10000000", channel_url]
-            proc = subprocess.Popen(
-                mpv_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            try:
-                stdout, stderr = proc.communicate(timeout=10)
-                returncode = proc.returncode
-            except subprocess.TimeoutExpired:
-                stdout, stderr = proc.communicate()
-                returncode = proc.returncode
-
-            # Log mpv output to dedicated log file
-            log_mpv_output(
-                channel_name=f"{channel_name} [{provider}] - {show_title}",
-                command=mpv_cmd,
-                stdout=stdout,
-                stderr=stderr,
-                returncode=returncode
-            )
-
-            # If mpv exited successfully or user quit (returncode 0 or 4), consider it success
-            if returncode in (0, 4):
-                logging.info(f"Playback completed successfully (exit code: {returncode})")
-                print(f"\n[PLAYBACK COMPLETE]")
-                return  # Success!
-
-            # Log failure details
-            logging.warning(f"mpv exited with code {returncode}")
-            logging.debug(f"mpv stderr: {stderr[:500]}")  # First 500 chars
-
-        except FileNotFoundError:
-            logging.error("mpv command not found")
-            print("\nError: 'mpv' command not found. Is mpv installed?", file=sys.stderr)
-            return
-        except Exception as e:
-            logging.error(f"Attempt {attempt_num} failed with exception: {e}")
-            print(f"[PLAYBACK] Error: {e}")
-
-        if attempt == 0:
-            print(f"[PLAYBACK] Retrying in 5 seconds...")
-            time.sleep(5)
-
-    # Original URL failed, try alternatives
-    logging.warning(f"Original stream failed after 2 attempts, searching for alternatives")
-    print(f"\n[PLAYBACK] Original stream failed, searching for alternative providers...")
-
-    if episode_num and original_start_time and _channels and _epg:
-        alternatives = find_alternative_streams(
-            _channels,
-            _epg,
-            show_title,
-            episode_num,
-            original_start_time,
-            tolerance_minutes=5
-        )
-
-        for alt in alternatives:
-            alt_channel = alt["channel"]
-            alt_url = alt_channel.get("url", "")
-            alt_provider = alt_channel.get("group-title", "Unknown Provider")
-            alt_name = alt_channel.get("name", "Unknown")
-
-            logging.info(f"Trying alternative: {alt_name} [{alt_provider}] - {alt_url}")
-            print(f"[PLAYBACK] Trying alternative: {alt_name} [{alt_provider}]")
-
-            try:
-                mpv_cmd = ["mpv", "--stream-lavf-o=timeout=10000000", alt_url]
-                proc = subprocess.Popen(
-                    mpv_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                try:
-                    stdout, stderr = proc.communicate(timeout=10)
-                    returncode = proc.returncode
-                except subprocess.TimeoutExpired:
-                    stdout, stderr = proc.communicate()
-                    returncode = proc.returncode
-
-                # Log mpv output to dedicated log file
-                log_mpv_output(
-                    channel_name=f"{alt_name} [{alt_provider}] - {show_title} (alternative)",
-                    command=mpv_cmd,
-                    stdout=stdout,
-                    stderr=stderr,
-                    returncode=returncode
-                )
-
-                if returncode in (0, 4):
-                    logging.info(f"Alternative stream succeeded: {alt_name} [{alt_provider}]")
-                    print(f"\n[PLAYBACK COMPLETE]")
-                    print(f"[PLAYBACK] Used alternative provider: {alt_provider}")
-                    return  # Success!
-
-                logging.warning(f"Alternative failed with exit code {returncode}")
-
-            except Exception as e:
-                logging.error(f"Alternative stream failed: {e}")
-
-    # All streams failed, search for future reruns
-    logging.warning(f"All streams failed, searching for future reruns")
-    print(f"\n[PLAYBACK] All streams failed, searching for future reruns...")
-
-    if episode_num and _channels and _epg:
-        reruns = find_future_reruns(
-            _channels,
-            _epg,
-            show_title,
-            episode_num,
-            hours_ahead=24
-        )
-
-        if reruns:
-            next_rerun = reruns[0]
-            next_channel = next_rerun["channel"]
-            next_url = next_channel.get("url", "")
-            next_provider = next_channel.get("group-title", "Unknown Provider")
-            next_name = next_channel.get("name", "Unknown")
-            next_start = next_rerun["start_time"]
-            new_delay = max(0, int((next_start - datetime.now().astimezone()).total_seconds()))
-            minutes_until = new_delay // 60
-
-            logging.info(f"Found future rerun in {minutes_until} minutes on {next_name} [{next_provider}]")
-            print(f"[PLAYBACK] Found future rerun:")
-            print(f"  Channel: {next_name} [{next_provider}]")
-            print(f"  Time: {next_rerun['time_status']}")
-
-            # Schedule new playback
-            new_task_id = int(time.time() * 1000)
-            new_cancel_event = threading.Event()
-
-            with SCHEDULED_TASKS_LOCK:
-                SCHEDULED_TASKS.append({
-                    "id": new_task_id,
-                    "type": "playback",
-                    "channel_name": next_name,
-                    "provider": next_provider,
-                    "show_title": show_title,
-                    "scheduled_time": datetime.now().astimezone() + timedelta(seconds=new_delay),
-                    "url": next_url,
-                    "episode_num": episode_num,
-                    "original_start_time": next_start,
-                    "cancel_event": new_cancel_event,
-                })
-            _persist_tasks()
-
-            thread = threading.Thread(
-                target=scheduled_playback_task,
-                args=(next_url, new_delay, next_name, show_title, next_provider, new_task_id, episode_num, next_start, new_cancel_event),
-                daemon=True
-            )
-            thread.start()
-
-            print(f"[PLAYBACK] Rescheduled for {next_rerun['time_status']}")
-            logging.info(f"Rescheduled playback for {minutes_until} minutes from now")
-            return
-
-    # Complete failure
-    logging.error(f"Playback failed completely: {show_title} - no alternatives or reruns found")
-    print(f"\n[PLAYBACK FAILED] Could not play {show_title}")
-    print(f"  All stream URLs failed and no future reruns found in the next 24 hours")
+    print(f"[PLAYBACK] Rescheduled for {next_rerun['time_status']}")
+    logging.info(f"Rescheduled playback for {new_delay // 60} minutes from now")
 
 
 def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds: int, channel_name: str, show_title: str, provider: str = "Unknown Provider", extract_subs: bool = True, task_id: int = 0, episode_num: str = "", original_start_time: Optional[datetime] = None, duration_seconds: int = 0, cancel_event: Optional[threading.Event] = None):
     """
     Background task that waits then starts recording with retry logic.
 
-    If the original stream fails:
-    1. Retries once on the same URL
-    2. Searches for alternative streams (same episode, different providers)
-    3. If all fail, searches for future reruns and schedules the next one
+    Thin wrapper around run_scheduled_stream() (lib/term_tv_core.py) — see
+    there for the shared wait/retry/alternative-channel/future-rerun engine.
+    Supplies the recording-specific mpv command, routes output logging to
+    RECORDINGS_LOG_FILE, extracts subtitles on success, checks VPN
+    connectivity before firing, brackets each mpv attempt with
+    _mark_recording_started/_mark_recording_stopped (so Ctrl+C during a
+    scheduled recording doesn't blindly tear down the VPN tunnel — see
+    _register_vpn_signal_handlers), and on a rerun hit builds/persists the
+    next "recording" task and recurses.
     """
     global SCHEDULED_TASKS, channels_global, epg_global
 
-    logging.info(f"Scheduled recording task created: {show_title} on {channel_name} [{provider}]")
-    logging.info(f"  URL: {channel_url}")
-    logging.info(f"  Delay: {delay_seconds} seconds ({delay_seconds // 60} minutes)")
-    logging.info(f"  Episode: {episode_num}")
-
-    # Snapshot globals once at the start so the task works with a consistent dataset
-    # even if an EPG refresh happens while this thread is running.
     with DATA_LOCK:
         _channels = channels_global
         _epg = epg_global
 
-    print(f"\n[SCHEDULED] Recording will start in {delay_seconds // 60} minutes...")
-    print(f"[SCHEDULED] Channel: {channel_name} [{provider}]")
-    print(f"[SCHEDULED] Show: {show_title}")
-    print(f"[SCHEDULED] Output: {output_path}")
-    print(f"[SCHEDULED] Press Ctrl+C in mpv window to stop recording\n")
+    def _build_mpv_cmd(url: str) -> List[str]:
+        cmd = ["mpv", f"--stream-record={output_path}", *MPV_RESILIENCE_ARGS,
+               "--sid=auto",              # Auto-select subtitles at start
+               "--no-sub-visibility"]     # Start with subs hidden (user can toggle with 'v')
+        if duration_seconds:
+            cmd.append(f"--length={duration_seconds}")
+        cmd.append("--")
+        cmd.append(url)
+        return cmd
 
-    # Wait for the scheduled time; fire a desktop notification 5 min before start
-    _evt = cancel_event or threading.Event()
-    _notify_wait = max(0, delay_seconds - 300)
-    if _evt.wait(timeout=_notify_wait):
-        logging.info(f"Recording task cancelled: {show_title}")
+    def _on_success():
+        print(f"[RECORDING COMPLETE] Saved to: {output_path}")
+        if extract_subs:
+            extract_subtitles_from_recording(output_path)
+
+    evt = cancel_event or threading.Event()
+    result = run_scheduled_stream(
+        kind="recording",
+        channel_url=channel_url, delay_seconds=delay_seconds, channel_name=channel_name,
+        show_title=show_title, provider=provider, task_id=task_id, episode_num=episode_num,
+        original_start_time=original_start_time, channels=_channels, epg=_epg, cancel_event=evt,
+        remove_task_fn=_remove_task,
+        mpv_cmd_builder=_build_mpv_cmd,
+        log_fn=lambda **kw: log_mpv_output(**kw, log_path=RECORDINGS_LOG_FILE),
+        on_success=_on_success,
+        vpn_check=vpn_is_connected,
+        on_stream_start=_mark_recording_started,
+        on_stream_stop=_mark_recording_stopped,
+    )
+    if result["status"] != "rerun_found":
         return
-    if _notify_wait > 0:
-        send_desktop_notification("Term-TV", f"Recording in 5 min: {show_title}")
-        logging.info(f"Desktop notification sent for recording: {show_title}")
-    if _evt.wait(timeout=delay_seconds - _notify_wait):
-        logging.info(f"Recording task cancelled after notification: {show_title}")
-        return
 
-    # Remove from scheduled tasks list (and persist)
-    _remove_task(task_id)
+    next_rerun    = result["rerun"]
+    next_channel  = next_rerun["channel"]
+    next_url      = next_channel.get("url", "")
+    next_provider = next_channel.get("group-title", "Unknown Provider")
+    next_name     = next_channel.get("name", "Unknown")
+    next_start    = next_rerun["start_time"]
+    new_delay     = result["new_delay"]
 
-    # Start recording with retry logic
-    print(f"\n[RECORDING STARTED] {channel_name} [{provider}] - {show_title}")
-    print(f"[RECORDING] Output: {output_path}")
-    logging.info(f"Starting recording: {show_title}")
+    new_task_id = int(time.time() * 1000)
+    new_cancel_event = threading.Event()
+    with SCHEDULED_TASKS_LOCK:
+        SCHEDULED_TASKS.append({
+            "id": new_task_id,
+            "type": "recording",
+            "channel_name": next_name,
+            "provider": next_provider,
+            "show_title": show_title,
+            "scheduled_time": datetime.now().astimezone() + timedelta(seconds=new_delay),
+            "url": next_url,
+            "episode_num": episode_num,
+            "original_start_time": next_start,
+            "output_path": str(output_path),
+            "duration_seconds": duration_seconds,
+            "extract_subs": extract_subs,
+            "cancel_event": new_cancel_event,
+        })
+    _persist_tasks()
 
-    # Try original URL (with one retry)
-    for attempt in range(2):
-        attempt_num = attempt + 1
-        logging.info(f"Attempt {attempt_num}/2: Trying original URL {channel_url}")
-        print(f"[RECORDING] Attempt {attempt_num}/2: {channel_name} [{provider}]")
+    thread = threading.Thread(
+        target=scheduled_recording_task,
+        args=(next_url, output_path, new_delay, next_name, show_title, next_provider, extract_subs, new_task_id, episode_num, next_start, duration_seconds, new_cancel_event),
+        daemon=True
+    )
+    thread.start()
 
-        try:
-            mpv_cmd = [
-                "mpv",
-                f"--stream-record={output_path}",
-                "--stream-lavf-o=timeout=10000000",
-                "--sid=auto",  # Auto-select subtitles at start
-                "--no-sub-visibility",  # Start with subs hidden (user can toggle with 'v')
-            ]
-            if duration_seconds:
-                mpv_cmd.append(f"--length={duration_seconds}")
-            mpv_cmd.append(channel_url)
-            proc = subprocess.Popen(
-                mpv_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            try:
-                stdout, stderr = proc.communicate(timeout=10)
-                returncode = proc.returncode
-            except subprocess.TimeoutExpired:
-                stdout, stderr = proc.communicate()
-                returncode = proc.returncode
-
-            # Log mpv output to dedicated recordings log file
-            log_mpv_output(
-                channel_name=f"{channel_name} [{provider}] - {show_title} (recording)",
-                command=mpv_cmd,
-                stdout=stdout,
-                log_path=RECORDINGS_LOG_FILE,
-                stderr=stderr,
-                returncode=returncode
-            )
-
-            # If mpv exited successfully or user quit (returncode 0 or 4), consider it success
-            if returncode in (0, 4):
-                logging.info(f"Recording completed successfully (exit code: {returncode})")
-                print(f"\n[RECORDING COMPLETE] Saved to: {output_path}")
-
-                # Extract subtitles if requested
-                if extract_subs:
-                    extract_subtitles_from_recording(output_path)
-                return  # Success!
-
-            # Log failure details
-            logging.warning(f"mpv exited with code {returncode}")
-            logging.debug(f"mpv stderr: {stderr[:500]}")  # First 500 chars
-
-        except FileNotFoundError:
-            logging.error("mpv command not found")
-            print("\nError: 'mpv' command not found. Is mpv installed?", file=sys.stderr)
-            return
-        except Exception as e:
-            logging.error(f"Attempt {attempt_num} failed with exception: {e}")
-            print(f"[RECORDING] Error: {e}")
-
-        if attempt == 0:
-            print(f"[RECORDING] Retrying in 5 seconds...")
-            time.sleep(5)
-
-    # Original URL failed, try alternatives
-    logging.warning(f"Original stream failed after 2 attempts, searching for alternatives")
-    print(f"\n[RECORDING] Original stream failed, searching for alternative providers...")
-
-    if episode_num and original_start_time and _channels and _epg:
-        alternatives = find_alternative_streams(
-            _channels,
-            _epg,
-            show_title,
-            episode_num,
-            original_start_time,
-            tolerance_minutes=5
-        )
-
-        for alt in alternatives:
-            alt_channel = alt["channel"]
-            alt_url = alt_channel.get("url", "")
-            alt_provider = alt_channel.get("group-title", "Unknown Provider")
-            alt_name = alt_channel.get("name", "Unknown")
-
-            logging.info(f"Trying alternative: {alt_name} [{alt_provider}] - {alt_url}")
-            print(f"[RECORDING] Trying alternative: {alt_name} [{alt_provider}]")
-
-            try:
-                mpv_cmd = [
-                    "mpv",
-                    f"--stream-record={output_path}",
-                    "--stream-lavf-o=timeout=10000000",
-                    "--sid=auto",  # Auto-select subtitles at start
-                    "--no-sub-visibility",  # Start with subs hidden (user can toggle with 'v')
-                ]
-                if duration_seconds:
-                    mpv_cmd.append(f"--length={duration_seconds}")
-                mpv_cmd.append(alt_url)
-                proc = subprocess.Popen(
-                    mpv_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                try:
-                    stdout, stderr = proc.communicate(timeout=10)
-                    returncode = proc.returncode
-                except subprocess.TimeoutExpired:
-                    stdout, stderr = proc.communicate()
-                    returncode = proc.returncode
-
-                # Log mpv output to dedicated recordings log file
-                log_mpv_output(
-                    channel_name=f"{alt_name} [{alt_provider}] - {show_title} (recording alternative)",
-                    command=mpv_cmd,
-                    stdout=stdout,
-                    log_path=RECORDINGS_LOG_FILE,
-                    stderr=stderr,
-                    returncode=returncode
-                )
-
-                if returncode in (0, 4):
-                    logging.info(f"Alternative stream succeeded: {alt_name} [{alt_provider}]")
-                    print(f"\n[RECORDING COMPLETE] Saved to: {output_path}")
-                    print(f"[RECORDING] Used alternative provider: {alt_provider}")
-
-                    if extract_subs:
-                        extract_subtitles_from_recording(output_path)
-                    return  # Success!
-
-                logging.warning(f"Alternative failed with exit code {returncode}")
-
-            except Exception as e:
-                logging.error(f"Alternative stream failed: {e}")
-
-    # All streams failed, search for future reruns
-    logging.warning(f"All streams failed, searching for future reruns")
-    print(f"\n[RECORDING] All streams failed, searching for future reruns...")
-
-    if episode_num and _channels and _epg:
-        reruns = find_future_reruns(
-            _channels,
-            _epg,
-            show_title,
-            episode_num,
-            hours_ahead=24
-        )
-
-        if reruns:
-            next_rerun = reruns[0]
-            next_channel = next_rerun["channel"]
-            next_url = next_channel.get("url", "")
-            next_provider = next_channel.get("group-title", "Unknown Provider")
-            next_name = next_channel.get("name", "Unknown")
-            next_start = next_rerun["start_time"]
-            new_delay = max(0, int((next_start - datetime.now().astimezone()).total_seconds()))
-            minutes_until = new_delay // 60
-
-            logging.info(f"Found future rerun in {minutes_until} minutes on {next_name} [{next_provider}]")
-            print(f"[RECORDING] Found future rerun:")
-            print(f"  Channel: {next_name} [{next_provider}]")
-            print(f"  Time: {next_rerun['time_status']}")
-
-            # Schedule new recording
-            new_task_id = int(time.time() * 1000)
-            new_cancel_event = threading.Event()
-
-            with SCHEDULED_TASKS_LOCK:
-                SCHEDULED_TASKS.append({
-                    "id": new_task_id,
-                    "type": "recording",
-                    "channel_name": next_name,
-                    "provider": next_provider,
-                    "show_title": show_title,
-                    "scheduled_time": datetime.now().astimezone() + timedelta(seconds=new_delay),
-                    "url": next_url,
-                    "episode_num": episode_num,
-                    "original_start_time": next_start,
-                    "output_path": str(output_path),
-                    "duration_seconds": duration_seconds,
-                    "extract_subs": extract_subs,
-                    "cancel_event": new_cancel_event,
-                })
-            _persist_tasks()
-
-            thread = threading.Thread(
-                target=scheduled_recording_task,
-                args=(next_url, output_path, new_delay, next_name, show_title, next_provider, extract_subs, new_task_id, episode_num, next_start, duration_seconds, new_cancel_event),
-                daemon=True
-            )
-            thread.start()
-
-            print(f"[RECORDING] Rescheduled for {next_rerun['time_status']}")
-            logging.info(f"Rescheduled recording for {minutes_until} minutes from now")
-            return
-
-    # Complete failure
-    logging.error(f"Recording failed completely: {show_title} - no alternatives or reruns found")
-    print(f"\n[RECORDING FAILED] Could not record {show_title}")
-    print(f"  All stream URLs failed and no future reruns found in the next 24 hours")
+    print(f"[RECORDING] Rescheduled for {next_rerun['time_status']}")
+    logging.info(f"Rescheduled recording for {new_delay // 60} minutes from now")
 
 
 def scheduled_reminder_task(show_title: str, start_time: datetime, channel_name: str, task_id: int, cancel_event: Optional[threading.Event] = None):
@@ -1066,7 +693,10 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
             return
 
         minutes_until = show_result.get("minutes_until", 0)
-        if minutes_until < 0:
+        # is_playing_now is computed from real datetimes (start_time <= now < stop_time);
+        # minutes_until is derived and truncates toward zero, so a show that started up to
+        # 59s ago would read as 0 instead of negative and slip past a "< 0" check.
+        if show_result.get("is_playing_now"):
             print("Error: Cannot schedule recording for a show that's already playing.", file=sys.stderr)
             print("Use 'r' to record while watching instead.")
             return
@@ -1136,7 +766,7 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         return
 
     # Handle watch-only or record-while-watching
-    mpv_args = ["mpv"]
+    mpv_args = ["mpv", *MPV_RESILIENCE_ARGS]
 
     if record_choice == 'r':
         ensure_recordings_dir()
@@ -1176,6 +806,7 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         if _sleep_input and _sleep_input.isdigit() and int(_sleep_input) > 0:
             mpv_args.append(f"--length={int(_sleep_input) * 60}")
 
+    mpv_args.append("--")
     mpv_args.append(channel_url)
 
     print(f"\nLaunching: {channel_name} [{provider}]")
@@ -1188,6 +819,8 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
     # Track start time
     start_time = datetime.now()
 
+    if record_choice == 'r':
+        _mark_recording_started()
     try:
         # Run mpv (blocks until player exits or fails to connect)
         # If mpv hangs connecting to stream, press Ctrl+C to cancel
@@ -1224,21 +857,23 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         print(f"\nError launching mpv: {e}", file=sys.stderr)
         return
     finally:
-        # Log watch history for both watch and record sessions
-        if record_choice in ('w', 'r'):
-            end_time = datetime.now()
-            duration = (end_time - start_time).total_seconds()
+        if record_choice == 'r':
+            _mark_recording_stopped()
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
 
-            logging.info(f"Session duration: {duration:.1f} seconds (mode={record_choice})")
+        logging.info(f"Session duration: {duration:.1f} seconds (mode={record_choice})")
 
-            if duration >= 2:
-                log_channel_watch(channel, int(duration))
+        if duration >= 2:
+            log_channel_watch(channel, int(duration))
 
-                if duration >= 120:
-                    logging.info(f"Session logged: {int(duration // 60)} minutes")
+            if duration >= 120:
+                logging.info(f"Session logged: {int(duration // 60)} minutes")
+                if record_choice == 'w':
                     print(f"\nWatched for {int(duration // 60)} minutes - session logged!")
-                else:
-                    logging.debug(f"Session too short to log: {int(duration)} seconds")
+            else:
+                logging.debug(f"Session too short to log: {int(duration)} seconds")
+                if record_choice == 'w':
                     print(f"\nWatched for {int(duration)} seconds (need 2 min to log frequency)")
 
 
@@ -1516,6 +1151,7 @@ def connect_vpn(openvpn_exe: str, config_file: str, expected_ip: Optional[str] =
     print(f"\nConnecting to VPN using: {config_path.name}")
     logging.info(f"Launching OpenVPN: {openvpn_exe} --config {config_file}")
 
+    vpn_log_file = None
     try:
         vpn_log_file = open("openvpn.log", "a", encoding="utf-8", errors="replace")
         vpn_log_file.write(f"\n{'='*60}\n[{datetime.now()}] OpenVPN started\n{'='*60}\n")
@@ -1545,6 +1181,11 @@ def connect_vpn(openvpn_exe: str, config_file: str, expected_ip: Optional[str] =
     except Exception as e:
         print(f"Error starting OpenVPN: {e}", file=sys.stderr)
         return False
+    finally:
+        # The child process (if launched) inherited its own handle to the file;
+        # the parent's handle isn't needed past Popen() and must not leak.
+        if vpn_log_file:
+            vpn_log_file.close()
 
     # Poll until connected or timeout
     print("Waiting for VPN connection", end="", flush=True)
@@ -1593,6 +1234,7 @@ def connect_vpn(openvpn_exe: str, config_file: str, expected_ip: Optional[str] =
             if choice == 'y':
                 return True
             elif choice == 'n':
+                disconnect_vpn()
                 return False
 
     return True
@@ -1854,6 +1496,26 @@ def toggle_vpn_menu():
             input("  Press Enter to go back...")
 
 
+# Tracks in-flight recordings (scheduled_recording_task, interactive play_channel
+# 'r' mode, and the headless --record/--record-channel path) so Ctrl+C doesn't
+# blindly tear down the VPN tunnel mid-recording and truncate the output file.
+_ACTIVE_RECORDINGS = 0
+_ACTIVE_RECORDINGS_LOCK = threading.Lock()
+_force_quit_requested = False
+
+
+def _mark_recording_started():
+    global _ACTIVE_RECORDINGS
+    with _ACTIVE_RECORDINGS_LOCK:
+        _ACTIVE_RECORDINGS += 1
+
+
+def _mark_recording_stopped():
+    global _ACTIVE_RECORDINGS
+    with _ACTIVE_RECORDINGS_LOCK:
+        _ACTIVE_RECORDINGS = max(0, _ACTIVE_RECORDINGS - 1)
+
+
 def _register_vpn_signal_handlers():
     """
     Register signal and console-control handlers so that OpenVPN is always
@@ -1866,6 +1528,16 @@ def _register_vpn_signal_handlers():
     import signal
 
     def _on_signal(signum, frame):
+        global _force_quit_requested
+        with _ACTIVE_RECORDINGS_LOCK:
+            active = _ACTIVE_RECORDINGS
+        if active > 0 and not _force_quit_requested:
+            _force_quit_requested = True
+            print(f"\n⚠ {active} recording(s) in progress — leaving VPN connected so they can finish.",
+                  file=sys.stderr)
+            print("  Press Ctrl+C again to force quit immediately (recording(s) will be truncated).",
+                  file=sys.stderr)
+            return
         disconnect_vpn()
         sys.exit(0)
 
@@ -1916,7 +1588,8 @@ def main():
     # --- Register cleanup on exit ---
     atexit.register(clean_old_cache_files)
     atexit.register(archive_mpv_log)
-    logging.debug("Registered cache cleanup and MPV log archiving on exit")
+    atexit.register(archive_recordings_log)
+    logging.debug("Registered cache cleanup and MPV/recordings log archiving on exit")
 
     # --- Tool Checks (mpv required, ffmpeg optional) ---
     check_required_tools()
@@ -1935,7 +1608,7 @@ def main():
         print(f"Error: '{CONFIG_FILE}' contains invalid JSON: {e}", file=sys.stderr)
         sys.exit(1)
 
-    playlists = config.get("playlists", [])
+    playlists = validate_playlists(config.get("playlists", []))
     if not playlists:
         print("Error: No playlists defined in config.json.", file=sys.stderr)
         sys.exit(1)
@@ -2105,16 +1778,20 @@ def main():
         _h_path = RECORDINGS_DIR / _h_filename
         print(f"Output: {_h_path}")
         _h_dur = (args.duration or 0) * 60
-        _h_mpv = ["mpv", f"--stream-record={_h_path}", "--sid=auto", "--no-sub-visibility"]
+        _h_mpv = ["mpv", f"--stream-record={_h_path}", *MPV_RESILIENCE_ARGS, "--sid=auto", "--no-sub-visibility"]
         if _h_dur:
             _h_mpv.append(f"--length={_h_dur}")
+        _h_mpv.append("--")
         _h_mpv.append(_h_url)
+        _mark_recording_started()
         try:
             run_mpv_with_logging(_h_mpv, _h_channel.get("name", ""), log_path=RECORDINGS_LOG_FILE)
             extract_subtitles_from_recording(_h_path)
         except KeyboardInterrupt:
             print("\nRecording stopped.")
             extract_subtitles_from_recording(_h_path)
+        finally:
+            _mark_recording_stopped()
         sys.exit(0)
 
     # --- Restore scheduled tasks from a previous session ---
@@ -2231,7 +1908,7 @@ def main():
                 if 0 <= _ridx < len(_page):
                     _rp = _page[_ridx]
                     print(f"\nPlaying: {_rp.name}")
-                    run_mpv_with_logging(["mpv", "--save-position-on-quit", str(_rp)], _rp.name)
+                    run_mpv_with_logging(["mpv", "--save-position-on-quit", "--", str(_rp)], _rp.name)
             continue
 
         # F6: Export watch history to CSV
@@ -2372,13 +2049,24 @@ def main():
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as _f:
                     _new_cfg = json.load(_f)
-                playlists = _new_cfg.get("playlists", playlists)
-                expected_vpn_ip = _new_cfg.get("vpn_ip", expected_vpn_ip)
-                if "recordings_dir" in _new_cfg:
-                    RECORDINGS_DIR = Path(_new_cfg["recordings_dir"]).expanduser()
-                    _core.RECORDINGS_DIR = RECORDINGS_DIR
-                print(f"✓ Config reloaded — {len(playlists)} playlist(s) found.")
-                logging.info("Config reloaded from disk")
+                _new_playlists = validate_playlists(_new_cfg.get("playlists", playlists))
+                if not _new_playlists:
+                    print("Error reloading config: no valid playlists found — keeping existing config.", file=sys.stderr)
+                else:
+                    playlists = _new_playlists
+                    expected_vpn_ip = _new_cfg.get("vpn_ip", expected_vpn_ip)
+                    if "recordings_dir" in _new_cfg:
+                        RECORDINGS_DIR = Path(_new_cfg["recordings_dir"]).expanduser()
+                        _core.RECORDINGS_DIR = RECORDINGS_DIR
+                    # Re-resolve chosen_playlist against the freshly reloaded dicts —
+                    # the old object identity is gone, so "pl"'s "(current)" marker and
+                    # the active m3u/epg URLs would otherwise silently stay on stale data.
+                    _match = next((p for p in playlists if p.get("name") == chosen_playlist.get("name")
+                                   and p.get("m3u_url") == chosen_playlist.get("m3u_url")), None)
+                    if _match is not None:
+                        chosen_playlist = _match
+                    print(f"✓ Config reloaded — {len(playlists)} playlist(s) found.")
+                    logging.info("Config reloaded from disk")
             except Exception as _e:
                 print(f"Error reloading config: {_e}", file=sys.stderr)
             continue
