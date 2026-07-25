@@ -537,7 +537,7 @@ def mpv_status() -> Dict:
 _recordings:      Dict[str, Dict] = {}
 _recordings_lock: threading.Lock  = threading.Lock()
 
-_web_tasks:      List[Dict] = []   # [{id, type, title, ch_name, ch_url, start_ts, _cancel}]
+_web_tasks:      List[Dict] = []   # [{id, type, title, ch_name, ch_url, start_ts, stop_ts, _cancel}]
 _web_tasks_lock: threading.Lock = threading.Lock()
 WEB_TASKS_FILE = Path(".web_tasks.json")
 
@@ -545,7 +545,7 @@ WEB_TASKS_FILE = Path(".web_tasks.json")
 def _save_web_tasks():
     """F4: persist pending remind/schedule tasks so a server restart restores them."""
     with _web_tasks_lock:
-        data = [{k: t[k] for k in ("id", "type", "title", "ch_name", "ch_url", "start_ts")}
+        data = [{k: t.get(k, 0) for k in ("id", "type", "title", "ch_name", "ch_url", "start_ts", "stop_ts")}
                 for t in _web_tasks]
     try:
         with open(WEB_TASKS_FILE, "w", encoding="utf-8") as f:
@@ -907,6 +907,7 @@ body {
 .pb-remind   { background: #0c4a6e; color: #38bdf8; }
 .pb-schedule { background: #3b0764; color: #a78bfa; }
 .pb-record   { background: #7f1d1d; color: #f87171; }
+.pb-record_scheduled { background: #7f1d1d; color: #f87171; }
 .no-epg {
   position: absolute; top: 0; left: 0; height: 100%;
   display: flex; align-items: center; padding-left: 10px;
@@ -1468,6 +1469,7 @@ async function _boot() {
 
   loadSources();
   _loadScheduled();
+  updateRecordings();  // pick up recordings already running (e.g. a scheduled recording that fired before this page load)
   loadGuide().then(() => {
     jumpToNow();
     loadGroups();
@@ -2056,6 +2058,7 @@ function showPopup(prog, ch) {
   popupProg = prog;
   const nt  = guideData ? guideData.now_ts : Math.floor(Date.now() / 1000);
   const isNow = prog.start_ts <= nt && prog.stop_ts > nt;
+  const isFuture = prog.start_ts > nt;
 
   document.getElementById('popup-ch').textContent    = ch.name + (ch.group ? '  [' + ch.group + ']' : '');
   document.getElementById('popup-title').textContent = prog.title;
@@ -2087,17 +2090,22 @@ function showPopup(prog, ch) {
   playNewBtn.onclick = () => { playNew(ch.url, ch.name, prog.title); closePopup(); };
 
   const recBtn = document.getElementById('popup-record');
+  recBtn.textContent = isFuture ? '⏺ Schedule Recording' : '⏺ Record';
   recBtn.onclick = async () => {
     closePopup();
-    const recId = await startRecording(ch.url, ch.name, prog.title, prog.stop_ts || 0);
-    if (recId) _markTask(ch, prog, 'record', recId);
+    if (isFuture) {
+      await scheduleRecording(prog, ch);
+    } else {
+      const recId = await startRecording(ch.url, ch.name, prog.title, prog.stop_ts || 0);
+      if (recId) _markTask(ch, prog, 'record', recId);
+    }
   };
 
   const _taskStatusEl = document.getElementById('popup-task-status');
   const _existingTask = _webTasks.get((ch.url || '') + '|' + prog.start_ts);
   if (_existingTask) {
-    const _taskLabels = {remind: '🔔 Reminder set', schedule: '⏰ Scheduled for playback', record: '⏺ Recording active'};
-    const _taskColors = {remind: '#38bdf8', schedule: '#a78bfa', record: '#f87171'};
+    const _taskLabels = {remind: '🔔 Reminder set', schedule: '⏰ Scheduled for playback', record: '⏺ Recording active', record_scheduled: '⏺ Recording scheduled'};
+    const _taskColors = {remind: '#38bdf8', schedule: '#a78bfa', record: '#f87171', record_scheduled: '#f87171'};
     const _tk = _taskKey(ch, prog);
     const _type = _existingTask.type;
     const _tid  = _existingTask.taskId;
@@ -2135,7 +2143,6 @@ function showPopup(prog, ch) {
     } catch (e) { showToast('Error: ' + e.message, true); }
   };
 
-  const isFuture = prog.start_ts > nt;
   const schedBtn  = document.getElementById('popup-schedule');
   const remindBtn = document.getElementById('popup-remind');
   schedBtn.style.display  = isFuture ? '' : 'none';
@@ -2236,7 +2243,7 @@ function _taskKey(ch, prog)    { return (ch.url || '') + '|' + prog.start_ts; }
 function _makeTaskBadge(type)  {
   const s = document.createElement('span');
   s.className = 'prog-badge pb-' + type;
-  s.textContent = type === 'remind' ? 'RM' : type === 'schedule' ? 'SC' : 'RC';
+  s.textContent = type === 'remind' ? 'RM' : type === 'schedule' ? 'SC' : type === 'record_scheduled' ? 'SR' : 'RC';
   return s;
 }
 function _refreshTaskBadges() {
@@ -2385,6 +2392,20 @@ async function schedulePb(prog, ch) {
     const data = await res.json();
     if (data.ok && data.already_set) { showToast('Already scheduled: ' + prog.title); }
     else if (data.ok) { _markTask(ch, prog, 'schedule', data.task_id); showToast('Scheduled: ' + prog.title + ' in ' + data.minutes_until + ' min'); }
+    else               showToast('Schedule failed: ' + (data.error || 'unknown'), true);
+  } catch (e) { showToast('Error: ' + e.message, true); }
+}
+
+async function scheduleRecording(prog, ch) {
+  try {
+    const res  = await fetch('/api/schedule_record', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url: ch.url, channel_name: ch.name, title: prog.title,
+                             start_ts: prog.start_ts, stop_ts: prog.stop_ts || 0})
+    });
+    const data = await res.json();
+    if (data.ok && data.already_set) { showToast('Recording already scheduled: ' + prog.title); }
+    else if (data.ok) { _markTask(ch, prog, 'record_scheduled', data.task_id); showToast('Recording scheduled: ' + prog.title + ' in ' + data.minutes_until + ' min'); }
     else               showToast('Schedule failed: ' + (data.error || 'unknown'), true);
   } catch (e) { showToast('Error: ' + e.message, true); }
 }
@@ -3374,6 +3395,35 @@ def _spawn_schedule_task(task_id: int, title: str, ch_name: str, url: str,
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _spawn_schedule_record_task(task_id: int, title: str, ch_name: str, url: str,
+                                start_ts: int, stop_ts: int, cancel_evt: threading.Event):
+    """Wait until start_ts then start a background recording (mirrors _spawn_schedule_task,
+    but records instead of opening a visible mpv window)."""
+    def _run():
+        delay       = max(0, start_ts - int(time.time()))
+        notify_wait = max(0, delay - 300)
+        if cancel_evt.wait(timeout=notify_wait):
+            print(f"[SCHEDULE-REC] '{title}' — cancelled")
+            return
+        if delay > 300:
+            send_desktop_notification("Term-TV", f"Recording starts in 5 min: {title}")
+            print(f"[SCHEDULE-REC] '{title}' — 5-min notification sent")
+        if cancel_evt.wait(timeout=delay - notify_wait):
+            print(f"[SCHEDULE-REC] '{title}' — cancelled before start")
+            return
+        _remove_web_task(task_id)
+
+        result = launch_recording(url, ch_name, title, stop_ts=stop_ts)
+        if result.get("ok"):
+            send_desktop_notification("Term-TV", f"Recording started: {title}")
+            print(f"[SCHEDULE-REC] '{title}' on {ch_name} — recording started")
+        else:
+            send_desktop_notification("Term-TV", f"Recording failed to start: {title}")
+            print(f"[SCHEDULE-REC] '{title}' — failed to start: {result.get('error')}", file=sys.stderr)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _restore_web_tasks():
     """F4: re-arm remind/schedule tasks saved by a previous server run."""
     if not WEB_TASKS_FILE.exists():
@@ -3392,13 +3442,18 @@ def _restore_web_tasks():
             if start_ts <= now:
                 continue  # expired while the server was down
             cancel_evt = threading.Event()
+            stop_ts = int(t.get("stop_ts", 0) or 0)
             task = {"id": int(t["id"]), "type": t.get("type", "schedule"),
                     "title": t.get("title", "Unknown"), "ch_name": t.get("ch_name", ""),
-                    "ch_url": t.get("ch_url", ""), "start_ts": start_ts, "_cancel": cancel_evt}
+                    "ch_url": t.get("ch_url", ""), "start_ts": start_ts, "stop_ts": stop_ts,
+                    "_cancel": cancel_evt}
             with _web_tasks_lock:
                 _web_tasks.append(task)
             if task["type"] == "remind":
                 _spawn_remind_task(task["id"], task["title"], start_ts, cancel_evt)
+            elif task["type"] == "record_scheduled":
+                _spawn_schedule_record_task(task["id"], task["title"], task["ch_name"],
+                                            task["ch_url"], start_ts, stop_ts, cancel_evt)
             else:
                 _spawn_schedule_task(task["id"], task["title"], task["ch_name"],
                                      task["ch_url"], start_ts, cancel_evt)
@@ -3462,6 +3517,36 @@ def api_schedule():
     _save_web_tasks()
     _spawn_schedule_task(task_id, title, ch_name, url, start_ts, cancel_evt)
     print(f"[SCHEDULE] '{title}' on {ch_name} — playback in {minutes_until} min")
+    return jsonify({"ok": True, "minutes_until": minutes_until, "task_id": task_id})
+
+
+@app.route("/api/schedule_record", methods=["POST"])
+def api_schedule_record():
+    data       = request.get_json(force=True) or {}
+    url        = data.get("url", "").strip()
+    ch_name    = data.get("channel_name", "")
+    title      = data.get("title", "Unknown")
+    start_ts   = int(data.get("start_ts", 0))
+    stop_ts    = int(data.get("stop_ts", 0) or 0)
+    if not url:
+        return jsonify({"ok": False, "error": "No URL provided"}), 400
+    now_ts = int(datetime.now().astimezone().timestamp())
+    if start_ts <= now_ts:
+        return jsonify({"ok": False, "error": "Show has already started"}), 400
+    minutes_until = max(0, (start_ts - now_ts) // 60)
+
+    task_id    = int(time.time() * 1000)
+    cancel_evt = threading.Event()
+    with _web_tasks_lock:
+        if any(t["type"] == "record_scheduled" and t["title"] == title and t["start_ts"] == start_ts
+               for t in _web_tasks):
+            return jsonify({"ok": True, "already_set": True, "minutes_until": minutes_until})
+        _web_tasks.append({"id": task_id, "type": "record_scheduled", "title": title,
+                           "ch_name": ch_name, "ch_url": url, "start_ts": start_ts,
+                           "stop_ts": stop_ts, "_cancel": cancel_evt})
+    _save_web_tasks()
+    _spawn_schedule_record_task(task_id, title, ch_name, url, start_ts, stop_ts, cancel_evt)
+    print(f"[SCHEDULE-REC] '{title}' on {ch_name} — recording in {minutes_until} min")
     return jsonify({"ok": True, "minutes_until": minutes_until, "task_id": task_id})
 
 
