@@ -19,9 +19,10 @@ import hashlib
 import logging
 import platform
 import time
+import threading
 from pathlib import Path
 from collections import defaultdict
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Tuple
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -630,19 +631,26 @@ def ch_in_group(ch: Channel, groups: set) -> bool:
 
 _tvg_map_cached_key: Optional[List[Channel]] = None
 _tvg_map_cached_result: Dict[str, List[Channel]] = {}
+_tvg_map_lock = threading.Lock()
 
 
 def _build_tvg_map(channels: List[Channel]) -> Dict[str, List[Channel]]:
+    """Cache is keyed by object identity (`is`), not equality — call sites pass
+    channels_global/epg_global snapshots, so a different snapshot (e.g. after a
+    playlist switch) is always a cache miss, never a stale hit. Locked because
+    this is now reachable concurrently from multiple scheduled-task threads
+    (each with its own channels snapshot) via run_scheduled_stream()."""
     global _tvg_map_cached_key, _tvg_map_cached_result
-    if channels is not _tvg_map_cached_key:
-        tvg_map: Dict[str, List[Channel]] = defaultdict(list)
-        for ch in channels:
-            tvg_id = ch.get("tvg-id")
-            if tvg_id:
-                tvg_map[tvg_id].append(ch)
-        _tvg_map_cached_key = channels
-        _tvg_map_cached_result = tvg_map
-    return _tvg_map_cached_result
+    with _tvg_map_lock:
+        if channels is not _tvg_map_cached_key:
+            tvg_map: Dict[str, List[Channel]] = defaultdict(list)
+            for ch in channels:
+                tvg_id = ch.get("tvg-id")
+                if tvg_id:
+                    tvg_map[tvg_id].append(ch)
+            _tvg_map_cached_key = channels
+            _tvg_map_cached_result = tvg_map
+        return _tvg_map_cached_result
 
 
 def _fmt_time_status(is_playing_now: bool, minutes_until: int) -> str:
@@ -724,8 +732,16 @@ def find_alternative_streams(
     episode_num: str,
     original_start_time: datetime,
     tolerance_minutes: int = 5,
+    exclude_url: str = "",
 ) -> List[ShowResult]:
-    """Find the same episode airing on alternative channels at approximately the same time."""
+    """Find the same episode airing on alternative channels at approximately the same time.
+
+    exclude_url: drop this channel's own URL from the results — without it, a
+    channel sharing tvg-id with the one that just failed (common when the
+    same feed is listed under multiple providers) could be retried a second
+    time under the "alternative" banner instead of trying a genuinely
+    different source.
+    """
     logging.info(f"Searching for alternative streams: {show_title} {episode_num}")
     now = datetime.now().astimezone()
     tvg_map = _build_tvg_map(channels)
@@ -753,6 +769,8 @@ def find_alternative_streams(
                 continue
             minutes_until = int((start_time - now).total_seconds() / 60)
             for ch in tvg_map[channel_id]:
+                if exclude_url and ch.get("url", "") == exclude_url:
+                    continue
                 alternatives.append({
                     "channel":      ch,
                     "title":        title,
@@ -928,12 +946,13 @@ def run_scheduled_stream(
     epg: EpgData,
     cancel_event,
     remove_task_fn: Callable[[int], None],
-    mpv_cmd_builder: Callable[[str], List[str]],
+    mpv_cmd_builder: Callable[[str, float], List[str]],
     log_fn: Callable[..., None],
     on_success: Optional[Callable[[], None]] = None,
     vpn_check: Optional[Callable[[], bool]] = None,
     on_stream_start: Optional[Callable[[], None]] = None,
     on_stream_stop: Optional[Callable[[], None]] = None,
+    refresh_data_fn: Optional[Callable[[], Tuple[List[Channel], EpgData]]] = None,
 ) -> Dict[str, Any]:
     """Wait, then try-and-fail-over a scheduled stream (playback or recording).
 
@@ -946,14 +965,22 @@ def run_scheduled_stream(
     where output is logged (log_fn), and what happens on success (on_success,
     e.g. subtitle extraction for recordings).
 
-    mpv_cmd_builder(url) must return the full mpv argv (including "mpv" and a
-    trailing "--" before url). log_fn must accept the same keyword arguments
-    as log_mpv_output (channel_name, command, stdout, stderr, returncode).
-    vpn_check, if given, is called right before the first launch attempt —
-    if it returns False the task aborts without touching mpv (Term-TV-VPN.py
-    only, so a dropped tunnel doesn't let a scheduled task air unprotected).
-    on_stream_start/on_stream_stop bracket each individual mpv attempt (used
-    by Term-TV-VPN.py to gate its Ctrl+C VPN-teardown guard during recording).
+    mpv_cmd_builder(url, elapsed_seconds) must return the full mpv argv
+    (including "mpv" and a trailing "--" before url) — elapsed_seconds is the
+    time spent since the *first* launch attempt, so a recording's --length
+    can be shortened on retries/alternatives instead of restarting the cap
+    from zero and over-recording. log_fn must accept the same keyword
+    arguments as log_mpv_output (channel_name, command, stdout, stderr,
+    returncode). vpn_check, if given, is called before every attempt (not
+    just the first) — if it returns False the task aborts without touching
+    mpv (Term-TV-VPN.py only, so a tunnel that drops mid-retry doesn't let a
+    later attempt air unprotected). on_stream_start/on_stream_stop bracket
+    each individual mpv attempt (used by Term-TV-VPN.py to gate its Ctrl+C
+    VPN-teardown guard during recording). refresh_data_fn, if given, is
+    called to get a fresh (channels, epg) pair right before the alternative-
+    channel and future-rerun searches, instead of relying on the snapshot
+    taken when the task's background thread started (which can be hours
+    stale by the time a failover actually runs).
 
     Returns {"status": "cancelled" | "success" | "failed"} or
     {"status": "rerun_found", "rerun": <dict from find_future_reruns>, "new_delay": int}
@@ -984,19 +1011,28 @@ def run_scheduled_stream(
 
     remove_task_fn(task_id)
 
-    if vpn_check is not None and not vpn_check():
-        logging.warning(f"VPN not connected — aborting scheduled {kind}: {show_title}")
-        print(f"\n[{tag} FAILED] VPN is not connected — refusing to start {kind} for {show_title}")
+    def _vpn_still_up(context: str) -> bool:
+        if vpn_check is None:
+            return True
+        if vpn_check():
+            return True
+        logging.warning(f"VPN not connected — aborting scheduled {kind} ({context}): {show_title}")
+        print(f"\n[{tag} FAILED] VPN is not connected — refusing to {'continue' if context != 'start' else 'start'} {kind} for {show_title}")
         send_desktop_notification("Term-TV", f"{kind.capitalize()} skipped (VPN down): {show_title}")
+        return False
+
+    if not _vpn_still_up("start"):
         return {"status": "failed"}
 
     print(f"\n[{tag} STARTED] {channel_name} [{provider}] - {show_title}")
     logging.info(f"Starting {kind}: {show_title}")
 
+    overall_start = time.time()
+
     def _try_url(url: str, label: str) -> bool:
         """Launch mpv for *url*; wait up to 10s for an early failure, then wait
         for exit. Returns True on success (returncode 0 or 4 == user quit)."""
-        mpv_cmd = mpv_cmd_builder(url)
+        mpv_cmd = mpv_cmd_builder(url, time.time() - overall_start)
         if on_stream_start:
             on_stream_start()
         try:
@@ -1026,6 +1062,8 @@ def run_scheduled_stream(
     # Try original URL (with one retry)
     for attempt in range(2):
         attempt_num = attempt + 1
+        if attempt_num > 1 and not _vpn_still_up("retry"):
+            return {"status": "failed"}
         logging.info(f"Attempt {attempt_num}/2: Trying original URL {channel_url}")
         print(f"[{tag}] Attempt {attempt_num}/2: {channel_name} [{provider}]")
         try:
@@ -1047,10 +1085,19 @@ def run_scheduled_stream(
     logging.warning("Original stream failed after 2 attempts, searching for alternatives")
     print(f"\n[{tag}] Original stream failed, searching for alternative providers...")
 
+    if refresh_data_fn is not None:
+        try:
+            channels, epg = refresh_data_fn()
+        except Exception as e:
+            logging.warning(f"refresh_data_fn failed, using original snapshot: {e}")
+
     if episode_num and original_start_time and channels and epg:
         alternatives = find_alternative_streams(
-            channels, epg, show_title, episode_num, original_start_time, tolerance_minutes=5)
+            channels, epg, show_title, episode_num, original_start_time,
+            tolerance_minutes=5, exclude_url=channel_url)
         for alt in alternatives:
+            if not _vpn_still_up("alternative"):
+                return {"status": "failed"}
             alt_channel = alt["channel"]
             alt_url = alt_channel.get("url", "")
             alt_provider = alt_channel.get("group-title", "Unknown Provider")

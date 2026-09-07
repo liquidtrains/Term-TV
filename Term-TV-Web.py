@@ -560,6 +560,20 @@ def _pid_alive(pid: Optional[int]) -> bool:
         return False
 
 
+def _recording_is_alive(r: Dict) -> bool:
+    """True if a _recordings entry is still actively recording — handles both
+    a live subprocess.Popen handle and a reattached (process=None, pid-only)
+    recording from _restore_active_recordings(). Recording state lives across
+    three places that must stay in sync by convention (the in-memory
+    _recordings dict, its .active_recordings.json mirror, and the per-file
+    sidecar) — every place that needs "is this recording still running" goes
+    through this one helper so the reattached case can't be forgotten again."""
+    proc = r.get("process")
+    if proc is not None:
+        return proc.poll() is None
+    return _pid_alive(r.get("pid"))
+
+
 def _kill_pid(pid: int):
     """Terminate a PID we don't hold a subprocess.Popen handle for (a reattached recording)."""
     if platform.system() == "Windows":
@@ -844,8 +858,7 @@ def recordings_status() -> List[Dict]:
             "filename":   r["filename"],
             "path":       r["path"],
             "started_at": r["started_at"],
-            "running":    (r.get("process") is not None and r["process"].poll() is None)
-                          or (r.get("process") is None and _pid_alive(r.get("pid"))),
+            "running":    _recording_is_alive(r),
             "duration_s": int(time.time()) - r["started_at"],
         }
         for r in recs
@@ -862,11 +875,7 @@ def archive_mpv_log():
     with _mpv_lock:
         mpv_alive = _mpv_process is not None and _mpv_process.poll() is None
     with _recordings_lock:
-        recording_alive = any(
-            (r.get("process") and r["process"].poll() is None)
-            or (r.get("process") is None and _pid_alive(r.get("pid")))
-            for r in _recordings.values()
-        )
+        recording_alive = any(_recording_is_alive(r) for r in _recordings.values())
     if mpv_alive or recording_alive:
         logging.info("archive_mpv_log: skipped — mpv/recording process still writing to the log")
         return
@@ -3873,9 +3882,7 @@ def api_scheduled():
                  "title": r.get("show", r.get("channel", "")),
                  "ch_name": r.get("channel", ""), "ch_url": r.get("url", ""),
                  "start_ts": r.get("start_ts", 0)}
-                for r in _recordings.values()
-                if (r.get("process") and r["process"].poll() is None)
-                or (r.get("process") is None and _pid_alive(r.get("pid")))]
+                for r in _recordings.values() if _recording_is_alive(r)]
     return jsonify({"tasks": tasks + recs})
 
 
@@ -3897,9 +3904,7 @@ def api_cancel_task(task_id):
 def api_recordings():
     # Prune finished recordings (clean up dead processes, including reattached ones)
     with _recordings_lock:
-        dead = [rid for rid, r in _recordings.items()
-                if (r.get("process") and r["process"].poll() is not None)
-                or (r.get("process") is None and not _pid_alive(r.get("pid")))]
+        dead = [rid for rid, r in _recordings.items() if not _recording_is_alive(r)]
     for rid in dead:
         stop_recording(rid)
     return jsonify({"recordings": recordings_status()})

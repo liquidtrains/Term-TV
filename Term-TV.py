@@ -293,6 +293,18 @@ channels_global = []  # Global reference to channels (for scheduled task retry l
 epg_global = {}  # Global reference to EPG data (for scheduled task retry logic)
 
 
+def _is_already_scheduled(show_title: str, channel_name: str, task_type: Optional[str] = None) -> bool:
+    """True if a task for this show+channel (optionally restricted to task_type)
+    is already scheduled — used to warn before creating an accidental duplicate
+    (e.g. re-selecting the same upcoming show twice from search results)."""
+    with SCHEDULED_TASKS_LOCK:
+        return any(
+            t.get("show_title") == show_title and t.get("channel_name") == channel_name
+            and (task_type is None or t.get("type") == task_type)
+            for t in SCHEDULED_TASKS
+        )
+
+
 def _persist_tasks():
     """Snapshot SCHEDULED_TASKS to .scheduled_tasks.json so a restart can restore them."""
     with SCHEDULED_TASKS_LOCK:
@@ -455,6 +467,15 @@ def manage_scheduled_tasks():
     print(f"✓ Cancelled: {task.get('show_title', 'task')}")
 
 
+def _refresh_channels_epg():
+    """Re-read the latest channels/EPG snapshot for run_scheduled_stream()'s
+    failover search — a scheduled task's thread can sit waiting for hours
+    before its retry logic runs, by which point channels_global/epg_global
+    (snapshotted at thread start) may be stale (playlist switch, EPG refresh)."""
+    with DATA_LOCK:
+        return channels_global, epg_global
+
+
 def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: str, show_title: str, provider: str = "Unknown Provider", task_id: int = 0, episode_num: str = "", original_start_time: Optional[datetime] = None, cancel_event: Optional[threading.Event] = None):
     """
     Background task that waits then launches playback with retry logic.
@@ -477,8 +498,9 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
         show_title=show_title, provider=provider, task_id=task_id, episode_num=episode_num,
         original_start_time=original_start_time, channels=_channels, epg=_epg, cancel_event=evt,
         remove_task_fn=_remove_task,
-        mpv_cmd_builder=lambda url: ["mpv", *MPV_RESILIENCE_ARGS, "--", url],
+        mpv_cmd_builder=lambda url, elapsed: ["mpv", *MPV_RESILIENCE_ARGS, "--", url],
         log_fn=lambda **kw: log_mpv_output(**kw),
+        refresh_data_fn=_refresh_channels_epg,
     )
     if result["status"] != "rerun_found":
         return
@@ -536,12 +558,16 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
         _channels = channels_global
         _epg = epg_global
 
-    def _build_mpv_cmd(url: str) -> List[str]:
+    def _build_mpv_cmd(url: str, elapsed: float) -> List[str]:
         cmd = ["mpv", f"--stream-record={output_path}", *MPV_RESILIENCE_ARGS,
                "--sid=auto",              # Auto-select subtitles at start
                "--no-sub-visibility"]     # Start with subs hidden (user can toggle with 'v')
         if duration_seconds:
-            cmd.append(f"--length={duration_seconds}")
+            # Shrink the cap by time already spent on earlier attempts so a
+            # failover partway through doesn't restart the clock and let the
+            # total recorded length run well past what was requested.
+            remaining = max(1, duration_seconds - int(elapsed))
+            cmd.append(f"--length={remaining}")
         cmd.append("--")
         cmd.append(url)
         return cmd
@@ -563,6 +589,7 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
         mpv_cmd_builder=_build_mpv_cmd,
         log_fn=lambda **kw: log_mpv_output(**kw, log_path=RECORDINGS_LOG_FILE),
         on_success=_on_success,
+        refresh_data_fn=_refresh_channels_epg,
     )
     if result["status"] != "rerun_found":
         return
@@ -735,6 +762,12 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
 
         if confirm != 'y':
             return
+
+        if _is_already_scheduled(show_title, channel_name, "recording"):
+            if input(f"'{show_title}' on {channel_name} is already scheduled to record — "
+                      f"add another anyway? (y/n): ").strip().lower() != 'y':
+                print("Not scheduled.")
+                return
 
         # Start background thread for scheduled recording
         delay_seconds = minutes_until * 60
@@ -1230,6 +1263,13 @@ def main():
             choice = 's'
 
         if choice in ("quit", "exit"):
+            with SCHEDULED_TASKS_LOCK:
+                _pending = len(SCHEDULED_TASKS)
+            if _pending:
+                _confirm = input(f"⚠ {_pending} scheduled task(s) still pending — quit anyway? "
+                                  f"(y/n): ").strip().lower()
+                if _confirm != 'y':
+                    continue
             break
 
         if choice == "t":
@@ -1582,6 +1622,9 @@ def main():
                     _ep = _mr.get("episode_num", "")
                     _st = _mr.get("start_time")
                     _delay = _mu * 60
+                    if _is_already_scheduled(_title, _ch.get("name", "?"), "playback"):
+                        print(f"Skipped (already scheduled): {_title}")
+                        continue
                     _task_id = int(time.time() * 1000) + scheduled_count
                     _cancel = threading.Event()
                     _sched_time = datetime.now().astimezone() + timedelta(seconds=_delay)
@@ -1657,6 +1700,11 @@ def main():
                         print(f"\nPlayback will auto-launch when show starts")
                         confirm = input("Schedule this playback? (y/n): ").strip().lower()
 
+                        if confirm == 'y' and _is_already_scheduled(chosen_result.get("title", "Unknown"), channel_name, "playback"):
+                            if input(f"'{chosen_result.get('title', 'Unknown')}' on {channel_name} is already "
+                                      f"scheduled — add another anyway? (y/n): ").strip().lower() != 'y':
+                                confirm = 'n'
+
                         if confirm == 'y':
                             delay_seconds = minutes_until * 60
                             show_title = chosen_result.get("title", "Unknown")
@@ -1713,6 +1761,11 @@ def main():
                         future_rec_duration = int(future_dur_input) * 60 if future_dur_input and future_dur_input.isdigit() else 0
                         confirm = input("Schedule this recording? (y/n): ").strip().lower()
 
+                        if confirm == 'y' and _is_already_scheduled(show_title, channel_name, "recording"):
+                            if input(f"'{show_title}' on {channel_name} is already scheduled to record — "
+                                      f"add another anyway? (y/n): ").strip().lower() != 'y':
+                                confirm = 'n'
+
                         if confirm == 'y':
                             delay_seconds = minutes_until * 60
 
@@ -1756,6 +1809,9 @@ def main():
                         _r_start = chosen_result.get("start_time")
                         _r_title = chosen_result.get("title", "Unknown")
                         _r_chname = channel.get("name", "Unknown")
+                        if _is_already_scheduled(_r_title, _r_chname, "reminder"):
+                            print(f"  Already reminding for '{_r_title}' on {_r_chname}.")
+                            continue
                         _r_task_id = int(time.time() * 1000)
                         _r_cancel = threading.Event()
                         _r_sched_t = (_r_start - timedelta(seconds=60)) if _r_start else datetime.now().astimezone()
