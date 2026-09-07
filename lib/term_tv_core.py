@@ -474,7 +474,11 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
         else:
             r.raise_for_status()
 
-    except requests.RequestException as e:
+    except (requests.RequestException, IOError, ValueError) as e:
+        # requests.RequestException subclasses IOError/OSError, not the other way
+        # around — the manual `raise IOError(...)` above (incomplete download) and
+        # a malformed Content-Length (`int(expected)` -> ValueError) need their own
+        # types listed here or they'd propagate uncaught past this handler.
         if cache_file.exists():
             print(f"Warning: Network error, using cached EPG. {e}", file=sys.stderr)
             try:

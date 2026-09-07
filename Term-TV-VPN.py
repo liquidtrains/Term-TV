@@ -535,7 +535,9 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
         return cmd
 
     def _on_success():
-        print(f"[RECORDING COMPLETE] Saved to: {output_path}")
+        # run_scheduled_stream() already prints its own "[RECORDING COMPLETE]"
+        # banner right after this returns — just report the path here.
+        print(f"Saved to: {output_path}")
         if extract_subs:
             extract_subtitles_from_recording(output_path)
 
@@ -1511,9 +1513,14 @@ def _mark_recording_started():
 
 
 def _mark_recording_stopped():
-    global _ACTIVE_RECORDINGS
+    global _ACTIVE_RECORDINGS, _force_quit_requested
     with _ACTIVE_RECORDINGS_LOCK:
         _ACTIVE_RECORDINGS = max(0, _ACTIVE_RECORDINGS - 1)
+        if _ACTIVE_RECORDINGS == 0:
+            # Otherwise a Ctrl+C warning shown for an earlier recording would
+            # silently suppress the warning (and force an immediate VPN
+            # disconnect + exit on just one press) for a later, unrelated one.
+            _force_quit_requested = False
 
 
 def _register_vpn_signal_handlers():
@@ -2003,12 +2010,18 @@ def main():
                     if playlists[pl_idx] is chosen_playlist:
                         print("Already on this playlist.")
                     else:
-                        chosen_playlist = playlists[pl_idx]
-                        print(f"\nSwitching to: {chosen_playlist['name']}")
-                        channels = load_m3u_cached(chosen_playlist["m3u_url"])
-                        if not channels:
-                            print("Could not load channels.", file=sys.stderr)
+                        _target_playlist = playlists[pl_idx]
+                        print(f"\nSwitching to: {_target_playlist['name']}")
+                        _new_channels = load_m3u_cached(_target_playlist["m3u_url"])
+                        if not _new_channels:
+                            # Don't commit chosen_playlist/channels on failure — stay
+                            # on the working playlist instead of ending up desynced
+                            # (chosen_playlist pointing at B while channels_global/
+                            # epg_global still hold A's data).
+                            print("Could not load channels. Staying on current playlist.", file=sys.stderr)
                         else:
+                            chosen_playlist = _target_playlist
+                            channels = _new_channels
                             with DATA_LOCK:
                                 channels_global = channels
                             epg = {}

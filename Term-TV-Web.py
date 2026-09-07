@@ -589,13 +589,18 @@ def _save_active_recordings():
             data.append({
                 "id": r["id"], "channel": r.get("channel", ""), "show": r.get("show", ""),
                 "url": r.get("url", ""), "path": r.get("path", ""), "filename": r.get("filename", ""),
-                "started_at": r.get("started_at", 0), "stop_ts": r.get("stop_ts", 0), "pid": pid,
+                "started_at": r.get("started_at", 0), "stop_ts": r.get("stop_ts", 0),
+                "start_ts": r.get("start_ts", 0), "pid": pid,
             })
-    try:
-        with open(ACTIVE_RECORDINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        logging.warning(f"Could not save active recordings: {e}")
+        # Write while still holding the lock — two threads (e.g. an auto-stop
+        # firing while a new recording starts) racing to open/truncate this
+        # file independently could otherwise interleave writes and corrupt it
+        # (same class of bug as the _persist_tasks race fixed 2026-07-24).
+        try:
+            with open(ACTIVE_RECORDINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logging.warning(f"Could not save active recordings: {e}")
 
 
 def _restore_active_recordings():
@@ -609,32 +614,49 @@ def _restore_active_recordings():
         logging.warning(f"Could not load active recordings: {e}")
         return
     reattached = 0
+    stale_stopped = 0
+    skipped = 0
     for r in saved:
-        pid = r.get("pid")
-        if not _pid_alive(pid):
-            continue  # finished or was killed while the server was down — nothing to reattach
-        rec_id = str(r.get("id") or int(time.time() * 1000))
-        with _recordings_lock:
-            _recordings[rec_id] = {
-                "id": rec_id, "channel": r.get("channel", ""), "show": r.get("show", ""),
-                "url": r.get("url", ""), "path": r.get("path", ""), "filename": r.get("filename", ""),
-                "started_at": r.get("started_at") or int(time.time()),
-                "stop_ts": r.get("stop_ts", 0),
-                "process": None, "pid": pid, "log_handle": None,
-            }
-        stop_ts = r.get("stop_ts", 0)
-        if stop_ts and stop_ts > int(time.time()):
-            delay = stop_ts - int(time.time())
-            def _auto_stop(rid=rec_id, title=r.get("show") or r.get("channel", ""), d=delay):
-                time.sleep(max(0, d))
-                if stop_recording(rid):
-                    logging.info(f"Auto-stopped reattached recording '{title}' at programme end")
-            threading.Thread(target=_auto_stop, daemon=True).start()
-        reattached += 1
-        logging.info(f"Reattached to in-progress recording: {r.get('filename', '?')} (pid {pid})")
+        try:
+            pid = r.get("pid")
+            if not isinstance(pid, int) or not _pid_alive(pid):
+                continue  # finished, was killed, or malformed entry — nothing to reattach
+            rec_id = str(r.get("id") or int(time.time() * 1000))
+            with _recordings_lock:
+                _recordings[rec_id] = {
+                    "id": rec_id, "channel": r.get("channel", ""), "show": r.get("show", ""),
+                    "url": r.get("url", ""), "path": r.get("path", ""), "filename": r.get("filename", ""),
+                    "started_at": r.get("started_at") or int(time.time()),
+                    "stop_ts": r.get("stop_ts", 0),
+                    "start_ts": r.get("start_ts", 0),
+                    "process": None, "pid": pid, "log_handle": None,
+                }
+            stop_ts = r.get("stop_ts", 0)
+            title = r.get("show") or r.get("channel", "")
+            if stop_ts and stop_ts > int(time.time()):
+                delay = stop_ts - int(time.time())
+                def _auto_stop(rid=rec_id, title=title, d=delay):
+                    time.sleep(max(0, d))
+                    if stop_recording(rid):
+                        logging.info(f"Auto-stopped reattached recording '{title}' at programme end")
+                threading.Thread(target=_auto_stop, daemon=True).start()
+            elif stop_ts:
+                # Programme end already passed while the server was down — don't
+                # let it record forever waiting for an auto-stop that will never
+                # fire; stop it right away instead.
+                stop_recording(rec_id)
+                stale_stopped += 1
+                logging.info(f"Stopped reattached recording '{title}' — its stop time already passed")
+                continue
+            reattached += 1
+            logging.info(f"Reattached to in-progress recording: {r.get('filename', '?')} (pid {pid})")
+        except Exception as e:
+            skipped += 1
+            logging.warning(f"Skipping bad saved active-recording entry: {e}")
     _save_active_recordings()  # rewrite, dropping entries that didn't reattach
-    if reattached:
-        print(f"Reattached to {reattached} in-progress recording(s) from a previous session.")
+    if reattached or stale_stopped or skipped:
+        print(f"Active recordings: {reattached} reattached, {stale_stopped} stopped (overran while offline), "
+              f"{skipped} could not be restored.")
 
 
 _web_tasks:      List[Dict] = []   # [{id, type, title, ch_name, ch_url, start_ts, stop_ts, _cancel}]
@@ -650,11 +672,14 @@ def _save_web_tasks():
                  epg_meta=t.get("epg_meta"))
             for t in _web_tasks
         ]
-    try:
-        with open(WEB_TASKS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        logging.warning(f"Could not save web tasks: {e}")
+        # Write while still holding the lock so two threads saving at nearly the
+        # same time (e.g. one task firing while another is scheduled) can't
+        # interleave writes and corrupt the file.
+        try:
+            with open(WEB_TASKS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logging.warning(f"Could not save web tasks: {e}")
 
 
 def _remove_web_task(task_id: int):
@@ -734,6 +759,12 @@ def launch_recording(url: str, channel: str, show: str = "", stop_ts: int = 0,
             kw["creationflags"] = subprocess.CREATE_NO_WINDOW
         proc = subprocess.Popen(mpv_cmd, **kw)
 
+        # The originating programme's start_ts (if this came from the EPG popup) —
+        # needed so /api/scheduled can report a task key the frontend actually
+        # looks up (_taskKey() = ch.url + '|' + prog.start_ts); without it the
+        # "recording active" popup indicator/badge is lost on every page refresh.
+        prog_start_ts = int((epg_meta or {}).get("programme", {}).get("start_ts") or 0)
+
         with _recordings_lock:
             _recordings[rec_id] = {
                 "id":         rec_id,
@@ -744,6 +775,7 @@ def launch_recording(url: str, channel: str, show: str = "", stop_ts: int = 0,
                 "filename":   filename,
                 "started_at": int(time.time()),
                 "stop_ts":    stop_ts,
+                "start_ts":   prog_start_ts,
                 "process":    proc,
                 "log_handle": log_handle,
             }
@@ -830,8 +862,11 @@ def archive_mpv_log():
     with _mpv_lock:
         mpv_alive = _mpv_process is not None and _mpv_process.poll() is None
     with _recordings_lock:
-        recording_alive = any(r.get("process") and r["process"].poll() is None
-                               for r in _recordings.values())
+        recording_alive = any(
+            (r.get("process") and r["process"].poll() is None)
+            or (r.get("process") is None and _pid_alive(r.get("pid")))
+            for r in _recordings.values()
+        )
     if mpv_alive or recording_alive:
         logging.info("archive_mpv_log: skipped — mpv/recording process still writing to the log")
         return
@@ -3837,8 +3872,10 @@ def api_scheduled():
         recs = [{"id": r["id"], "type": "record",
                  "title": r.get("show", r.get("channel", "")),
                  "ch_name": r.get("channel", ""), "ch_url": r.get("url", ""),
-                 "start_ts": 0}
-                for r in _recordings.values() if r.get("process") and r["process"].poll() is None]
+                 "start_ts": r.get("start_ts", 0)}
+                for r in _recordings.values()
+                if (r.get("process") and r["process"].poll() is None)
+                or (r.get("process") is None and _pid_alive(r.get("pid")))]
     return jsonify({"tasks": tasks + recs})
 
 
@@ -4089,7 +4126,7 @@ def api_library_play():
         kw: Dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
         if platform.system() == "Windows":
             kw["creationflags"] = subprocess.CREATE_NEW_CONSOLE
-        subprocess.Popen(["mpv", "--save-position-on-quit", str(p)], **kw)
+        subprocess.Popen(["mpv", "--save-position-on-quit", "--", str(p)], **kw)
         return jsonify({"ok": True})
     except FileNotFoundError:
         return jsonify({"ok": False, "error": "mpv not found — is it installed?"}), 500
