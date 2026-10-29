@@ -53,14 +53,15 @@ import shutil
 import webbrowser
 import atexit
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 import requests
 from flask import Flask, jsonify, request, Response
 from lib.term_tv_core import (
-    parse_epg_time, get_safe_filename,
+    parse_epg_time, get_safe_filename, MPV_RESILIENCE_ARGS, MpvStallWatchdog,
+    MPV_STALL_RETRY_RESET_SECONDS,
     load_m3u_cached as _core_load_m3u_cached,
     load_epg as _core_load_epg,
     load_watch_history as _core_load_watch_history,
@@ -429,22 +430,26 @@ _mpv_lock = threading.Lock()
 # /api/play calls can't each spawn an mpv with one becoming untracked.
 _mpv_launch_lock = threading.Lock()
 
+# One silent reconnect if the stall watchdog has to kill mpv (e.g. a hung
+# ad-segment fetch that never times out — see MpvStallWatchdog), matching
+# the CLIs' play_channel() behavior.
+MPV_STALL_MAX_RETRIES = 1
+
 
 def launch_mpv(url: str, channel_name: str, show_title: str = "") -> bool:
     global _mpv_process, _mpv_info, _mpv_log_handle
     with _mpv_launch_lock:
-        return _launch_mpv_locked(url, channel_name, show_title)
+        return _launch_mpv_locked(url, channel_name, show_title, stall_retries_left=MPV_STALL_MAX_RETRIES)
 
 
-def _launch_mpv_locked(url: str, channel_name: str, show_title: str = "") -> bool:
+def _launch_mpv_locked(url: str, channel_name: str, show_title: str = "", stall_retries_left: int = 0,
+                        is_reconnect: bool = False, started_at: Optional[int] = None) -> bool:
     global _mpv_process, _mpv_info, _mpv_log_handle
-    stop_mpv()
+    stop_mpv(internal_reconnect=is_reconnect)
 
     mpv_args = [
         "mpv",
-        "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
-        "--cache=yes",
-        "--cache-pause=no",
+        *MPV_RESILIENCE_ARGS,
         "--",
         url,
     ]
@@ -458,19 +463,29 @@ def _launch_mpv_locked(url: str, channel_name: str, show_title: str = "") -> boo
         log_handle.flush()
 
         kw: Dict = {
-            "stdout": log_handle,
+            "stdout": subprocess.PIPE,
             "stderr": subprocess.STDOUT,
             "stdin":  subprocess.DEVNULL,
+            "text":   True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
         }
         with _mpv_lock:
             _mpv_log_handle = log_handle
             _mpv_process    = subprocess.Popen(mpv_args, **kw)
+            proc            = _mpv_process
             _mpv_info       = {
                 "channel":    channel_name,
                 "show":       show_title,
                 "url":        url,
-                "started_at": int(time.time()),
+                "started_at": started_at if started_at is not None else int(time.time()),
             }
+        threading.Thread(
+            target=_pump_mpv_output,
+            args=(proc, log_handle, url, channel_name, show_title, stall_retries_left),
+            daemon=True,
+        ).start()
         logging.info(f"Launched mpv: {channel_name} — {show_title}")
         return True
     except FileNotFoundError:
@@ -481,7 +496,73 @@ def _launch_mpv_locked(url: str, channel_name: str, show_title: str = "") -> boo
         return False
 
 
-def stop_mpv():
+def _pump_mpv_output(proc: subprocess.Popen, log_handle, url: str, channel_name: str,
+                      show_title: str, stall_retries_left: int) -> None:
+    """Tees *proc*'s stdout to *log_handle* and watches for a stuck live
+    position (see MpvStallWatchdog). mpv's stdout used to go straight to the
+    log file with nothing reading it live, so a hung ad-segment fetch (mpv
+    sits in "(Buffering)" forever, no error, no exit) was invisible until
+    someone noticed the picture was frozen — nothing ever killed or replaced
+    that mpv process. Runs in its own thread per mpv launch.
+    """
+    watchdog = MpvStallWatchdog()
+    pump_started = time.monotonic()
+    stalled = False
+    lost_pipe = False
+    try:
+        for line in proc.stdout:
+            try:
+                log_handle.write(line)
+                log_handle.flush()
+            except Exception:
+                pass
+            if watchdog.feed(line):
+                stalled = True
+                msg = f"Stream stalled (no position change for {int(watchdog.timeout_seconds)}s) — {channel_name}"
+                logging.warning(msg)
+                try:
+                    log_handle.write(f"\n{msg}\n")
+                    log_handle.flush()
+                except Exception:
+                    pass
+                proc.kill()
+                break
+    except Exception as e:
+        # We've lost the ability to read (and therefore stall-watch) this
+        # process — treat that the same as a detected stall instead of
+        # leaving mpv running with no supervision. (A UTF-8 decode error here
+        # once did exactly that: the pump died silently, and a real stall
+        # right after went uncaught because nothing was left watching.)
+        lost_pipe = True
+        logging.warning(f"mpv output pump error ({channel_name}): {e}")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    if not (stalled or lost_pipe):
+        return
+
+    # Only act if this pump's process is still the tracked one — a user-
+    # initiated stop/switch that happened concurrently already replaced it,
+    # and that (not our stall) is why this loop ended.
+    with _mpv_launch_lock:
+        with _mpv_lock:
+            is_current = _mpv_process is proc
+            original_started_at = _mpv_info.get("started_at") if is_current else None
+        if not is_current:
+            return
+        if time.monotonic() - pump_started > MPV_STALL_RETRY_RESET_SECONDS:
+            stall_retries_left = MPV_STALL_MAX_RETRIES  # long healthy run, so treat this as a new incident
+        if stall_retries_left > 0:
+            logging.info(f"Reconnecting after {'pump error' if lost_pipe else 'stall'}: {channel_name}")
+            _launch_mpv_locked(url, channel_name, show_title, stall_retries_left=stall_retries_left - 1,
+                               is_reconnect=True, started_at=original_started_at)
+        else:
+            logging.warning(f"{channel_name} kept failing — giving up")
+
+
+def stop_mpv(internal_reconnect: bool = False):
     global _mpv_process, _mpv_info, _mpv_log_handle
     with _mpv_lock:
         if _mpv_process and _mpv_process.poll() is None:
@@ -492,7 +573,8 @@ def stop_mpv():
                 _mpv_process.kill()
         if _mpv_log_handle:
             try:
-                _mpv_log_handle.write(f"{'='*80}\n[Stopped by web UI]\n")
+                footer = "[Reconnecting after stall]" if internal_reconnect else "[Stopped by web UI]"
+                _mpv_log_handle.write(f"{'='*80}\n{footer}\n")
                 _mpv_log_handle.close()
             except Exception:
                 pass
@@ -500,6 +582,14 @@ def stop_mpv():
         info_snapshot = dict(_mpv_info)
         _mpv_process = None
         _mpv_info    = {}
+
+    if internal_reconnect:
+        # A stall-triggered auto-reconnect isn't the user stopping — the
+        # caller carries started_at through to the new launch, so skip the
+        # watch-history write here (it would otherwise fragment one viewing
+        # session into several short entries) and let the eventual real
+        # stop/death log the full duration.
+        return
 
     # Log watch history and invalidate cache so guide re-sorts immediately.
     # Clamp to exit_time when mpv already died (e.g. user pressed 'q' in the
@@ -742,36 +832,53 @@ def _write_recording_sidecar(out_path: Path, channel: str, show: str, url: str,
         logging.warning(f"Could not write recording metadata sidecar for {out_path.name}: {e}")
 
 
+# How many times an unattended recording gets to restart itself (as a new
+# "_partN" file) after the stall watchdog kills a hung mpv before we give up
+# and just keep whatever was recorded so far. Higher than live playback's
+# MPV_STALL_MAX_RETRIES — nobody's watching a recording live to retry it by
+# hand, and a long recording can plausibly hit more than one bad ad break.
+RECORDING_STALL_MAX_RETRIES = 2
+
+
+def _spawn_recording_mpv(url: str, out_path: Path, channel: str, show: str) -> Tuple[subprocess.Popen, Any]:
+    """Opens the mpv-output.log append handle and starts mpv recording to
+    *out_path*, stdout piped (not redirected straight to the log file) so
+    _pump_recording_output can tee it live and watch for a stall."""
+    mpv_cmd = [
+        "mpv",
+        f"--stream-record={out_path}",
+        "--vo=null", "--ao=null",             # background — no window, but keep tracks selected so stream-record has data
+        *MPV_RESILIENCE_ARGS,
+        "--",
+        url,
+    ]
+    log_handle = open(MPV_LOG_FILE, "a", encoding="utf-8", errors="replace")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_handle.write(f"\n{'='*80}\n[{ts}] RECORDING: {channel}")
+    if show:
+        log_handle.write(f" — {show}")
+    log_handle.write(f"\nOutput: {out_path}\nCommand: {' '.join(str(a) for a in mpv_cmd)}\n{'-'*80}\n")
+    log_handle.flush()
+
+    kw: Dict = {
+        "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL,
+        "text": True, "encoding": "utf-8", "errors": "replace", "bufsize": 1,
+    }
+    if platform.system() == "Windows":
+        kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+    proc = subprocess.Popen(mpv_cmd, **kw)
+    return proc, log_handle
+
+
 def launch_recording(url: str, channel: str, show: str = "", stop_ts: int = 0,
                       epg_meta: Optional[Dict] = None) -> Dict:
     """Start a background mpv recording (no window). Returns status dict."""
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
     filename = get_safe_filename(channel, show)
     out_path = RECORDINGS_DIR / filename
-
-    mpv_cmd = [
-        "mpv",
-        f"--stream-record={out_path}",
-        "--vo=null", "--ao=null",             # background — no window, but keep tracks selected so stream-record has data
-        "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
-        "--cache=yes", "--cache-pause=no",
-        "--",
-        url,
-    ]
     rec_id = str(int(time.time() * 1000))
     try:
-        log_handle = open(MPV_LOG_FILE, "a", encoding="utf-8", errors="replace")
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_handle.write(f"\n{'='*80}\n[{ts}] RECORDING: {channel}")
-        if show:
-            log_handle.write(f" — {show}")
-        log_handle.write(f"\nOutput: {out_path}\nCommand: {' '.join(str(a) for a in mpv_cmd)}\n{'-'*80}\n")
-        log_handle.flush()
-
-        kw: Dict = {"stdout": log_handle, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL}
-        if platform.system() == "Windows":
-            kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-        proc = subprocess.Popen(mpv_cmd, **kw)
+        proc, log_handle = _spawn_recording_mpv(url, out_path, channel, show)
 
         # The originating programme's start_ts (if this came from the EPG popup) —
         # needed so /api/scheduled can report a task key the frontend actually
@@ -793,6 +900,12 @@ def launch_recording(url: str, channel: str, show: str = "", stop_ts: int = 0,
                 "process":    proc,
                 "log_handle": log_handle,
             }
+        threading.Thread(
+            target=_pump_recording_output,
+            args=(rec_id, proc, log_handle, url, channel, show, stop_ts, epg_meta,
+                  out_path, 1, RECORDING_STALL_MAX_RETRIES),
+            daemon=True,
+        ).start()
         _save_active_recordings()
         _write_recording_sidecar(out_path, channel, show, url, stop_ts, epg_meta)
         logging.info(f"Recording started: {channel} → {filename}")
@@ -812,6 +925,116 @@ def launch_recording(url: str, channel: str, show: str = "", stop_ts: int = 0,
     except Exception as e:
         logging.error(f"launch_recording error: {e}")
         return {"ok": False, "error": str(e)}
+
+
+def _pump_recording_output(rec_id: str, proc: subprocess.Popen, log_handle, url: str,
+                            channel: str, show: str, stop_ts: int, epg_meta: Optional[Dict],
+                            base_out_path: Path, part_num: int, stall_retries_left: int) -> None:
+    """Tees *proc*'s stdout to *log_handle* and watches for a stuck recording
+    (see MpvStallWatchdog). Unlike live playback, nobody's watching a
+    recording live to notice a freeze — it would otherwise just sit hung,
+    silently producing an incomplete file, until the already-scheduled
+    auto-stop timer (if any) eventually kills it hours later. On a stall,
+    starts a fresh "_partN" file continuing from where this one died instead
+    of leaving the recording stuck or corrupting it with an in-place retry.
+    """
+    watchdog = MpvStallWatchdog()
+    pump_started = time.monotonic()
+    stalled = False
+    lost_pipe = False
+    try:
+        for line in proc.stdout:
+            try:
+                log_handle.write(line)
+                log_handle.flush()
+            except Exception:
+                pass
+            if watchdog.feed(line):
+                stalled = True
+                msg = f"Recording stalled (no position change for {int(watchdog.timeout_seconds)}s) — {channel}"
+                logging.warning(msg)
+                try:
+                    log_handle.write(f"\n{msg}\n")
+                    log_handle.flush()
+                except Exception:
+                    pass
+                proc.kill()
+                break
+    except Exception as e:
+        lost_pipe = True
+        logging.warning(f"recording output pump error ({channel}): {e}")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    if not (stalled or lost_pipe):
+        return
+
+    with _recordings_lock:
+        rec = _recordings.get(rec_id)
+        is_current = bool(rec) and rec.get("process") is proc
+    if not is_current:
+        return  # user already stopped this recording — not our stall to handle
+
+    try:
+        log_handle.close()
+    except Exception:
+        pass
+
+    if time.monotonic() - pump_started > MPV_STALL_RETRY_RESET_SECONDS:
+        stall_retries_left = RECORDING_STALL_MAX_RETRIES  # long healthy part, so treat this as a new incident
+    # Right before the programme ends, the auto-stop timer would kill a new
+    # part within seconds, which just leaves a near-empty _partN file behind.
+    near_stop = bool(stop_ts) and stop_ts - time.time() < 30
+    if stall_retries_left <= 0 or near_stop:
+        reason = "programme is about to end" if near_stop else "kept failing"
+        logging.warning(f"Recording '{channel}' stalled and {reason}; not restarting, keeping what was recorded so far")
+        with _recordings_lock:
+            rec = _recordings.get(rec_id)
+            if rec and rec.get("process") is proc:
+                rec["process"] = None  # mpv is dead; nothing left for stop_recording() to kill
+        _save_active_recordings()
+        return
+
+    next_part = part_num + 1
+    new_path = base_out_path.with_name(f"{base_out_path.stem}_part{next_part}{base_out_path.suffix}")
+    try:
+        new_proc, new_log_handle = _spawn_recording_mpv(url, new_path, channel, show)
+    except Exception as e:
+        logging.error(f"Could not start recording continuation for '{channel}': {e}")
+        with _recordings_lock:
+            rec = _recordings.get(rec_id)
+            if rec and rec.get("process") is proc:
+                rec["process"] = None
+        _save_active_recordings()
+        return
+
+    with _recordings_lock:
+        rec = _recordings.get(rec_id)
+        if not rec or rec.get("process") is not proc:
+            # Superseded while we were restarting (e.g. user clicked stop) —
+            # don't leave the process we just started orphaned and untracked.
+            new_proc.kill()
+            try:
+                new_log_handle.close()
+            except Exception:
+                pass
+            return
+        rec["process"]    = new_proc
+        rec["log_handle"] = new_log_handle
+        rec["path"]       = str(new_path)
+        rec["filename"]   = new_path.name
+    logging.info(f"Recording '{channel}' continuing as part {next_part} after stall/error: {new_path.name}")
+    _save_active_recordings()
+    _write_recording_sidecar(new_path, channel, show, url, stop_ts, epg_meta)
+
+    threading.Thread(
+        target=_pump_recording_output,
+        args=(rec_id, new_proc, new_log_handle, url, channel, show, stop_ts, epg_meta,
+              base_out_path, next_part, stall_retries_left - 1),
+        daemon=True,
+    ).start()
 
 
 def stop_recording(rec_id: str) -> bool:
@@ -3590,8 +3813,7 @@ def _try_mpv_stream(url: str, title: str) -> bool:
     try:
         proc = subprocess.Popen([
             "mpv",
-            "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
-            "--cache=yes", "--cache-pause=no",
+            *MPV_RESILIENCE_ARGS,
             "--",
             url,
         ], stdin=subprocess.DEVNULL)
@@ -3846,8 +4068,7 @@ def api_play_new():
             kw["creationflags"] = subprocess.CREATE_NEW_CONSOLE
         subprocess.Popen([
             "mpv",
-            "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
-            "--cache=yes", "--cache-pause=no",
+            *MPV_RESILIENCE_ARGS,
             "--",
             url,
         ], **kw)

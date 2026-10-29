@@ -76,6 +76,7 @@ from lib.term_tv_core import (
     save_scheduled_tasks, load_scheduled_tasks,
     validate_playlists,
     MPV_RESILIENCE_ARGS, archive_log_file, run_scheduled_stream,
+    MpvStallWatchdog, MPV_STALL_RETURNCODE, MPV_STALL_RETRY_RESET_SECONDS,
 )
 
 # --- Constants ---
@@ -216,6 +217,9 @@ def run_mpv_with_logging(mpv_args: List[str], channel_name: str, log_path: Optio
             bufsize=1  # Line buffered
         )
 
+        stall_watchdog = MpvStallWatchdog()
+        stalled = False
+
         # Read and display output line by line
         for line in process.stdout:
             stripped = line.strip()
@@ -261,8 +265,20 @@ def run_mpv_with_logging(mpv_args: List[str], channel_name: str, log_path: Optio
             if show_in_terminal:
                 print(line, end='')
 
+            if stall_watchdog.feed(line):
+                stalled = True
+                msg = f"Stream stalled (no position change for {int(stall_watchdog.timeout_seconds)}s) — reconnecting: {channel_name}"
+                logging.warning(msg)
+                print(f"\n[STALLED] {msg}", file=sys.stderr)
+                if log_file:
+                    log_file.write(f"\n{msg}\n")
+                process.kill()
+                break
+
         # Wait for process to complete
         returncode = process.wait()
+        if stalled:
+            returncode = MPV_STALL_RETURNCODE
 
         if log_file:
             log_file.write(f"\n{'-'*80}\n")
@@ -844,11 +860,13 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         print("   Subtitles are pre-loaded - press 'v' to show/hide (safe)")
         print("   Press 'q' in mpv window to stop recording and playback")
 
+    sleep_seconds = 0
     if record_choice == 'w':
         mpv_args.append("--save-position-on-quit")
         _sleep_input = input("Sleep timer? (minutes, Enter for none): ").strip()
         if _sleep_input and _sleep_input.isdigit() and int(_sleep_input) > 0:
-            mpv_args.append(f"--length={int(_sleep_input) * 60}")
+            sleep_seconds = int(_sleep_input) * 60
+            mpv_args.append(f"--length={sleep_seconds}")
 
     mpv_args.append("--")
     mpv_args.append(channel_url)
@@ -867,12 +885,40 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         # Run mpv (blocks until player exits or fails to connect)
         # If mpv hangs connecting to stream, press Ctrl+C to cancel
         logging.info("Starting mpv subprocess...")
-        result = run_mpv_with_logging(mpv_args, f"{channel_name} [{provider}]",
-                                      log_path=RECORDINGS_LOG_FILE if record_choice == 'r' else None)
+        # Watch-only gets one silent reconnect if the stall watchdog kills mpv
+        # (e.g. a hung ad-segment fetch) — not recording, since a mid-file
+        # retry there would need its own output-path/subtitle handling.
+        # A stall after a long healthy run gets a fresh retry (otherwise one
+        # early stall would use up the retry for the whole evening), and a
+        # sleep timer keeps its original deadline across reconnects instead
+        # of starting over.
+        stall_retries = 1 if record_choice == 'w' else 0
+        retries_left = stall_retries
+        sleep_deadline = time.monotonic() + sleep_seconds if sleep_seconds else None
+        while True:
+            attempt_started = time.monotonic()
+            result = run_mpv_with_logging(mpv_args, f"{channel_name} [{provider}]",
+                                          log_path=RECORDINGS_LOG_FILE if record_choice == 'r' else None)
+            if result.returncode != MPV_STALL_RETURNCODE:
+                break
+            if time.monotonic() - attempt_started > MPV_STALL_RETRY_RESET_SECONDS:
+                retries_left = stall_retries
+            if retries_left <= 0:
+                break
+            if sleep_deadline is not None:
+                remaining = int(sleep_deadline - time.monotonic())
+                if remaining <= 0:
+                    result = subprocess.CompletedProcess(mpv_args, 0, None, None)  # sleep timer was due anyway
+                    break
+                mpv_args = [f"--length={remaining}" if a.startswith("--length=") else a for a in mpv_args]
+            retries_left -= 1
+            print(f"\nReconnecting to {channel_name}...")
         logging.info(f"mpv exited with return code: {result.returncode}")
 
         # Check if mpv exited with an error
-        if result.returncode != 0 and result.returncode != -2:  # -2 is Ctrl+C
+        if result.returncode == MPV_STALL_RETURNCODE:
+            print(f"\n{channel_name} kept stalling — giving up for now. Try again in a moment.", file=sys.stderr)
+        elif result.returncode != 0 and result.returncode != -2:  # -2 is Ctrl+C
             logging.warning(f"mpv exited with error code {result.returncode}")
             print(f"\nmpv exited with code {result.returncode}", file=sys.stderr)
 

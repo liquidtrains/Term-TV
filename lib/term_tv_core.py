@@ -21,7 +21,7 @@ import platform
 import time
 import threading
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import List, Dict, Any, Optional, Callable, Tuple
 from datetime import datetime, timedelta, timezone
 
@@ -854,11 +854,121 @@ def find_future_reruns(
 # on a filling cache. Term-TV-Web.py's launch_mpv()/launch_recording() have
 # always used these; the CLIs' scheduled tasks only had the timeout half and
 # interactive playback had none of it — now applied consistently everywhere.
+#
+# linearize-timestamps=yes: Pluto TV (and other SSAI live TV) splice ad
+# segments into the HLS stream with their own independent PTS/DTS, which
+# libavformat reports as a hard timestamp discontinuity. mpv's default is
+# "auto", which disables linearization outright whenever a video stream is
+# present (see demux_lavf.c) — so on live TV it never engages, and every
+# show<->ad splice hits "Reset playback due to audio timestamp reset" in
+# mpv-output.log, flushing and re-priming the AV pipeline (visible as the
+# video reloading while audio — already decoded ahead — keeps playing).
+# Forcing "yes" overrides that auto-disable and smooths the splice instead.
+#
+# cache-pause-initial=no (mpv's default) skips the slow "buffer up before
+# starting" wait when first joining a live stream, which is all the original
+# --cache-pause=no here was meant to achieve. But cache-pause=no ALSO disabled
+# mpv's normal mid-playback rebuffer-and-resync, and ad segments are commonly
+# served from a slower/higher-latency CDN than the show content: the cache
+# drains for many seconds straight right after a splice with no recovery, and
+# without cache-pause, mpv keeps trying to play through the starvation instead
+# of pausing both tracks together — audio (cheaper to decode) races ahead
+# while video stalls, instead of a clean pause+rebuffer+resync. Leaving
+# cache-pause at its default (yes) fixes that without reintroducing the slow
+# initial join, which cache-pause-initial=no already covers on its own.
+#
+# mc=0.1: some splices still get through as a hard reset (linearize doesn't
+# catch every jump), and mpv comes out of that reset with audio several
+# seconds behind video (seen in mpv-output.log: "A-V: -4.819" right after
+# "Reset playback due to audio timestamp reset"). With the default --mc=-1
+# mpv caps its correction at 0.4x frame time per frame (~0.4s per second),
+# so a 4.8s offset took ~12s to close, i.e. the audio lagged behind after
+# every transition. 0.1s/frame closes the same gap in about 2s. Small
+# everyday jitter is unaffected because mpv only corrects 10% of the
+# current offset per frame, which stays well under either cap.
 MPV_RESILIENCE_ARGS = [
     "--stream-lavf-o=reconnect=1,reconnect_delay_max=5,timeout=10000000",
+    "--demuxer-lavf-linearize-timestamps=yes",
     "--cache=yes",
-    "--cache-pause=no",
+    "--cache-pause-initial=no",
+    "--mc=0.1",
 ]
+
+# Sentinel returncode run_mpv_with_logging() (Term-TV.py/Term-TV-VPN.py) uses
+# when it kills mpv itself for a stall, so callers can tell "we gave up on a
+# frozen stream" apart from a normal mpv exit code or a real OS/signal value.
+MPV_STALL_RETURNCODE = -9999
+
+# How long a live stream's reported position can sit unchanged before we
+# treat mpv as stuck and kill it. Some ad-stitched segments (Pluto TV's SSAI
+# CDN in particular) hang mid-fetch with no error and no working timeout on
+# that fetch path (see MpvStallWatchdog docstring) — mpv keeps printing
+# "(Buffering)" status lines forever, so nothing (mpv itself, or a blocking
+# read loop watching it) ever notices on its own.
+MPV_STALL_TIMEOUT_SECONDS = 25.0
+
+# A stall that comes after this long of healthy playback on the current
+# connection counts as a new incident, so it gets a fresh retry budget. An
+# evening of Pluto TV crosses dozens of ad breaks, and without the reset a
+# single stall early on would use up the retries for the whole session, so
+# the next bad break hours later just gave up.
+MPV_STALL_RETRY_RESET_SECONDS = 300.0
+
+# "AV:" (normal), "A:" (audio-only, e.g. radio) or "V:" (video-only) status
+# lines. The lookbehind keeps the "A-V: 0.000" sync field from matching, and
+# the "/ duration" part is optional because live streams don't always
+# report one.
+_AV_POSITION_RE = re.compile(r"(?<![\w-])(?:AV|A|V):\s*(\d\d:\d\d:\d\d)")
+
+
+class MpvStallWatchdog:
+    """Detects a live stream stuck at one playback position even though mpv
+    keeps emitting status lines (a genuine freeze, not silence).
+
+    Reproduced case: an ad-splice segment's download stalls indefinitely.
+    --stream-lavf-o's reconnect/timeout options only cover mpv's own stream
+    layer, which isn't the code path libavformat's "hls" demuxer actually
+    uses to fetch segments — so a hung segment fetch has no timeout that
+    fires, and mpv sits in "(Buffering)" forever with the position frozen,
+    never exiting and never advancing. Feed it every stdout line from mpv;
+    once the reported "AV: HH:MM:SS" position hasn't moved for
+    MPV_STALL_TIMEOUT_SECONDS, feed() returns True once so the caller can
+    kill mpv instead of blocking on it indefinitely.
+    """
+
+    def __init__(self, timeout_seconds: float = MPV_STALL_TIMEOUT_SECONDS):
+        self.timeout_seconds = timeout_seconds
+        self._last_position: Optional[str] = None
+        self._last_change = time.monotonic()
+        self._fired = False
+
+    def feed(self, line: str) -> bool:
+        if self._fired:
+            return False
+        match = _AV_POSITION_RE.search(line)
+        if not match:
+            return False
+        if "(Paused)" in line:
+            # The user paused in the mpv window. mpv keeps printing
+            # "(Paused) AV: <same position>" while the cache fills, which
+            # would otherwise look exactly like a stall and get the stream
+            # killed after 25s. Keep restarting the clock so that unpausing
+            # doesn't fire on its first status line either.
+            self._last_position = match.group(1)
+            self._last_change = time.monotonic()
+            return False
+        # Only start the clock once mpv has reported a first position, so a
+        # slow initial connect (a separate, already-tolerated case) can't be
+        # mistaken for a mid-stream stall before any "AV:" line has appeared.
+        position = match.group(1)
+        if position != self._last_position:
+            self._last_position = position
+            self._last_change = time.monotonic()
+            return False
+        if time.monotonic() - self._last_change > self.timeout_seconds:
+            self._fired = True
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1030,19 +1140,61 @@ def run_scheduled_stream(
     overall_start = time.time()
 
     def _try_url(url: str, label: str) -> bool:
-        """Launch mpv for *url*; wait up to 10s for an early failure, then wait
-        for exit. Returns True on success (returncode 0 or 4 == user quit)."""
+        """Launch mpv for *url* and wait for it to exit. Returns True on
+        success (returncode 0 or 4 == user quit).
+
+        Reads mpv's output line-by-line (rather than a single blocking
+        communicate() at the end) so MpvStallWatchdog can catch a hung
+        ad-segment fetch — mpv sits in "(Buffering)" forever with no error
+        and no exit — and kill it instead of blocking here indefinitely,
+        which would hang this whole scheduled task (and silently leave an
+        unattended recording stuck mid-file). A stall or lost-pipe error
+        reports as MPV_STALL_RETURNCODE, which falls outside (0, 4) just like
+        any other failure, so it flows into the existing attempt/alternative-
+        channel retry tiers below without needing its own retry path.
+        """
         mpv_cmd = mpv_cmd_builder(url, time.time() - overall_start)
         if on_stream_start:
             on_stream_start()
         try:
-            proc = subprocess.Popen(mpv_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proc = subprocess.Popen(
+                mpv_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+            watchdog = MpvStallWatchdog()
+            # Keep only the tail. mpv prints a status line several times a
+            # second, so storing all of it for a multi-hour scheduled
+            # recording would grow by tens of MB, and log_fn only needs
+            # the end to show why mpv exited.
+            lines: deque = deque(maxlen=2000)
+            stalled = False
             try:
-                stdout, stderr = proc.communicate(timeout=10)
-                returncode = proc.returncode
-            except subprocess.TimeoutExpired:
-                stdout, stderr = proc.communicate()
-                returncode = proc.returncode
+                for line in proc.stdout:
+                    lines.append(line)
+                    if watchdog.feed(line):
+                        stalled = True
+                        logging.warning(
+                            f"{kind.capitalize()} stalled (no position change for "
+                            f"{int(watchdog.timeout_seconds)}s) — {label}")
+                        proc.kill()
+                        break
+            except Exception as e:
+                # Lost the ability to read (and therefore stall-watch) this
+                # process — treat it the same as a detected stall rather
+                # than leaving mpv running unsupervised for the rest of this
+                # attempt (see MpvStallWatchdog / the Web UI's _pump_mpv_output
+                # for the same reasoning — an undecodable byte here once
+                # caused exactly that).
+                stalled = True
+                logging.warning(f"mpv output read error ({label}): {e}")
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            returncode = proc.wait()
+            if stalled:
+                returncode = MPV_STALL_RETURNCODE
+            stdout, stderr = "".join(lines), None
         finally:
             if on_stream_stop:
                 on_stream_stop()
@@ -1056,7 +1208,6 @@ def run_scheduled_stream(
             return True
 
         logging.warning(f"mpv exited with code {returncode}")
-        logging.debug(f"mpv stderr: {(stderr or '')[:500]}")
         return False
 
     # Try original URL (with one retry)
