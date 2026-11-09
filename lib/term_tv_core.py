@@ -85,17 +85,32 @@ _LEGACY_FILE_NAMES = (
 _LEGACY_DIR_NAMES = (".epg_cache", ".m3u_cache", "mpv-log-archive")
 
 
+_migration_notes: List[Tuple[int, str]] = []
+
+
+def _migration_note(level: int, msg: str):
+    _migration_notes.append((level, msg))
+
+
+def log_migration_notes():
+    """Log what migrate_legacy_data() did. Call once logging is set up."""
+    for level, msg in _migration_notes:
+        logging.log(level, msg)
+    _migration_notes.clear()
+
+
 def migrate_legacy_data():
     """Move runtime files/dirs left in the source tree by older versions to DATA_DIR.
 
     Call this *before* opening log files: if the new log path doesn't exist yet,
     the old in-repo log is moved over instead of being left behind (and then
-    silently duplicated).
+    silently duplicated). Because logging isn't configured yet at that point,
+    what happened is kept and written by log_migration_notes() afterwards.
     """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
     except Exception as e:
-        logging.warning(f"Could not create data directory {DATA_DIR}: {e}")
+        _migration_note(logging.WARNING, f"Could not create data directory {DATA_DIR}: {e}")
         return
     for name in _LEGACY_FILE_NAMES:
         old, new = Path(name), DATA_DIR / name
@@ -103,18 +118,18 @@ def migrate_legacy_data():
             continue
         try:
             shutil.move(str(old), str(new))
-            logging.info(f"Runtime data: moved {name} -> {new}")
+            _migration_note(logging.INFO, f"Runtime data: moved {name} -> {new}")
         except Exception as e:
-            logging.warning(f"Could not move legacy file {name}: {e}")
+            _migration_note(logging.WARNING, f"Could not move legacy file {name}: {e}")
     for name in _LEGACY_DIR_NAMES:
         old, new = Path(name), DATA_DIR / name
         if not old.is_dir() or new.exists():
             continue
         try:
             shutil.move(str(old), str(new))
-            logging.info(f"Runtime data: moved {name}/ -> {new}")
+            _migration_note(logging.INFO, f"Runtime data: moved {name}/ -> {new}")
         except Exception as e:
-            logging.warning(f"Could not move legacy directory {name}: {e}")
+            _migration_note(logging.WARNING, f"Could not move legacy directory {name}: {e}")
 
 # ---------------------------------------------------------------------------
 # Config validation
@@ -505,6 +520,10 @@ def load_m3u_cached(url: str) -> List[Channel]:
 # EPG loading  (robust: iterparse + zlib fallback + tuple timeout)
 # ---------------------------------------------------------------------------
 
+# Warn when a guide's listings end within this many hours (see load_epg).
+EPG_STALE_WARN_HOURS = 3
+
+
 def _local_source_path(source: str) -> Optional[Path]:
     """Return a local Path when *source* names a file, else None.
 
@@ -764,6 +783,23 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
 
     if total > 0:
         print(f"Processed {total} programs ({filtered} past, {total - filtered} current/upcoming)")
+
+    # A guide that has run out looks exactly like a channel with no listings,
+    # so say so. This matters most for a self-hosted guide file, which only
+    # covers the days it was generated for and is never refreshed on its own.
+    if total > 0:
+        ends = [p["stop_time"] or p["start_time"] for progs in epg.values() for p in progs
+                if p["stop_time"] or p["start_time"]]
+        latest = max(ends) if ends else None
+        hours_left = (latest - now).total_seconds() / 3600 if latest else 0
+        if hours_left < EPG_STALE_WARN_HOURS:
+            state = ("has no current or upcoming programmes" if hours_left <= 0
+                     else f"runs out in about {max(1, round(hours_left))} hour(s)")
+            hint = (" Regenerate it with: python tools/update_epg.py"
+                    if local_path is not None else "")
+            msg = f"EPG {state}: {local_path if local_path is not None else url}.{hint}"
+            logging.warning(msg)
+            print(f"Warning: {msg}", file=sys.stderr)
 
     return epg
 

@@ -4532,6 +4532,7 @@ def main():
     # tree before the log file is (re)opened.
     _core.migrate_legacy_data()
     setup_logging()
+    _core.log_migration_notes()
     # Keep the M3U/EPG caches tidy like the CLIs do (README promises this).
     # Safe to age by mtime now that load_m3u_cached/load_epg refresh the mtime
     # of any cache they actually use, so a cache that is still the only working

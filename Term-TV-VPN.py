@@ -868,9 +868,24 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         mpv_args.append("--sid=auto")  # Auto-select subtitles at start
         mpv_args.append("--no-sub-visibility")  # Start with subs hidden (toggle with 'v')
 
-        duration_cap = input("Duration in minutes (Enter for unlimited): ").strip()
-        if duration_cap and duration_cap.isdigit():
-            mpv_args.append(f"--length={int(duration_cap) * 60}")
+        # Default to what is left of the programme being recorded, matching
+        # scheduled recordings (programme length) and the web UI (auto-stop at
+        # programme end). Without a known end time the default stays unlimited.
+        remaining_minutes = 0
+        _stop_time = show_result.get("stop_time") if show_result else None
+        if _stop_time:
+            _left = (_stop_time - datetime.now().astimezone()).total_seconds()
+            if _left > 0:
+                remaining_minutes = max(1, int(-(-_left // 60)))
+        dur_hint = (f"Enter for {remaining_minutes} (rest of programme), 0 for unlimited"
+                    if remaining_minutes else "Enter for unlimited")
+        duration_cap = input(f"Duration in minutes ({dur_hint}): ").strip()
+        if duration_cap.isdigit():
+            record_minutes = int(duration_cap)
+        else:
+            record_minutes = remaining_minutes
+        if record_minutes > 0:
+            mpv_args.append(f"--length={record_minutes * 60}")
 
         print(f"\n📹 Recording to: {output_path}")
         print("⚠️  WARNING: Do NOT change subtitle tracks during recording or it will stop!")
@@ -1749,6 +1764,7 @@ def main():
     # tree before the log file is (re)opened.
     _core.migrate_legacy_data()
     setup_logging()
+    _core.log_migration_notes()
     logging.info("Starting main application")
 
     # --- Register cleanup on exit ---

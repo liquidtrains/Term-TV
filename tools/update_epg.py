@@ -29,10 +29,11 @@ import re
 import shutil
 import subprocess
 import sys
-import time
+import threading
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
+from collections import deque
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
@@ -67,7 +68,21 @@ SITE_PRIORITY = (
 # errors / 404s), so they are only used when nothing else carries the id.
 SITE_FALLBACK = {"tvpassport.com", "tvtv.us", "distro.tv"}
 
+# Print one progress line per this many lines of grabber output.
 REPORT_EVERY = 50
+
+# Written into the grabber checkout once `npm install` has finished, so an
+# interrupted install is redone instead of being mistaken for a complete one.
+INSTALL_MARKER = ".term-tv-installed"
+
+
+# Grabber output contains characters a redirected Windows console (cp1252)
+# cannot encode; replace them instead of crashing mid-run.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 
 def log(msg: str) -> None:
@@ -129,6 +144,27 @@ def load_target_ids(sources: Iterable[Tuple[str, str]]) -> "Dict[str, str]":
     return ids
 
 
+def config_sources() -> List[Tuple[str, str]]:
+    """(name, m3u_url) for every enabled playlist in config.json.
+
+    Looks in the current directory first (where the apps read it), then next
+    to the repository.
+    """
+    for path in (Path("config.json"), REPO_ROOT / "config.json"):
+        if path.is_file():
+            break
+    else:
+        die("--from-config: no config.json in the current directory or the repository")
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        die(f"could not read {path}: {e}")
+    playlists = core.validate_playlists(config.get("playlists", []))
+    if not playlists:
+        die(f"--from-config: {path} has no enabled playlists")
+    return [(pl["name"], pl["m3u_url"]) for pl in playlists]
+
+
 def download_grabber(grabber_dir: Path, force: bool) -> None:
     if grabber_dir.exists() and not force:
         log(f"Using existing grabber: {grabber_dir}")
@@ -139,37 +175,90 @@ def download_grabber(grabber_dir: Path, force: bool) -> None:
         r.raise_for_status()
     except requests.RequestException as e:
         die(f"could not download the grabber: {e}")
-    if grabber_dir.exists():
-        shutil.rmtree(grabber_dir)
+    # Extract next to the target and swap it in only once that worked, so a
+    # failed download or extraction never destroys a working checkout.
     grabber_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging = grabber_dir.parent / (grabber_dir.name + ".new")
+    if staging.exists():
+        shutil.rmtree(staging)
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
         root = next(n for n in z.namelist() if n.endswith("/") and n.count("/") == 1)
-        z.extractall(grabber_dir.parent)
-    extracted = grabber_dir.parent / root.strip("/")
-    extracted.rename(grabber_dir)
+        z.extractall(staging)
+    if grabber_dir.exists():
+        shutil.rmtree(grabber_dir)
+    (staging / root.strip("/")).rename(grabber_dir)
+    shutil.rmtree(staging, ignore_errors=True)
     log(f"  {len(r.content) / 1048576:.1f} MB extracted")
 
 
-def run(cmd: List[str], cwd: Path, env: Dict[str, str], timeout: Optional[int] = None) -> int:
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_GRAB_LINE_RE = re.compile(r"\[(\d+)/(\d+)\]")
+
+
+def run(cmd: List[str], cwd: Path, env: Dict[str, str], timeout: Optional[int] = None,
+        progress: bool = False) -> int:
+    """Run *cmd*, killing it after *timeout* seconds.
+
+    With *progress*, the grabber's "[n/total] site - id - date (N programs)"
+    lines are followed and one is printed per REPORT_EVERY grabs while it runs
+    (the grab takes minutes and used to print nothing until it exited), plus a
+    count of grabs that came back empty. The last lines are always shown if
+    the command fails.
+    """
     log("  $ " + " ".join(str(c) for c in cmd))
     try:
-        proc = subprocess.run(
-            cmd, cwd=str(cwd), env=env, timeout=timeout,
-            capture_output=True, text=True, errors="replace",
+        proc = subprocess.Popen(
+            cmd, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
     except FileNotFoundError:
         die(f"'{cmd[0]}' not found on PATH")
-    except subprocess.TimeoutExpired:
+    timed_out = threading.Event()
+
+    def _kill():
+        timed_out.set()
+        proc.kill()
+
+    timer = threading.Timer(timeout, _kill) if timeout else None
+    if timer:
+        timer.daemon = True
+        timer.start()
+    tail: deque = deque(maxlen=40)
+    total = empty = 0
+    try:
+        for raw in proc.stdout:
+            line = _ANSI_RE.sub("", raw).rstrip()
+            # Skip blank lines and the indented bodies of dumped request errors.
+            if not line or line == "}" or (line[0].isspace() and not _GRAB_LINE_RE.search(line)):
+                continue
+            tail.append(line)
+            m = _GRAB_LINE_RE.search(line) if progress else None
+            if not m:
+                continue
+            n, total = int(m.group(1)), int(m.group(2))
+            if "(0 programs)" in line:
+                empty += 1
+            if n % REPORT_EVERY == 0 or n == total:
+                log(f"  {n}/{total} | {line[m.end():].strip()[:100]}")
+        code = proc.wait()
+    finally:
+        if timer:
+            timer.cancel()
+    if timed_out.is_set():
+        print("\n".join(tail), file=sys.stderr)
         die(f"command timed out after {timeout}s")
-    if proc.stdout.strip():
-        print(proc.stdout.strip()[-4000:])
-    if proc.returncode != 0 and proc.stderr.strip():
-        print(proc.stderr.strip()[-4000:], file=sys.stderr)
-    return proc.returncode
+    if code != 0:
+        print("\n".join(tail), file=sys.stderr)
+    elif not progress and tail:
+        print("\n".join(list(tail)[-5:]))
+    if progress and empty:
+        log(f"  {empty} of {total} grabs returned no programmes (site errors or no listings)")
+    return code
 
 
 def ensure_node_modules(grabber_dir: Path, data_dir: Path) -> None:
-    if (grabber_dir / "node_modules").is_dir():
+    if (grabber_dir / INSTALL_MARKER).is_file():
         return
     npm = shutil.which("npm")
     if not npm:
@@ -183,6 +272,7 @@ def ensure_node_modules(grabber_dir: Path, data_dir: Path) -> None:
     )
     if code != 0:
         die("npm install failed")
+    (grabber_dir / INSTALL_MARKER).write_text("ok\n", encoding="utf-8")
 
 
 def ensure_api_data(grabber_dir: Path, force: bool) -> None:
@@ -291,7 +381,7 @@ def write_channels_file(
 
 def run_grab(grabber_dir: Path, channels_file: Path, out_file: Path,
              days: int, max_connections: int, timeout_ms: int,
-             data_dir: Path) -> None:
+             data_dir: Path, grab_timeout: Optional[int] = None) -> None:
     node = shutil.which("node")
     if not node:
         die("node not found — install Node.js 18+ (https://nodejs.org) and retry")
@@ -306,7 +396,7 @@ def run_grab(grabber_dir: Path, channels_file: Path, out_file: Path,
         f"--timeout={timeout_ms}",
     ]
     log(f"Grabbing guide for {days} day(s) ...")
-    code = run(cmd, cwd=grabber_dir, env=env)
+    code = run(cmd, cwd=grabber_dir, env=env, timeout=grab_timeout, progress=True)
     if code != 0:
         die(f"guide grab failed (exit {code})")
 
@@ -333,6 +423,11 @@ def main() -> int:
     parser.add_argument("--ids-from", action="append", metavar="URL_OR_PATH",
                         help="M3U playlist to take tvg-ids from (repeatable; "
                              "default: Free-TV USA + Canada)")
+    parser.add_argument("--from-config", action="store_true",
+                        help="Take tvg-ids from the enabled playlists in config.json "
+                             "(can be combined with --ids-from)")
+    parser.add_argument("--grab-timeout", type=int, default=60, metavar="MINUTES",
+                        help="Give up on the whole grab after this long (default 60, 0 = never)")
     parser.add_argument("--days", type=int, default=2,
                         help="Days of guide data to fetch (default 2)")
     parser.add_argument("--max-connections", type=int, default=8,
@@ -365,8 +460,12 @@ def main() -> int:
     else:
         data_dir.mkdir(parents=True, exist_ok=True)
 
-    sources = DEFAULT_SOURCES if not args.ids_from else tuple(
-        (Path(s).name if core._local_source_path(s) else s, s) for s in args.ids_from)
+    sources: List[Tuple[str, str]] = []
+    if args.from_config:
+        sources += config_sources()
+    sources += [(Path(s).name if core._local_source_path(s) else s, s) for s in args.ids_from or ()]
+    if not sources:
+        sources = list(DEFAULT_SOURCES)
     log("Collecting channel ids from playlists ...")
     targets = load_target_ids(sources)
     if not targets:
@@ -394,7 +493,8 @@ def main() -> int:
     if out_file.exists():
         out_file.unlink()
     run_grab(grabber_dir, channels_file, out_file, args.days,
-             args.max_connections, args.timeout, data_dir)
+             args.max_connections, args.timeout, data_dir,
+             grab_timeout=args.grab_timeout * 60 if args.grab_timeout > 0 else None)
     if not out_file.exists() or out_file.stat().st_size == 0:
         die("the grabber produced no guide file")
 
@@ -404,8 +504,12 @@ def main() -> int:
     if programmes == 0:
         die("the guide contains no programmes — try a larger --days or different ids")
 
-    with open(out_file, "rb") as src, gzip.open(gz_file, "wb", compresslevel=9) as dst:
+    # Compress to a temporary name and rename over the old guide, so the app
+    # never reads a half-written file and a failure here keeps the old guide.
+    tmp_gz = gz_file.with_name(gz_file.name + ".tmp")
+    with open(out_file, "rb") as src, gzip.open(tmp_gz, "wb", compresslevel=9) as dst:
         shutil.copyfileobj(src, dst)
+    os.replace(tmp_gz, gz_file)
     if not args.keep_xml:
         out_file.unlink()
     log(f"\nWrote {gz_file} ({gz_file.stat().st_size / 1048576:.1f} MB)")

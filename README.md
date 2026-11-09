@@ -166,6 +166,9 @@ live in the runtime data directory above, never in the repository.
 # Free-TV USA + Canada (the tool's defaults)
 python tools/update_epg.py
 
+# The playlists you actually use (enabled entries in config.json)
+python tools/update_epg.py --from-config
+
 # Broader US/CA coverage: also index the iptv-org playlists
 python tools/update_epg.py ^
   --ids-from https://iptv-org.github.io/iptv/countries/us.m3u ^
@@ -173,7 +176,9 @@ python tools/update_epg.py ^
 ```
 
 The tool maps playlist `tvg-id`s to grabber sites, fetches the guide (typically
-1–3 minutes), and prints the resulting path. Put it in a playlist's `epg_url`:
+1–3 minutes, with a progress line every 50 channels), and prints the resulting
+path. The new guide replaces the old one only once it is complete, and
+`--grab-timeout` (default 60 minutes) stops a grab that hangs. Put it in a playlist's `epg_url`:
 
 ```json
 "epg_url": "C:/Users/you/AppData/Local/Term-TV/guide/guide.xml.gz"
@@ -188,6 +193,7 @@ them the network feed's schedule instead, which can be hours off.
 
 `load_epg` accepts a local path, a `file://` URI, or an HTTP(S) URL. Re-run the
 tool whenever the guide goes stale; `--days` controls how far ahead it fetches.
+The apps warn at load time when a guide has fewer than three hours of listings left.
 
 ---
 
