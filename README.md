@@ -42,6 +42,9 @@ Three ways to run it:
 - Stop mpv or cancel recordings from the browser
 - Live VPN status indicator
 - Background data loading with loading state indicators
+- **Language filter** for the guide, search and VOD (inferred from iptv-org feed/country metadata)
+- **Stream health**: a failed launch explains why (dead link, geo-block, timeout, corrupt stream, …)
+  and the channel is marked dead in the guide until it plays again
 
 ---
 
