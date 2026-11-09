@@ -59,6 +59,7 @@ from collections import defaultdict
 
 import requests
 from flask import Flask, jsonify, request, Response
+import lib.term_tv_core as _core
 from lib.term_tv_core import (
     parse_epg_time, get_safe_filename, MPV_RESILIENCE_ARGS, MpvStallWatchdog,
     MPV_STALL_RETRY_RESET_SECONDS,
@@ -82,12 +83,12 @@ from lib.term_tv_core import (
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 CONFIG_FILE         = Path("config.json")
-WATCH_HISTORY_FILE  = Path(".watch_history.json")
-EPG_CACHE_DIR       = Path(".epg_cache")
-M3U_CACHE_DIR       = Path(".m3u_cache")
-LOG_FILE            = Path("term-tv-web.log")
-MPV_LOG_FILE        = Path("mpv-output.log")
-MPV_LOG_ARCHIVE_DIR = Path("mpv-log-archive")
+WATCH_HISTORY_FILE  = _core.DATA_DIR / ".watch_history.json"
+EPG_CACHE_DIR       = _core.DATA_DIR / ".epg_cache"
+M3U_CACHE_DIR       = _core.DATA_DIR / ".m3u_cache"
+LOG_FILE            = _core.DATA_DIR / "term-tv-web.log"
+MPV_LOG_FILE        = _core.DATA_DIR / "mpv-output.log"
+MPV_LOG_ARCHIVE_DIR = _core.DATA_DIR / "mpv-log-archive"
 MPV_LOG_CHUNK_SIZE  = 5 * 1024 * 1024  # 5 MB
 RECORDINGS_DIR      = Path.home() / "Videos" / "Recordings"
 
@@ -104,6 +105,8 @@ WEB_URL  = f"http://{WEB_HOST}:{WEB_PORT}"
 # ── Logging ───────────────────────────────────────────────────────────────────
 def setup_logging():
     fmt = "%(asctime)s [%(levelname)s] %(funcName)s:%(lineno)d  %(message)s"
+    # Runtime data lives outside the source tree (see lib.term_tv_core.DATA_DIR)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.DEBUG,
         format=fmt,
@@ -637,7 +640,7 @@ def mpv_status() -> Dict:
 
 _recordings:      Dict[str, Dict] = {}
 _recordings_lock: threading.Lock  = threading.Lock()
-ACTIVE_RECORDINGS_FILE = Path(".active_recordings.json")
+ACTIVE_RECORDINGS_FILE = _core.DATA_DIR / ".active_recordings.json"
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
@@ -774,7 +777,7 @@ def _restore_active_recordings():
 
 _web_tasks:      List[Dict] = []   # [{id, type, title, ch_name, ch_url, start_ts, stop_ts, _cancel}]
 _web_tasks_lock: threading.Lock = threading.Lock()
-WEB_TASKS_FILE = Path(".web_tasks.json")
+WEB_TASKS_FILE = _core.DATA_DIR / ".web_tasks.json"
 
 
 def _save_web_tasks():
@@ -4522,6 +4525,9 @@ def main():
     args = parser.parse_args()
 
     _skip_epg = args.skip_epg
+    # Move runtime files left in the repo by older versions out of the source
+    # tree before the log file is (re)opened.
+    _core.migrate_legacy_data()
     setup_logging()
     # Keep the M3U/EPG caches tidy like the CLIs do (README promises this).
     # Safe to age by mtime now that load_m3u_cached/load_epg refresh the mtime

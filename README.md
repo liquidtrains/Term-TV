@@ -125,6 +125,65 @@ Copy `config.example.json` to `config.json` and fill in your details:
 
 ---
 
+## Runtime data
+
+Caches, logs and JSON state are kept **outside the source tree**, so a
+cloud-synced checkout (Google Drive, OneDrive, Dropbox) does not re-upload the
+EPG cache and append-only logs on every run:
+
+| Platform | Default location |
+|---|---|
+| Windows | `%LOCALAPPDATA%\Term-TV` |
+| macOS / Linux | `$XDG_CACHE_HOME/term-tv` (or `~/.cache/term-tv`) |
+
+Set `TERM_TV_DATA_DIR` to put it anywhere else:
+
+```bash
+setx TERM_TV_DATA_DIR "D:\Term-TV-data"     # Windows
+export TERM_TV_DATA_DIR="$HOME/tv-data"     # macOS / Linux
+```
+
+It holds `.epg_cache/`, `.m3u_cache/`, the logs (`term-tv.log`, `mpv-output.log`,
+`openvpn.log`), `mpv-log-archive/`, and the small state files
+(`.watch_history.json`, `.favorites.json`, …). Older versions kept these next to
+the scripts; the first run moves them automatically. `config.json` and the
+recordings directory are unaffected.
+
+---
+
+## Self-hosted EPG (US/CA)
+
+Public XMLTV endpoints routinely drop or rename the iptv-org channel ids that
+the playlists use (`Buzzr.us`, `CBCTDT.ca`, …). [iptv-org/epg](https://github.com/iptv-org/epg)
+is the open-source grabber built on that same id database, so
+[`tools/update_epg.py`](tools/update_epg.py) runs it locally and writes a guide
+the app reads straight from disk — no third-party EPG service.
+
+Requirements: Node.js 18+ (for the grabber). The grabber checkout and npm cache
+live in the runtime data directory above, never in the repository.
+
+```bash
+# Free-TV USA + Canada (the tool's defaults)
+python tools/update_epg.py
+
+# Broader US/CA coverage: also index the iptv-org playlists
+python tools/update_epg.py ^
+  --ids-from https://iptv-org.github.io/iptv/countries/us.m3u ^
+  --ids-from https://iptv-org.github.io/iptv/countries/ca.m3u
+```
+
+The tool maps playlist `tvg-id`s to grabber sites, fetches the guide (typically
+1–3 minutes), and prints the resulting path. Put it in a playlist's `epg_url`:
+
+```json
+"epg_url": "C:/Users/you/AppData/Local/Term-TV/guide/guide.xml.gz"
+```
+
+`load_epg` accepts a local path, a `file://` URI, or an HTTP(S) URL. Re-run the
+tool whenever the guide goes stale; `--days` controls how far ahead it fetches.
+
+---
+
 ## Usage
 
 ### Term-TV.py — Standard CLI
@@ -235,22 +294,28 @@ Term-TV/
 ├── Term-TV-Web.py          # Browser UI (Flask)
 ├── lib/
 │   └── term_tv_core.py     # Shared library (M3U, EPG, search, history, recording utils)
+├── tools/
+│   └── update_epg.py       # Build a self-hosted US/CA guide with iptv-org/epg
 ├── config.json             # Your config (gitignored — keep private)
 ├── config.example.json     # Safe template to copy from
 ├── .gitignore
 ├── README.md
 └── LICENSE
 
-# Auto-generated at runtime (gitignored):
-.watch_history.json         # Watch counts and total duration per channel
-.search_history.json        # Last 5 successful searches
-.epg_cache/                 # Cached EPG files (hash-named, cleaned after 15 days)
-.m3u_cache/                 # Cached M3U playlists (same)
-term-tv.log                 # DEBUG-level app log
-term-tv-web.log             # Web UI log
-mpv-output.log              # Full mpv stdout/stderr per session (archived on exit)
-mpv-log-archive/            # LZMA-compressed mpv log archives (auto-rotated, 1yr retention)
-openvpn.log                 # VPN connection log (VPN version only)
+# Runtime data — NOT in this folder (see "Runtime data" above):
+%LOCALAPPDATA%\Term-TV\
+├── .watch_history.json     # Watch counts and total duration per channel
+├── .search_history.json    # Last 5 successful searches
+├── .epg_cache/             # Cached EPG files (hash-named, cleaned after 15 days)
+├── .m3u_cache/             # Cached M3U playlists (same)
+├── term-tv.log             # DEBUG-level app log
+├── term-tv-web.log         # Web UI log
+├── mpv-output.log          # Full mpv stdout/stderr per session (archived on exit)
+├── mpv-log-archive/        # LZMA-compressed mpv log archives (auto-rotated, 1yr retention)
+├── openvpn.log             # VPN connection log (VPN version only)
+├── guide/                  # Self-hosted XMLTV guide from tools/update_epg.py
+└── epg-grabber/            # iptv-org/epg checkout (only if update_epg.py was run)
+
 ~/Videos/Recordings/        # Recorded streams + extracted SRT subtitles
 ```
 

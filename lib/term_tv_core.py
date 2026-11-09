@@ -7,10 +7,12 @@ single authoritative implementation.
 """
 
 import sys
+import os
 import re
 import gzip
 import zlib
 import lzma
+import shutil
 import xml.etree.ElementTree as ET
 from io import BytesIO
 import json
@@ -41,16 +43,77 @@ EpgData = Dict[str, List[Dict[str, Any]]]
 ShowResult = Dict[str, Any]
 
 # ---------------------------------------------------------------------------
-# Shared file-path constants (relative to CWD where the script is launched)
+# Runtime data directory
 # ---------------------------------------------------------------------------
-WATCH_HISTORY_FILE  = Path(".watch_history.json")
-SEARCH_HISTORY_FILE = Path(".search_history.json")
-FAVORITES_FILE      = Path(".favorites.json")
-CHANNEL_NOTES_FILE  = Path(".channel_notes.json")
-SCHEDULED_TASKS_FILE = Path(".scheduled_tasks.json")
-RECORDINGS_DIR      = Path.home() / "Videos" / "Recordings"
-EPG_CACHE_DIR       = Path(".epg_cache")
-M3U_CACHE_DIR       = Path(".m3u_cache")
+# Caches, logs and JSON state used to live next to the scripts. Anything inside
+# a cloud-synced checkout (Google Drive, OneDrive, Dropbox) then gets re-uploaded
+# every time the EPG cache is rewritten or a log line is appended, which keeps
+# the sync client permanently busy. Runtime data therefore lives in a per-user
+# cache directory *outside* the source tree. Point TERM_TV_DATA_DIR somewhere
+# else (including a local path) to override it.
+def _default_data_dir() -> Path:
+    env = os.environ.get("TERM_TV_DATA_DIR", "").strip()
+    if env:
+        return Path(env).expanduser()
+    if platform.system() == "Windows":
+        base = os.environ.get("LOCALAPPDATA", "").strip() or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "Term-TV"
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    return (Path(xdg) if xdg else Path.home() / ".cache") / "term-tv"
+
+
+DATA_DIR = _default_data_dir()
+
+WATCH_HISTORY_FILE   = DATA_DIR / ".watch_history.json"
+SEARCH_HISTORY_FILE  = DATA_DIR / ".search_history.json"
+FAVORITES_FILE       = DATA_DIR / ".favorites.json"
+CHANNEL_NOTES_FILE   = DATA_DIR / ".channel_notes.json"
+SCHEDULED_TASKS_FILE = DATA_DIR / ".scheduled_tasks.json"
+RECORDINGS_DIR       = Path.home() / "Videos" / "Recordings"
+EPG_CACHE_DIR        = DATA_DIR / ".epg_cache"
+M3U_CACHE_DIR        = DATA_DIR / ".m3u_cache"
+
+# Files and directories older versions created in the source tree. Moved into
+# DATA_DIR once, on the first run after upgrading.
+_LEGACY_FILE_NAMES = (
+    ".watch_history.json", ".search_history.json", ".favorites.json",
+    ".channel_notes.json", ".scheduled_tasks.json", ".active_recordings.json",
+    ".web_tasks.json", "term-tv.log", "term-tv-web.log", "mpv-output.log",
+    "recordings.log", "openvpn.log",
+)
+_LEGACY_DIR_NAMES = (".epg_cache", ".m3u_cache", "mpv-log-archive")
+
+
+def migrate_legacy_data():
+    """Move runtime files/dirs left in the source tree by older versions to DATA_DIR.
+
+    Call this *before* opening log files: if the new log path doesn't exist yet,
+    the old in-repo log is moved over instead of being left behind (and then
+    silently duplicated).
+    """
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logging.warning(f"Could not create data directory {DATA_DIR}: {e}")
+        return
+    for name in _LEGACY_FILE_NAMES:
+        old, new = Path(name), DATA_DIR / name
+        if not old.is_file() or new.exists():
+            continue
+        try:
+            shutil.move(str(old), str(new))
+            logging.info(f"Runtime data: moved {name} -> {new}")
+        except Exception as e:
+            logging.warning(f"Could not move legacy file {name}: {e}")
+    for name in _LEGACY_DIR_NAMES:
+        old, new = Path(name), DATA_DIR / name
+        if not old.is_dir() or new.exists():
+            continue
+        try:
+            shutil.move(str(old), str(new))
+            logging.info(f"Runtime data: moved {name}/ -> {new}")
+        except Exception as e:
+            logging.warning(f"Could not move legacy directory {name}: {e}")
 
 # ---------------------------------------------------------------------------
 # Config validation
@@ -441,13 +504,30 @@ def load_m3u_cached(url: str) -> List[Channel]:
 # EPG loading  (robust: iterparse + zlib fallback + tuple timeout)
 # ---------------------------------------------------------------------------
 
-def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
-    """
-    Download and parse an XMLTV EPG with caching.
-    Uses iterparse to recover data from truncated XML and zlib for lenient
-    gzip decompression (tolerates missing gzip footer from misconfigured servers).
+def _local_source_path(source: str) -> Optional[Path]:
+    """Return a local Path when *source* names a file, else None.
 
-    lookback_hours: keep programmes that ended up to this many hours ago (0 = discard all past).
+    Accepts absolute/relative paths and file:// URLs. Anything carrying another
+    URL scheme is left for requests (and the download cache) to handle.
+    """
+    if not source:
+        return None
+    src = source.strip()
+    if src.lower().startswith("file://"):
+        src = src[7:]
+        if len(src) > 2 and src[0] == "/" and src[2] == ":":
+            src = src[1:]  # file:///C:/... -> C:/...
+        return Path(src).expanduser()
+    if "://" in src:
+        return None
+    return Path(src).expanduser()
+
+
+def _download_epg(url: str) -> Tuple[Optional[bytes], Optional[Path], Optional[Path]]:
+    """Fetch *url* with ETag/Last-Modified caching.
+
+    Returns (content, cache_file, metadata_file); content is None when nothing
+    could be fetched and no cache exists.
     """
     EPG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     url_hash = hashlib.md5(url.encode()).hexdigest()
@@ -519,13 +599,40 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
                 _touch_cache_file(cache_file)
             except Exception as ce:
                 print(f"Error: Failed to load cached EPG. {ce}", file=sys.stderr)
-                return {}
+                return None, cache_file, metadata_file
         else:
             print(f"Warning: Failed to download EPG, no cache available. {e}", file=sys.stderr)
-            return {}
+            return None, cache_file, metadata_file
 
-    if content is None:
-        return {}
+    return content, cache_file, metadata_file
+
+
+def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
+    """
+    Load and parse an XMLTV EPG, either from an HTTP(S) URL (with caching) or
+    from a local file/`file://` path — handy for a self-hosted guide, which
+    never leaves the machine and therefore needs no cache or network round-trip.
+    Uses iterparse to recover data from truncated XML and zlib for lenient
+    gzip decompression (tolerates missing gzip footer from misconfigured servers).
+
+    lookback_hours: keep programmes that ended up to this many hours ago (0 = discard all past).
+    """
+    local_path = _local_source_path(url)
+    if local_path is not None:
+        if not local_path.is_file():
+            print(f"Error: EPG file not found: {local_path}", file=sys.stderr)
+            return {}
+        print(f"Reading EPG from {local_path}...")
+        try:
+            content: Optional[bytes] = local_path.read_bytes()
+        except Exception as e:
+            print(f"Error: Could not read EPG file {local_path}: {e}", file=sys.stderr)
+            return {}
+        cache_file = metadata_file = None
+    else:
+        content, cache_file, metadata_file = _download_epg(url)
+        if content is None:
+            return {}
 
     # Decompress
     if content.startswith(b"\x1f\x8b"):
@@ -549,13 +656,18 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
         logging.warning(f"EPG XML truncated; recovered {recovered} elements")
 
     if recovered == 0:
-        # Delete corrupted cache and bail
+        # Delete a corrupted downloaded cache and bail; local files are left alone
         for f in (cache_file, metadata_file):
+            if f is None:
+                continue
             try:
                 f.unlink(missing_ok=True)
             except Exception:
                 pass
-        print("Warning: EPG contained no parseable data. Cache cleared.", file=sys.stderr)
+        if cache_file is not None:
+            print("Warning: EPG contained no parseable data. Cache cleared.", file=sys.stderr)
+        else:
+            print(f"Warning: EPG contained no parseable data: {local_path}", file=sys.stderr)
         return {}
 
     epg: EpgData = {}

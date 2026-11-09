@@ -81,15 +81,17 @@ from lib.term_tv_core import (
 
 # --- Constants ---
 CONFIG_FILE = Path("config.json")
-LOG_FILE = Path("term-tv.log")
-MPV_LOG_FILE = Path("mpv-output.log")
-RECORDINGS_LOG_FILE = Path("recordings.log")
-MPV_LOG_ARCHIVE_DIR = Path("mpv-log-archive")
+LOG_FILE = _core.DATA_DIR / "term-tv.log"
+MPV_LOG_FILE = _core.DATA_DIR / "mpv-output.log"
+RECORDINGS_LOG_FILE = _core.DATA_DIR / "recordings.log"
+MPV_LOG_ARCHIVE_DIR = _core.DATA_DIR / "mpv-log-archive"
 MPV_LOG_CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB per chunk
 
 # --- Logging Configuration ---
 def setup_logging():
     """Configure logging to both file and console with detailed formatting."""
+    # Runtime data lives outside the source tree (see lib.term_tv_core.DATA_DIR)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     # Create formatter with detailed information
     log_format = '%(asctime)s - [%(levelname)s] - %(funcName)s:%(lineno)d - %(message)s'
     date_format = '%Y-%m-%d %H:%M:%S'
@@ -1120,6 +1122,9 @@ def main():
     args = parser.parse_args()
 
     # --- Logging Setup ---
+    # Move runtime files left in the repo by older versions out of the source
+    # tree before the log file is (re)opened.
+    _core.migrate_legacy_data()
     setup_logging()
     logging.info("Starting main application")
 
