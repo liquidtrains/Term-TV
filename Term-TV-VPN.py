@@ -95,6 +95,21 @@ def _is_already_scheduled(show_title: str, channel_name: str, task_type: Optiona
         )
 
 
+def _seconds_until_start(start_time: Optional[datetime], fallback_minutes: int = 0) -> int:
+    """Seconds from now until *start_time* (never negative).
+
+    Scheduled playback/recording used to compute their delay as
+    ``minutes_until * 60``. minutes_until is ``int(...)`` of a minute count, so
+    that floors to whole minutes and fires up to 59 seconds early — playback
+    could open on the tail of the previous programme and a recording started
+    before its show did. Deriving the wait from the real start time fixes both;
+    fallback_minutes is only used when the EPG gave no start time.
+    """
+    if not start_time:
+        return max(0, fallback_minutes) * 60
+    return max(0, int((start_time - datetime.now().astimezone()).total_seconds()))
+
+
 def _persist_tasks():
     """Snapshot SCHEDULED_TASKS to .scheduled_tasks.json so a restart can restore them."""
     with SCHEDULED_TASKS_LOCK:
@@ -500,7 +515,7 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
         remove_task_fn=_remove_task,
         mpv_cmd_builder=lambda url, elapsed: ["mpv", *MPV_RESILIENCE_ARGS, "--", url],
         log_fn=lambda **kw: log_mpv_output(**kw),
-        vpn_check=vpn_is_connected,
+        vpn_check=_scheduled_vpn_check,
         refresh_data_fn=_refresh_channels_epg,
     )
     if result["status"] != "rerun_found":
@@ -593,7 +608,7 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
         mpv_cmd_builder=_build_mpv_cmd,
         log_fn=lambda **kw: log_mpv_output(**kw, log_path=RECORDINGS_LOG_FILE),
         on_success=_on_success,
-        vpn_check=vpn_is_connected,
+        vpn_check=_scheduled_vpn_check,
         on_stream_start=_mark_recording_started,
         on_stream_stop=_mark_recording_stopped,
         refresh_data_fn=_refresh_channels_epg,
@@ -751,9 +766,13 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         stop_time = show_result.get("stop_time")
         episode_num = show_result.get("episode_num", "")
 
+        # Default the length cap to the programme's own duration, matching the
+        # web UI's auto-stop at programme end. "Unlimited" used to be the
+        # default, so a 30-minute show recorded the channel until the user quit.
+        programme_minutes = 0
         if start_time and stop_time:
-            duration_minutes = int((stop_time - start_time).total_seconds() / 60)
-            print(f"\nShow duration: {duration_minutes} minutes")
+            programme_minutes = max(1, int((stop_time - start_time).total_seconds() // 60))
+            print(f"\nShow duration: {programme_minutes} minutes")
             print(f"Starts in: {minutes_until} minutes")
 
         # Generate filename
@@ -763,8 +782,13 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         output_path = RECORDINGS_DIR / filename
 
         print(f"\nRecording will be saved to: {output_path}")
-        duration_cap_input = input("Duration in minutes (Enter for unlimited): ").strip()
-        rec_duration_seconds = int(duration_cap_input) * 60 if duration_cap_input and duration_cap_input.isdigit() else 0
+        dur_hint = (f"Enter for {programme_minutes} (programme length)"
+                    if programme_minutes else "Enter for unlimited")
+        duration_cap_input = input(f"Duration in minutes ({dur_hint}): ").strip()
+        if duration_cap_input and duration_cap_input.isdigit():
+            rec_duration_seconds = int(duration_cap_input) * 60
+        else:
+            rec_duration_seconds = programme_minutes * 60
         confirm = input("Schedule this recording? (y/n): ").strip().lower()
 
         if confirm != 'y':
@@ -777,7 +801,7 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
                 return
 
         # Start background thread for scheduled recording
-        delay_seconds = minutes_until * 60
+        delay_seconds = _seconds_until_start(start_time, minutes_until)
 
         # Generate unique task ID
         task_id = int(time.time() * 1000)  # Millisecond timestamp
@@ -1205,6 +1229,10 @@ def check_required_tools():
 
 # Global handle to the running OpenVPN process
 _vpn_process: Optional[subprocess.Popen] = None
+# True once this session has confirmed its own tunnel (auto_connect or the
+# 'vpn' menu). Scheduled tasks only enforce the VPN pre-flight when this is
+# set — see _scheduled_vpn_check().
+_vpn_enforced = False
 # Stored so the VPN can be reconnected from the main menu
 _vpn_exe: Optional[str] = None
 _vpn_config_file: Optional[str] = None
@@ -1219,7 +1247,7 @@ def connect_vpn(openvpn_exe: str, config_file: str, expected_ip: Optional[str] =
     Polls the public IP every 2 seconds for up to 40 seconds.
     Returns True on success, False on failure.
     """
-    global _vpn_process, _vpn_exe, _vpn_config_file, _vpn_expected_ip
+    global _vpn_process, _vpn_exe, _vpn_config_file, _vpn_expected_ip, _vpn_enforced
     _vpn_exe = openvpn_exe
     _vpn_config_file = config_file
     _vpn_expected_ip = expected_ip
@@ -1313,11 +1341,18 @@ def connect_vpn(openvpn_exe: str, config_file: str, expected_ip: Optional[str] =
         while True:
             choice = input("Continue anyway? (y/n): ").strip().lower()
             if choice == 'y':
+                # Explicitly continuing without a confirmed tunnel: don't
+                # enforce the VPN pre-flight on scheduled tasks either, or they
+                # would all abort at fire time for a tunnel the user declined.
                 return True
             elif choice == 'n':
                 disconnect_vpn()
                 return False
 
+    # A tunnel this process established and confirmed: scheduled tasks must
+    # keep it up through their whole retry chain (a tunnel that drops
+    # mid-retry must not let a later attempt air unprotected).
+    _vpn_enforced = True
     return True
 
 
@@ -1517,6 +1552,21 @@ def check_and_resolve_vpn_conflicts():
 def vpn_is_connected() -> bool:
     """Returns True if the OpenVPN process is currently running."""
     return _vpn_process is not None and _vpn_process.poll() is None
+
+
+def _scheduled_vpn_check() -> bool:
+    """VPN pre-flight used by scheduled playback/recording tasks.
+
+    Only enforced when this session actually confirmed its own tunnel
+    (auto_connect or the 'vpn' menu). Passing vpn_is_connected() directly made
+    every scheduled task abort in sessions where this process doesn't own a
+    tunnel at all — --skip-vpn, openvpn.enabled=false, or a VPN managed outside
+    Term-TV — because _vpn_process stays None and vpn_is_connected() is
+    therefore always False.
+    """
+    if not _vpn_enforced:
+        return True
+    return vpn_is_connected()
 
 
 def toggle_vpn_menu():
@@ -2329,14 +2379,17 @@ def main():
                 scheduled_count = 0
                 for _mr in chosen_result:
                     _mu = _mr.get("minutes_until", 0)
-                    if _mu <= 0:
+                    _st = _mr.get("start_time")
+                    # minutes_until is floored, so 0 covers both "already
+                    # started" and "starts in the next 59s". Only the former
+                    # should be skipped — schedule against the real start time.
+                    if _mr.get("is_playing_now") or (_st and _st <= datetime.now().astimezone()):
                         print(f"Skipped (already started): {_mr['title']}")
                         continue
                     _ch = _mr["channel"]
                     _title = _mr.get("title", "Unknown")
                     _ep = _mr.get("episode_num", "")
-                    _st = _mr.get("start_time")
-                    _delay = _mu * 60
+                    _delay = _seconds_until_start(_st, _mu)
                     if _is_already_scheduled(_title, _ch.get("name", "?"), "playback"):
                         print(f"Skipped (already scheduled): {_title}")
                         continue
@@ -2421,10 +2474,10 @@ def main():
                                 confirm = 'n'
 
                         if confirm == 'y':
-                            delay_seconds = minutes_until * 60
                             show_title = chosen_result.get("title", "Unknown")
                             episode_num = chosen_result.get("episode_num", "")
                             start_time = chosen_result.get("start_time")
+                            delay_seconds = _seconds_until_start(start_time, minutes_until)
 
                             # Generate unique task ID
                             task_id = int(time.time() * 1000)  # Millisecond timestamp
@@ -2468,12 +2521,22 @@ def main():
                         show_title = chosen_result.get("title", "Unknown")
                         episode_num = chosen_result.get("episode_num", "")
                         start_time = chosen_result.get("start_time")
+                        stop_time = chosen_result.get("stop_time")
+                        programme_minutes = (
+                            max(1, int((stop_time - start_time).total_seconds() // 60))
+                            if start_time and stop_time else 0
+                        )
                         filename = get_safe_filename(channel_name, show_title)
                         output_path = RECORDINGS_DIR / filename
 
                         print(f"\nRecording will be saved to: {output_path}")
-                        future_dur_input = input("Duration in minutes (Enter for unlimited): ").strip()
-                        future_rec_duration = int(future_dur_input) * 60 if future_dur_input and future_dur_input.isdigit() else 0
+                        dur_hint = (f"Enter for {programme_minutes} (programme length)"
+                                    if programme_minutes else "Enter for unlimited")
+                        future_dur_input = input(f"Duration in minutes ({dur_hint}): ").strip()
+                        if future_dur_input and future_dur_input.isdigit():
+                            future_rec_duration = int(future_dur_input) * 60
+                        else:
+                            future_rec_duration = programme_minutes * 60
                         confirm = input("Schedule this recording? (y/n): ").strip().lower()
 
                         if confirm == 'y' and _is_already_scheduled(show_title, channel_name, "recording"):
@@ -2482,7 +2545,7 @@ def main():
                                 confirm = 'n'
 
                         if confirm == 'y':
-                            delay_seconds = minutes_until * 60
+                            delay_seconds = _seconds_until_start(start_time, minutes_until)
 
                             # Generate unique task ID
                             task_id = int(time.time() * 1000)  # Millisecond timestamp

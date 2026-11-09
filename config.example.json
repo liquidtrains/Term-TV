@@ -1,6 +1,9 @@
 {
   "vpn_ip": "",
   "recordings_dir": "~/Videos/Recordings",
+  "web_port": 8891,
+  "epg_refresh_hours": 6,
+  "tmdb_api_key": "",
   "openvpn": {
     "enabled": false,
     "executable": "",
@@ -16,6 +19,13 @@
     {
       "name": "Public (iptv-org)",
       "m3u_url": "https://iptv-org.github.io/iptv/index.m3u"
+    },
+    {
+      "name": "Example offline source",
+      "_note": "Parked sources keep their URLs and are skipped until \"disabled\" is removed.",
+      "disabled": true,
+      "m3u_url": "http://example.invalid/playlist.m3u",
+      "epg_url": "http://example.invalid/epg.xml.gz"
     }
   ]
 }

@@ -36,7 +36,7 @@ Three ways to run it:
 - Requires admin/root privileges (OpenVPN kernel-level networking)
 
 ### Term-TV-Web.py extras
-- EPG grid TV guide in your browser at `http://127.0.0.1:8080`
+- EPG grid TV guide in your browser at `http://127.0.0.1:8891`
 - Click any programme → launches in mpv
 - VOD mode with poster grid and A→Z / Group sort
 - Stop mpv or cancel recordings from the browser
@@ -85,6 +85,9 @@ Copy `config.example.json` to `config.json` and fill in your details:
 ```json
 {
   "vpn_ip": "",
+  "recordings_dir": "~/Videos/Recordings",
+  "web_port": 8891,
+  "epg_refresh_hours": 6,
   "openvpn": {
     "enabled": false,
     "executable": "",
@@ -109,8 +112,13 @@ Copy `config.example.json` to `config.json` and fill in your details:
 |---|---|---|
 | `playlists[].name` | Yes | Label shown at startup |
 | `playlists[].m3u_url` | Yes | HTTP URL to M3U playlist |
-| `playlists[].epg_url` | No | HTTP URL to XMLTV file (`.xml` or `.xml.gz`) — needed for show search |
+| `playlists[].epg_url` | No | HTTP URL to XMLTV file (`.xml` or `.xml.gz`) — needed for show search. Channel ids with a feed suffix (`CNN.us@SD`) are matched against the bare id automatically |
+| `playlists[].disabled` | No | `true` parks a source (e.g. temporarily offline) with its URLs intact — it is skipped instead of deleted |
+| `recordings_dir` | No | Where recordings are written (default `~/Videos/Recordings`) |
 | `vpn_ip` | No | Auto-confirms VPN check when public IP matches |
+| `web_port` | No | Term-TV-Web.py port (default `8891`) |
+| `epg_refresh_hours` | No | Term-TV-Web.py guide refresh interval (default `6`) |
+| `tmdb_api_key` | No | Term-TV-Web.py only — enables episode-level IMDb links in the popup |
 | `openvpn` | No | Term-TV-VPN.py only — omit entire block if not using |
 
 > **Windows paths in JSON**: use double backslashes: `"C:\\Users\\name\\profile.ovpn"`
@@ -143,7 +151,7 @@ The VPN version auto-connects OpenVPN on startup. It will warn and exit if not r
 python Term-TV-Web.py
 ```
 
-Opens `http://127.0.0.1:8080` automatically. Press `Ctrl+C` to stop.
+Opens `http://127.0.0.1:8891` automatically. Press `Ctrl+C` to stop. Use `--port N` (or `web_port` in `config.json`) to change it.
 
 ---
 
@@ -269,7 +277,7 @@ By design — mpv stops stream recording when the subtitle track changes. Use `v
 4. Run as Administrator (Windows) or with `sudo` (Linux/macOS)
 
 **Windows port in use (Term-TV-Web.py)**
-Hyper-V reserves large swaths of high ports. The web UI uses port 8080 which is outside all known exclusion ranges. If you still get a socket permission error, check `netsh int ipv4 show excludedportrange protocol=tcp` and update `WEB_PORT` in `Term-TV-Web.py` to a free port.
+Hyper-V reserves large swaths of high ports. The web UI defaults to port 8891 (outside the common exclusion ranges). If you still get a socket permission error, check `netsh int ipv4 show excludedportrange protocol=tcp` and pass `--port N` (or set `web_port` in `config.json`) to a free port.
 
 ---
 

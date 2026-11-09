@@ -70,10 +70,14 @@ from lib.term_tv_core import (
     is_new_episode as _core_is_new_episode,
     ch_in_group as _core_ch_in_group,
     send_desktop_notification,
+    clean_old_cache_files,
     load_favorites as _core_load_favorites,
     toggle_favorite as _core_toggle_favorite,
     get_channel_note as _core_get_channel_note,
     set_channel_note as _core_set_channel_note,
+    validate_playlists,
+    normalize_tvg_id,
+    epg_programmes,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -211,6 +215,11 @@ def search_shows_web(query: str, hours_ahead: int = 24, groups: Optional[set] = 
         tid = ch.get("tvg-id")
         if tid:
             tvg_to_channels[tid].append(ch)
+            # An EPG key may be normalised ("CNN.us"), while this channel's
+            # tvg-id carries a feed suffix ("CNN.us@SD") — index both.
+            base = normalize_tvg_id(tid)
+            if base != tid:
+                tvg_to_channels[base].append(ch)
 
     results: List[Dict] = []
     for channel_id, programs in epg.items():
@@ -2304,6 +2313,11 @@ async function updateStatus() {
     }
     _dataVersion = st.data_version ?? _dataVersion;
 
+    // Recordings can start server-side (scheduled recording, restored task), so
+    // poll them from the status tick. They used to stay invisible until a page
+    // reload, because only an in-page Record click ever began polling.
+    updateRecordings();
+
   } catch (_) {}
 }
 
@@ -3301,7 +3315,6 @@ function spOpenShow(idx) {
 }
 
 // ── Recording ──────────────────────────────────────────────────────────────
-let _recTimer = null;
 
 // Everything the EPG popup knows about an episode, saved alongside its recording
 // (as a .json sidecar next to the .mkv) to help classify recordings later.
@@ -3359,12 +3372,10 @@ async function updateRecordings() {
 
     if (recs.length === 0) {
       panel.style.display = 'none';
-      if (_recTimer) { clearInterval(_recTimer); _recTimer = null; }
       return;
     }
 
     panel.style.display = '';
-    if (!_recTimer) _recTimer = setInterval(updateRecordings, 5000);
 
     list.innerHTML = recs.map(r => {
       const label = r.show ? escH(r.channel) + ' \u2014 ' + escH(r.show) : escH(r.channel);
@@ -3472,30 +3483,29 @@ def api_guide():
         tvg_id  = ch.get("tvg-id", "")
 
         progs = []
-        if tvg_id in epg:
-            for p in epg[tvg_id]:
-                st  = p.get("start_time")
-                et  = p.get("stop_time")
-                if not st or not et:
-                    continue
-                st_ts = st.timestamp()
-                et_ts = et.timestamp()
-                if et_ts <= start_ts or st_ts >= end_ts:
-                    continue
-                desc = p.get("description", "")
-                if len(desc) > 400:
-                    desc = desc[:397] + "…"
-                progs.append({
-                    "title":       p.get("title", ""),
-                    "subtitle":    p.get("subtitle", ""),
-                    "description": desc,
-                    "episode_num": p.get("episode_num", ""),
-                    "air_date":    p.get("air_date", ""),
-                    "start_ts":    int(st_ts),
-                    "stop_ts":     int(et_ts),
-                    "duration_min":max(1, int((et_ts - st_ts) / 60)),
-                    "is_now":      st_ts <= now_ts < et_ts,
-                })
+        for p in epg_programmes(epg, tvg_id):
+            st  = p.get("start_time")
+            et  = p.get("stop_time")
+            if not st or not et:
+                continue
+            st_ts = st.timestamp()
+            et_ts = et.timestamp()
+            if et_ts <= start_ts or st_ts >= end_ts:
+                continue
+            desc = p.get("description", "")
+            if len(desc) > 400:
+                desc = desc[:397] + "…"
+            progs.append({
+                "title":       p.get("title", ""),
+                "subtitle":    p.get("subtitle", ""),
+                "description": desc,
+                "episode_num": p.get("episode_num", ""),
+                "air_date":    p.get("air_date", ""),
+                "start_ts":    int(st_ts),
+                "stop_ts":     int(et_ts),
+                "duration_min":max(1, int((et_ts - st_ts) / 60)),
+                "is_now":      st_ts <= now_ts < et_ts,
+            })
 
         result.append({
             "tvg_id":  tvg_id,
@@ -4513,6 +4523,11 @@ def main():
 
     _skip_epg = args.skip_epg
     setup_logging()
+    # Keep the M3U/EPG caches tidy like the CLIs do (README promises this).
+    # Safe to age by mtime now that load_m3u_cached/load_epg refresh the mtime
+    # of any cache they actually use, so a cache that is still the only working
+    # copy of an unreachable source can't be deleted out from under you.
+    atexit.register(clean_old_cache_files)
     atexit.register(archive_mpv_log)
     atexit.register(disconnect_vpn)
 
@@ -4527,10 +4542,13 @@ def main():
         print(f"Error: Invalid config.json — {e}", file=sys.stderr)
         sys.exit(1)
 
-    playlists = _config.get("playlists", [])
+    playlists = validate_playlists(_config.get("playlists", []))
     if not playlists:
         print("Error: No playlists defined in config.json.", file=sys.stderr)
         sys.exit(1)
+    # Keep api_sources()/_load_data()/source indices aligned with the filtered
+    # list (disabled or malformed entries would otherwise shift the indices).
+    _config["playlists"] = playlists
 
     # F8: configurable port (--port beats config web_port beats default)
     if args.port:
