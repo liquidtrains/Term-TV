@@ -15,6 +15,7 @@ import lzma
 import shutil
 import xml.etree.ElementTree as ET
 from io import BytesIO
+from urllib.parse import urlparse, unquote
 import json
 import subprocess
 import hashlib
@@ -514,10 +515,17 @@ def _local_source_path(source: str) -> Optional[Path]:
         return None
     src = source.strip()
     if src.lower().startswith("file://"):
-        src = src[7:]
-        if len(src) > 2 and src[0] == "/" and src[2] == ":":
-            src = src[1:]  # file:///C:/... -> C:/...
-        return Path(src).expanduser()
+        parsed = urlparse(src)
+        path = unquote(parsed.path)  # "%20" -> " "
+        host = parsed.netloc
+        if host and host.lower() != "localhost":
+            if len(host) == 2 and host[1] == ":":
+                path = host + path                  # file://C:/guide.xml (non-standard but common)
+            else:
+                path = f"//{host}{path}"            # file://server/share/guide.xml -> UNC
+        elif len(path) > 2 and path[0] == "/" and path[2] == ":":
+            path = path[1:]                         # file:///C:/... -> C:/...
+        return Path(path).expanduser()
     if "://" in src:
         return None
     return Path(src).expanduser()
@@ -675,32 +683,17 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
     cutoff = now - timedelta(hours=lookback_hours)
     total = filtered = 0
 
-    # XMLTV feeds are inconsistent about channel-id suffixes: iptv-org-style
-    # guides emit "CNN.us@SD"/"CNN.us@HD" while playlists reference "CNN.us".
-    # Index those programmes under the bare id so lookups still match, but:
-    #   * if the feed also carries the bare id as a real channel, leave both
-    #     untouched (they may be deliberately different feeds), and
-    #   * if two suffixed variants collapse onto one bare id (e.g. @East/@West
-    #     with no bare id), keep the first variant only — merging them would
-    #     give one channel two conflicting schedules.
-    raw_channel_ids = {p.get("channel") for p in root.findall("programme") if p.get("channel")}
-    variant_owner: Dict[str, str] = {}
-    normalised_ids: set = set()
-    skipped_variants = 0
-
+    # Programmes are always stored under the channel id exactly as the guide
+    # gives it ("HBO.us@East", "HBO.us@West", "CNN.us@HD"). The "@feed" part
+    # can be a picture quality, a time zone or a local station, and only the
+    # first is safe to ignore: collapsing them all onto the bare id gave a
+    # West-coast channel the East schedule, and every local NBC affiliate the
+    # same one. Bare-id lookups are handled by the aliases added below.
     for prog in root.findall("programme"):
         total += 1
-        raw_channel_id = prog.get("channel")
-        if not raw_channel_id:
+        channel_id = prog.get("channel")
+        if not channel_id:
             continue
-        channel_id = raw_channel_id
-        base_id = normalize_tvg_id(raw_channel_id)
-        if base_id != raw_channel_id and base_id not in raw_channel_ids:
-            channel_id = base_id
-            if variant_owner.setdefault(channel_id, raw_channel_id) != raw_channel_id:
-                skipped_variants += 1
-                continue
-            normalised_ids.add(raw_channel_id)
 
         def _text(tag: str) -> str:
             el = prog.find(tag)
@@ -727,11 +720,6 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
             "air_date":    _text("date"),
         })
 
-    if normalised_ids:
-        logging.info(f"Normalised {len(normalised_ids)} EPG channel id(s) by stripping @feed suffixes")
-    if skipped_variants:
-        logging.info(f"Skipped {skipped_variants} programme(s) from duplicate feed variants of one channel")
-
     # Sort each channel's programmes by start time. Undated entries sort last
     # via a (is_undated, start_time) tuple key rather than a datetime.max
     # sentinel: datetime.max.astimezone() raises OSError on Windows (and
@@ -743,6 +731,36 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
         epg[channel_id].sort(
             key=lambda x: (x["start_time"] is None, x["start_time"] or _undated_fallback)
         )
+
+    # Aliases, so a playlist id that differs from the guide's only in ways
+    # that don't change the schedule still matches (see epg_key_for):
+    #   1. each id's canonical form ("CNN.us@SD" -> "CNN.us",
+    #      "HBO.us@WestHD" -> "HBO.us@west"), and
+    #   2. the bare id, when the guide has no bare or quality-only entry for
+    #      it, pointing at the East feed if there is one, else the first
+    #      variant. A bare playlist id says nothing about the feed, so this
+    #      is the conventional default rather than a contradiction.
+    # An alias shares the variant's list; anything iterating the whole guide
+    # must go through channels_for_epg_key() so those programmes aren't
+    # reported twice.
+    raw_ids = list(epg)
+    aliases = 0
+    for channel_id in raw_ids:
+        canonical_id = canonical_tvg_id(channel_id)
+        if canonical_id and canonical_id not in epg:
+            epg[canonical_id] = epg[channel_id]
+            aliases += 1
+    for prefer_east in (True, False):
+        for channel_id in raw_ids:
+            base_id = normalize_tvg_id(channel_id).strip()
+            if not base_id or base_id in epg:
+                continue
+            if prefer_east and feed_region(channel_id) != "east":
+                continue
+            epg[base_id] = epg[channel_id]
+            aliases += 1
+    if aliases:
+        logging.info(f"Added {aliases} EPG channel id alias(es) for feed-suffixed ids")
 
     if total > 0:
         print(f"Processed {total} programs ({filtered} past, {total - filtered} current/upcoming)")
@@ -798,18 +816,75 @@ def normalize_tvg_id(tvg_id: str) -> str:
     return tvg_id.split("@", 1)[0]
 
 
-def epg_programmes(epg: EpgData, tvg_id: str) -> List[Dict[str, Any]]:
-    """Programme list for *tvg_id*, tolerating a feed-suffixed EPG channel id.
+_FEED_REGION_WORDS = {"east", "west", "pacific", "mountain", "central", "atlantic", "eastern", "western"}
+_FEED_QUALITY_RE = re.compile(r"(sd|hd|fhd|uhd|4k)$", re.IGNORECASE)
 
-    Exact matches win; otherwise the id is retried with its "@feed" suffix
-    stripped (see normalize_tvg_id).
+
+def feed_region(tvg_id: str) -> str:
+    """The part of an id's "@feed" suffix that changes the schedule.
+
+    "@SD"/"@HD" are the same programmes at a different picture quality, so
+    they (and no suffix at all) give "". "@East"/"@WestHD" give "east"/"west",
+    and anything else (a local station such as "@WNYW") is returned whole,
+    lower-cased. Two ids for one channel share a schedule only when this
+    matches.
+    """
+    feed = tvg_id.split("@", 1)[1].strip().lower() if tvg_id and "@" in tvg_id else ""
+    stripped = _FEED_QUALITY_RE.sub("", feed)
+    if stripped == "" or stripped in _FEED_REGION_WORDS:
+        return stripped
+    return feed
+
+
+def canonical_tvg_id(tvg_id: str) -> str:
+    """*tvg_id* with only the schedule-relevant part of its feed suffix.
+
+    "CNN.us@HD" -> "CNN.us", "HBO.us@WestHD" -> "HBO.us@west". Ids that give
+    the same result here can share a guide entry; ids that don't, can't.
+    """
+    if not tvg_id:
+        return tvg_id
+    region = feed_region(tvg_id)
+    base_id = normalize_tvg_id(tvg_id).strip()
+    return f"{base_id}@{region}" if region else base_id
+
+
+def epg_key_for(epg: EpgData, tvg_id: str) -> Optional[str]:
+    """The key in *epg* that holds the schedule for a channel's *tvg_id*.
+
+    The exact id wins. Otherwise the canonical id is tried, which load_epg()
+    aliases to a variant with the same schedule ("CNN.us@HD" finds
+    "CNN.us@SD", "HBO.us@WestHD" finds "HBO.us@West"). There is deliberately
+    no further fallback: "HBO.us@West" must not get the East schedule just
+    because the guide has no West feed. No listings beat wrong ones.
     """
     if not tvg_id or not epg:
-        return []
-    progs = epg.get(tvg_id)
-    if progs:
-        return progs
-    return epg.get(normalize_tvg_id(tvg_id), [])
+        return None
+    if tvg_id in epg:
+        return tvg_id
+    canonical_id = canonical_tvg_id(tvg_id)
+    if canonical_id in epg:
+        return canonical_id
+    return None
+
+
+def epg_programmes(epg: EpgData, tvg_id: str) -> List[Dict[str, Any]]:
+    """Programme list for *tvg_id* (see epg_key_for for the matching rules)."""
+    key = epg_key_for(epg, tvg_id)
+    return epg[key] if key is not None else []
+
+
+def channels_for_epg_key(epg: EpgData, tvg_map: Dict[str, List[Channel]], channel_id: str) -> List[Channel]:
+    """Channels whose schedule is *channel_id* when iterating the whole guide.
+
+    *tvg_map* indexes a channel under both its full and its canonical id,
+    and the guide can hold the same programmes under a variant and its
+    aliases, so a plain tvg_map[channel_id] would list some channels under
+    two keys. Keeping only the channels that resolve to exactly this key
+    reports each one once, against the right schedule.
+    """
+    return [ch for ch in tvg_map.get(channel_id, ())
+            if epg_key_for(epg, ch.get("tvg-id", "")) == channel_id]
 
 # ---------------------------------------------------------------------------
 # Search
@@ -853,11 +928,12 @@ def _build_tvg_map(channels: List[Channel]) -> Dict[str, List[Channel]]:
                 if not tvg_id:
                     continue
                 tvg_map[tvg_id].append(ch)
-                # Also index the bare id so a channel whose tvg-id carries a
-                # feed suffix ("CNN.us@SD") still matches a normalised EPG key.
-                base_id = normalize_tvg_id(tvg_id)
-                if base_id != tvg_id:
-                    tvg_map[base_id].append(ch)
+                # Also index the canonical id, which is the key a channel
+                # resolves to when the guide lacks its exact id ("CNN.us@HD"
+                # -> "CNN.us"); see epg_key_for / channels_for_epg_key.
+                canonical_id = canonical_tvg_id(tvg_id)
+                if canonical_id != tvg_id:
+                    tvg_map[canonical_id].append(ch)
             _tvg_map_cached_key = channels
             _tvg_map_cached_result = tvg_map
         return _tvg_map_cached_result
@@ -892,7 +968,8 @@ def search_shows_in_timeframe(
     results: List[ShowResult] = []
 
     for channel_id, programs in epg.items():
-        if channel_id not in tvg_map:
+        matched_channels = channels_for_epg_key(epg, tvg_map, channel_id)
+        if not matched_channels:
             continue
         for prog in programs:
             title = prog.get("title", "")
@@ -908,7 +985,7 @@ def search_shows_in_timeframe(
                 continue
             minutes_until = int((start_time - now).total_seconds() / 60)
             air_date = prog.get("air_date", "")
-            for ch in tvg_map[channel_id]:
+            for ch in matched_channels:
                 if groups and not ch_in_group(ch, groups):
                     continue
                 results.append({
@@ -958,7 +1035,8 @@ def find_alternative_streams(
     alternatives: List[ShowResult] = []
 
     for channel_id, programs in epg.items():
-        if channel_id not in tvg_map:
+        matched_channels = channels_for_epg_key(epg, tvg_map, channel_id)
+        if not matched_channels:
             continue
         for prog in programs:
             title          = prog.get("title", "")
@@ -978,7 +1056,7 @@ def find_alternative_streams(
             if not (is_playing_now or now <= start_time):
                 continue
             minutes_until = int((start_time - now).total_seconds() / 60)
-            for ch in tvg_map[channel_id]:
+            for ch in matched_channels:
                 if exclude_url and ch.get("url", "") == exclude_url:
                     continue
                 alternatives.append({
@@ -1017,7 +1095,8 @@ def find_future_reruns(
     reruns: List[ShowResult] = []
 
     for channel_id, programs in epg.items():
-        if channel_id not in tvg_map:
+        matched_channels = channels_for_epg_key(epg, tvg_map, channel_id)
+        if not matched_channels:
             continue
         for prog in programs:
             title      = prog.get("title", "")
@@ -1034,7 +1113,7 @@ def find_future_reruns(
             if not (now < start_time <= cutoff):
                 continue
             minutes_until = int((start_time - now).total_seconds() / 60)
-            for ch in tvg_map[channel_id]:
+            for ch in matched_channels:
                 reruns.append({
                     "channel":      ch,
                     "title":        title,

@@ -1073,9 +1073,9 @@ def select_from_channel_list(results: List[Channel], epg: EpgData) -> Optional[C
         print(f"{i}. {channel_name} [{provider}]")
 
         # Show current program if available
-        if tvg_id and tvg_id in epg:
+        if tvg_id:
             now = datetime.now().astimezone()
-            for program in epg[tvg_id][:5]:
+            for program in _core.epg_programmes(epg, tvg_id)[:5]:
                 start_time = program.get("start_time")
                 stop_time = program.get("stop_time")
 

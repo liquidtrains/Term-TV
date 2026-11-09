@@ -83,6 +83,9 @@ def normalize_id(xmltv_id: str) -> str:
     return (xmltv_id or "").split("@", 1)[0].strip()
 
 
+feed_region = core.feed_region  # which part of an "@feed" suffix changes the schedule
+
+
 def fetch_text(source: str) -> str:
     """Read *source* from a local path or an HTTP(S) URL."""
     path = core._local_source_path(source)
@@ -100,7 +103,11 @@ def fetch_text(source: str) -> str:
 
 
 def load_target_ids(sources: Iterable[Tuple[str, str]]) -> "Dict[str, str]":
-    """Return {normalized tvg-id: display name} for every playlist in *sources*."""
+    """Return {tvg-id: display name} for every playlist in *sources*.
+
+    Ids keep their "@feed" suffix: "HBO.us@East" and "HBO.us@West" (or two
+    local NBC stations) are different schedules and need their own guide entry.
+    """
     ids: Dict[str, str] = {}
     for label, source in sources:
         text = fetch_text(source)
@@ -111,8 +118,8 @@ def load_target_ids(sources: Iterable[Tuple[str, str]]) -> "Dict[str, str]":
             m = re.search(r'tvg-id="([^"]+)"', line)
             if not m:
                 continue
-            tvg_id = normalize_id(m.group(1))
-            if not tvg_id:
+            tvg_id = m.group(1).strip()
+            if not normalize_id(tvg_id):
                 continue
             name = line.rsplit(",", 1)[-1].strip() or tvg_id
             if tvg_id not in ids:
@@ -228,32 +235,58 @@ def rank(entry: Dict[str, str]) -> Tuple[int, int, str]:
     return (0, prio, site)
 
 
+def pick_source(tvg_id: str, options: List[Dict[str, str]], loose: bool) -> Optional[Dict[str, str]]:
+    """Best site entry for *tvg_id* among the entries for its bare channel id.
+
+    The exact feed wins, then any entry with the same schedule (see
+    feed_region). An entry for a different region or station is only used
+    with *loose*, because its programmes air at other times or not at all.
+    """
+    exact = [o for o in options if o["xmltv_id"] == tvg_id]
+    if exact:
+        return sorted(exact, key=rank)[0]
+    region = feed_region(tvg_id)
+    same = [o for o in options if feed_region(o["xmltv_id"]) == region]
+    if same:
+        return sorted(same, key=rank)[0]
+    return sorted(options, key=rank)[0] if loose else None
+
+
 def write_channels_file(
     path: Path, targets: Dict[str, str], index: Dict[str, List[Dict[str, str]]],
-) -> Tuple[int, List[str]]:
-    """Write one site entry per target id; return (matched count, missing ids)."""
+    loose: bool = False,
+) -> Tuple[int, List[str], List[str]]:
+    """Write one site entry per target id.
+
+    Returns (matched count, ids with no source at all, ids skipped because the
+    only sources are for a different regional feed or station).
+    """
     root = ET.Element("channels")
     matched: List[str] = []
     missing: List[str] = []
+    wrong_feed: List[str] = []
     for tvg_id, name in targets.items():
-        options = index.get(tvg_id)
+        options = index.get(normalize_id(tvg_id))
         if not options:
             missing.append(tvg_id)
             continue
-        best = sorted(options, key=rank)[0]
+        best = pick_source(tvg_id, options, loose)
+        if best is None:
+            wrong_feed.append(tvg_id)
+            continue
         el = ET.SubElement(root, "channel", {
             "site": best["site"],
             "site_id": best["site_id"],
             "lang": best["lang"],
-            # Emit the bare id: the guide then matches playlists directly and
-            # variants from different sites cannot collide in the app.
+            # Emit the playlist's own id (feed suffix included), so the guide
+            # matches the playlist exactly and feeds stay separate in the app.
             "xmltv_id": tvg_id,
         })
         el.text = name
         matched.append(tvg_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
-    return len(matched), missing
+    return len(matched), missing, wrong_feed
 
 
 def run_grab(grabber_dir: Path, channels_file: Path, out_file: Path,
@@ -312,6 +345,9 @@ def main() -> int:
                         help="Re-download the iptv-org API data")
     parser.add_argument("--keep-xml", action="store_true",
                         help="Keep the uncompressed guide.xml as well")
+    parser.add_argument("--loose-feeds", action="store_true",
+                        help="When a channel's own feed (e.g. @West, a local station) has "
+                             "no source, use another feed's schedule instead of none")
     parser.add_argument("--data-dir", metavar="PATH",
                         help="Override the runtime data directory for this run")
     args = parser.parse_args()
@@ -342,8 +378,13 @@ def main() -> int:
 
     log("Mapping ids to grabber sites ...")
     index = build_site_index(grabber_dir)
-    matched, missing = write_channels_file(channels_file, targets, index)
+    matched, missing, wrong_feed = write_channels_file(
+        channels_file, targets, index, loose=args.loose_feeds)
     log(f"  {matched}/{len(targets)} ids have a guide source")
+    if wrong_feed:
+        log(f"  {len(wrong_feed)} id(s) skipped: only a different regional feed/station "
+            "has a source (--loose-feeds uses it anyway): "
+            + ", ".join(sorted(wrong_feed)[:10]) + (" ..." if len(wrong_feed) > 10 else ""))
     if missing:
         log("  no source for: " + ", ".join(sorted(missing)[:20])
             + (" ..." if len(missing) > 20 else ""))

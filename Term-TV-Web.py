@@ -77,8 +77,9 @@ from lib.term_tv_core import (
     get_channel_note as _core_get_channel_note,
     set_channel_note as _core_set_channel_note,
     validate_playlists,
-    normalize_tvg_id,
+    canonical_tvg_id,
     epg_programmes,
+    channels_for_epg_key,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -218,15 +219,17 @@ def search_shows_web(query: str, hours_ahead: int = 24, groups: Optional[set] = 
         tid = ch.get("tvg-id")
         if tid:
             tvg_to_channels[tid].append(ch)
-            # An EPG key may be normalised ("CNN.us"), while this channel's
-            # tvg-id carries a feed suffix ("CNN.us@SD") — index both.
-            base = normalize_tvg_id(tid)
-            if base != tid:
-                tvg_to_channels[base].append(ch)
+            # Also index the canonical id, which is the guide key this
+            # channel resolves to when its exact id is missing ("CNN.us@HD"
+            # -> "CNN.us"); channels_for_epg_key() below picks which applies.
+            canonical = canonical_tvg_id(tid)
+            if canonical != tid:
+                tvg_to_channels[canonical].append(ch)
 
     results: List[Dict] = []
     for channel_id, programs in epg.items():
-        if channel_id not in tvg_to_channels:
+        matched_channels = channels_for_epg_key(epg, tvg_to_channels, channel_id)
+        if not matched_channels:
             continue
         for prog in programs:
             title = prog.get("title", "")
@@ -254,7 +257,7 @@ def search_shows_web(query: str, hours_ahead: int = 24, groups: Optional[set] = 
             dur_min = max(1, int((stop_time - start_time).total_seconds() / 60)) if stop_time else 0
 
             new_ep = is_new_episode(prog)
-            for ch in tvg_to_channels[channel_id]:
+            for ch in matched_channels:
                 results.append({
                     "channel_name":  ch.get("name", ""),
                     "channel_url":   ch.get("url", ""),

@@ -112,7 +112,7 @@ Copy `config.example.json` to `config.json` and fill in your details:
 |---|---|---|
 | `playlists[].name` | Yes | Label shown at startup |
 | `playlists[].m3u_url` | Yes | HTTP URL to M3U playlist |
-| `playlists[].epg_url` | No | HTTP URL to XMLTV file (`.xml` or `.xml.gz`) — needed for show search. Channel ids with a feed suffix (`CNN.us@SD`) are matched against the bare id automatically |
+| `playlists[].epg_url` | No | HTTP URL to XMLTV file (`.xml` or `.xml.gz`) — needed for show search. Feed suffixes are honoured: ids that differ only in picture quality (`CNN.us@SD`/`@HD`/`CNN.us`) share listings, while a different time zone or station (`HBO.us@West` vs `@East`) never does |
 | `playlists[].disabled` | No | `true` parks a source (e.g. temporarily offline) with its URLs intact — it is skipped instead of deleted |
 | `recordings_dir` | No | Where recordings are written (default `~/Videos/Recordings`) |
 | `vpn_ip` | No | Auto-confirms VPN check when public IP matches |
@@ -178,6 +178,13 @@ The tool maps playlist `tvg-id`s to grabber sites, fetches the guide (typically
 ```json
 "epg_url": "C:/Users/you/AppData/Local/Term-TV/guide/guide.xml.gz"
 ```
+
+Feed suffixes are kept, because `HBO.us@East` and `HBO.us@West` (or two local
+NBC stations) air different schedules. When a channel's own feed has no source,
+the tool skips it and lists it rather than give it another feed's times. The
+grabber only carries the network time-zone feeds for the big broadcast networks,
+so local affiliates (`NBC.us@WNYW`) are skipped by default; `--loose-feeds` gives
+them the network feed's schedule instead, which can be hours off.
 
 `load_epg` accepts a local path, a `file://` URI, or an HTTP(S) URL. Re-run the
 tool whenever the guide goes stale; `--days` controls how far ahead it fetches.
