@@ -7,12 +7,15 @@ single authoritative implementation.
 """
 
 import sys
+import os
 import re
 import gzip
 import zlib
 import lzma
+import shutil
 import xml.etree.ElementTree as ET
 from io import BytesIO
+from urllib.parse import urlparse, unquote
 import json
 import subprocess
 import hashlib
@@ -41,16 +44,92 @@ EpgData = Dict[str, List[Dict[str, Any]]]
 ShowResult = Dict[str, Any]
 
 # ---------------------------------------------------------------------------
-# Shared file-path constants (relative to CWD where the script is launched)
+# Runtime data directory
 # ---------------------------------------------------------------------------
-WATCH_HISTORY_FILE  = Path(".watch_history.json")
-SEARCH_HISTORY_FILE = Path(".search_history.json")
-FAVORITES_FILE      = Path(".favorites.json")
-CHANNEL_NOTES_FILE  = Path(".channel_notes.json")
-SCHEDULED_TASKS_FILE = Path(".scheduled_tasks.json")
-RECORDINGS_DIR      = Path.home() / "Videos" / "Recordings"
-EPG_CACHE_DIR       = Path(".epg_cache")
-M3U_CACHE_DIR       = Path(".m3u_cache")
+# Caches, logs and JSON state used to live next to the scripts. Anything inside
+# a cloud-synced checkout (Google Drive, OneDrive, Dropbox) then gets re-uploaded
+# every time the EPG cache is rewritten or a log line is appended, which keeps
+# the sync client permanently busy. Runtime data therefore lives in a per-user
+# cache directory *outside* the source tree. Point TERM_TV_DATA_DIR somewhere
+# else (including a local path) to override it.
+def _default_data_dir() -> Path:
+    env = os.environ.get("TERM_TV_DATA_DIR", "").strip()
+    if env:
+        return Path(env).expanduser()
+    if platform.system() == "Windows":
+        base = os.environ.get("LOCALAPPDATA", "").strip() or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "Term-TV"
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    return (Path(xdg) if xdg else Path.home() / ".cache") / "term-tv"
+
+
+DATA_DIR = _default_data_dir()
+
+WATCH_HISTORY_FILE   = DATA_DIR / ".watch_history.json"
+SEARCH_HISTORY_FILE  = DATA_DIR / ".search_history.json"
+FAVORITES_FILE       = DATA_DIR / ".favorites.json"
+CHANNEL_NOTES_FILE   = DATA_DIR / ".channel_notes.json"
+SCHEDULED_TASKS_FILE = DATA_DIR / ".scheduled_tasks.json"
+RECORDINGS_DIR       = Path.home() / "Videos" / "Recordings"
+EPG_CACHE_DIR        = DATA_DIR / ".epg_cache"
+M3U_CACHE_DIR        = DATA_DIR / ".m3u_cache"
+
+# Files and directories older versions created in the source tree. Moved into
+# DATA_DIR once, on the first run after upgrading.
+_LEGACY_FILE_NAMES = (
+    ".watch_history.json", ".search_history.json", ".favorites.json",
+    ".channel_notes.json", ".scheduled_tasks.json", ".active_recordings.json",
+    ".web_tasks.json", "term-tv.log", "term-tv-web.log", "mpv-output.log",
+    "recordings.log", "openvpn.log",
+)
+_LEGACY_DIR_NAMES = (".epg_cache", ".m3u_cache", "mpv-log-archive")
+
+
+_migration_notes: List[Tuple[int, str]] = []
+
+
+def _migration_note(level: int, msg: str):
+    _migration_notes.append((level, msg))
+
+
+def log_migration_notes():
+    """Log what migrate_legacy_data() did. Call once logging is set up."""
+    for level, msg in _migration_notes:
+        logging.log(level, msg)
+    _migration_notes.clear()
+
+
+def migrate_legacy_data():
+    """Move runtime files/dirs left in the source tree by older versions to DATA_DIR.
+
+    Call this *before* opening log files: if the new log path doesn't exist yet,
+    the old in-repo log is moved over instead of being left behind (and then
+    silently duplicated). Because logging isn't configured yet at that point,
+    what happened is kept and written by log_migration_notes() afterwards.
+    """
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        _migration_note(logging.WARNING, f"Could not create data directory {DATA_DIR}: {e}")
+        return
+    for name in _LEGACY_FILE_NAMES:
+        old, new = Path(name), DATA_DIR / name
+        if not old.is_file() or new.exists():
+            continue
+        try:
+            shutil.move(str(old), str(new))
+            _migration_note(logging.INFO, f"Runtime data: moved {name} -> {new}")
+        except Exception as e:
+            _migration_note(logging.WARNING, f"Could not move legacy file {name}: {e}")
+    for name in _LEGACY_DIR_NAMES:
+        old, new = Path(name), DATA_DIR / name
+        if not old.is_dir() or new.exists():
+            continue
+        try:
+            shutil.move(str(old), str(new))
+            _migration_note(logging.INFO, f"Runtime data: moved {name}/ -> {new}")
+        except Exception as e:
+            _migration_note(logging.WARNING, f"Could not move legacy directory {name}: {e}")
 
 # ---------------------------------------------------------------------------
 # Config validation
@@ -62,9 +141,16 @@ def validate_playlists(playlists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     A playlist dict needs at least "name" and "m3u_url" — everything downstream
     indexes these directly, so a malformed entry would otherwise crash with a
     raw KeyError instead of the friendly config errors used elsewhere.
+
+    Entries carrying ``"disabled": true`` are skipped silently (logged at INFO)
+    so a source that is temporarily offline can be parked in config.json with
+    its URLs intact rather than deleted and retyped later.
     """
     valid = []
     for i, pl in enumerate(playlists, 1):
+        if pl.get("disabled"):
+            logging.info(f"Skipping disabled playlist #{i}: {pl.get('name', '(unnamed)')}")
+            continue
         missing = [k for k in ("name", "m3u_url") if not pl.get(k)]
         if missing:
             msg = f"Skipping playlist #{i} in config.json — missing required key(s): {', '.join(missing)}"
@@ -78,6 +164,28 @@ def validate_playlists(playlists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Cache helpers
 # ---------------------------------------------------------------------------
+
+def _touch_cache_file(cache_file: Path):
+    """Refresh a cache file's mtime to mark it as still in use.
+
+    clean_old_cache_files() ages cached data by mtime, so anything that proves
+    a cache is still good has to count as "used":
+
+      - a 304 "Not Modified" means the server confirmed the cached copy is
+        current even though nothing was downloaded, and
+      - reading the cache as a network-error fallback means it is the only
+        working copy while the source is unreachable.
+
+    Without this, a perfectly valid cache was deleted 15 days after the last
+    *download* — e.g. a playlist whose ETag never changes, or (the case this
+    was written for) a source that went offline while its cached playlist was
+    still the only way to start the app at all.
+    """
+    try:
+        cache_file.touch()
+    except Exception as e:
+        logging.debug(f"Could not refresh cache mtime for {cache_file}: {e}")
+
 
 def clean_old_cache_files(max_age_days: int = 15):
     """Remove cached files older than max_age_days from EPG/M3U cache dirs."""
@@ -369,6 +477,7 @@ def load_m3u_cached(url: str) -> List[Channel]:
             print("✓ M3U is up to date (using cached version)")
             if cache_file.exists():
                 content = cache_file.read_text(encoding="utf-8")
+                _touch_cache_file(cache_file)
             else:
                 r = requests.get(url, timeout=15)
                 r.raise_for_status()
@@ -392,6 +501,7 @@ def load_m3u_cached(url: str) -> List[Channel]:
             print(f"Warning: Network error, using cached M3U. {e}", file=sys.stderr)
             try:
                 content = cache_file.read_text(encoding="utf-8")
+                _touch_cache_file(cache_file)
             except Exception as ce:
                 print(f"Error: Failed to load cached M3U. {ce}", file=sys.stderr)
                 return []
@@ -410,13 +520,41 @@ def load_m3u_cached(url: str) -> List[Channel]:
 # EPG loading  (robust: iterparse + zlib fallback + tuple timeout)
 # ---------------------------------------------------------------------------
 
-def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
-    """
-    Download and parse an XMLTV EPG with caching.
-    Uses iterparse to recover data from truncated XML and zlib for lenient
-    gzip decompression (tolerates missing gzip footer from misconfigured servers).
+# Warn when a guide's listings end within this many hours (see load_epg).
+EPG_STALE_WARN_HOURS = 3
 
-    lookback_hours: keep programmes that ended up to this many hours ago (0 = discard all past).
+
+def _local_source_path(source: str) -> Optional[Path]:
+    """Return a local Path when *source* names a file, else None.
+
+    Accepts absolute/relative paths and file:// URLs. Anything carrying another
+    URL scheme is left for requests (and the download cache) to handle.
+    """
+    if not source:
+        return None
+    src = source.strip()
+    if src.lower().startswith("file://"):
+        parsed = urlparse(src)
+        path = unquote(parsed.path)  # "%20" -> " "
+        host = parsed.netloc
+        if host and host.lower() != "localhost":
+            if len(host) == 2 and host[1] == ":":
+                path = host + path                  # file://C:/guide.xml (non-standard but common)
+            else:
+                path = f"//{host}{path}"            # file://server/share/guide.xml -> UNC
+        elif len(path) > 2 and path[0] == "/" and path[2] == ":":
+            path = path[1:]                         # file:///C:/... -> C:/...
+        return Path(path).expanduser()
+    if "://" in src:
+        return None
+    return Path(src).expanduser()
+
+
+def _download_epg(url: str) -> Tuple[Optional[bytes], Optional[Path], Optional[Path]]:
+    """Fetch *url* with ETag/Last-Modified caching.
+
+    Returns (content, cache_file, metadata_file); content is None when nothing
+    could be fetched and no cache exists.
     """
     EPG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     url_hash = hashlib.md5(url.encode()).hexdigest()
@@ -444,6 +582,7 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
             print("✓ EPG is up to date (using cached version)")
             if cache_file.exists():
                 content = cache_file.read_bytes()
+                _touch_cache_file(cache_file)
             else:
                 print("Cache file missing, downloading fresh copy...")
                 r = requests.get(url, timeout=(10, 120))
@@ -484,15 +623,43 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
             print(f"Warning: Network error, using cached EPG. {e}", file=sys.stderr)
             try:
                 content = cache_file.read_bytes()
+                _touch_cache_file(cache_file)
             except Exception as ce:
                 print(f"Error: Failed to load cached EPG. {ce}", file=sys.stderr)
-                return {}
+                return None, cache_file, metadata_file
         else:
             print(f"Warning: Failed to download EPG, no cache available. {e}", file=sys.stderr)
-            return {}
+            return None, cache_file, metadata_file
 
-    if content is None:
-        return {}
+    return content, cache_file, metadata_file
+
+
+def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
+    """
+    Load and parse an XMLTV EPG, either from an HTTP(S) URL (with caching) or
+    from a local file/`file://` path — handy for a self-hosted guide, which
+    never leaves the machine and therefore needs no cache or network round-trip.
+    Uses iterparse to recover data from truncated XML and zlib for lenient
+    gzip decompression (tolerates missing gzip footer from misconfigured servers).
+
+    lookback_hours: keep programmes that ended up to this many hours ago (0 = discard all past).
+    """
+    local_path = _local_source_path(url)
+    if local_path is not None:
+        if not local_path.is_file():
+            print(f"Error: EPG file not found: {local_path}", file=sys.stderr)
+            return {}
+        print(f"Reading EPG from {local_path}...")
+        try:
+            content: Optional[bytes] = local_path.read_bytes()
+        except Exception as e:
+            print(f"Error: Could not read EPG file {local_path}: {e}", file=sys.stderr)
+            return {}
+        cache_file = metadata_file = None
+    else:
+        content, cache_file, metadata_file = _download_epg(url)
+        if content is None:
+            return {}
 
     # Decompress
     if content.startswith(b"\x1f\x8b"):
@@ -516,13 +683,18 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
         logging.warning(f"EPG XML truncated; recovered {recovered} elements")
 
     if recovered == 0:
-        # Delete corrupted cache and bail
+        # Delete a corrupted downloaded cache and bail; local files are left alone
         for f in (cache_file, metadata_file):
+            if f is None:
+                continue
             try:
                 f.unlink(missing_ok=True)
             except Exception:
                 pass
-        print("Warning: EPG contained no parseable data. Cache cleared.", file=sys.stderr)
+        if cache_file is not None:
+            print("Warning: EPG contained no parseable data. Cache cleared.", file=sys.stderr)
+        else:
+            print(f"Warning: EPG contained no parseable data: {local_path}", file=sys.stderr)
         return {}
 
     epg: EpgData = {}
@@ -530,6 +702,12 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
     cutoff = now - timedelta(hours=lookback_hours)
     total = filtered = 0
 
+    # Programmes are always stored under the channel id exactly as the guide
+    # gives it ("HBO.us@East", "HBO.us@West", "CNN.us@HD"). The "@feed" part
+    # can be a picture quality, a time zone or a local station, and only the
+    # first is safe to ignore: collapsing them all onto the bare id gave a
+    # West-coast channel the East schedule, and every local NBC affiliate the
+    # same one. Bare-id lookups are handled by the aliases added below.
     for prog in root.findall("programme"):
         total += 1
         channel_id = prog.get("channel")
@@ -561,13 +739,82 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
             "air_date":    _text("date"),
         })
 
+    # Sort each channel's programmes by start time. Undated entries sort last
+    # via a (is_undated, start_time) tuple key rather than a datetime.max
+    # sentinel: datetime.max.astimezone() raises OSError on Windows (and
+    # OverflowError in zones where the conversion crosses the year-9999
+    # boundary), so a single programme with a malformed or missing start=
+    # attribute used to abort the entire EPG load.
+    _undated_fallback = datetime.now().astimezone()
     for channel_id in epg:
         epg[channel_id].sort(
-            key=lambda x: x["start_time"] if x["start_time"] else datetime.max.astimezone()
+            key=lambda x: (x["start_time"] is None, x["start_time"] or _undated_fallback)
         )
+
+    # Aliases, so a playlist id that differs from the guide's only in ways
+    # that don't change the schedule still matches (see epg_key_for):
+    #   1. each id's canonical form ("CNN.us@SD" -> "CNN.us",
+    #      "HBO.us@WestHD" -> "HBO.us@west"), and
+    #   2. the bare id, when the guide has no bare or quality-only entry for
+    #      it, pointing at the East feed if there is one, else the first
+    #      other time-zone feed. A bare playlist id says nothing about the
+    #      feed, so a network feed is the conventional default. It is never
+    #      pointed at a local station ("NBC.us@WNYW"): that is one city's
+    #      schedule, the same wrong-listings case epg_key_for refuses.
+    # An alias shares the variant's list; anything iterating the whole guide
+    # must go through channels_for_epg_key() so those programmes aren't
+    # reported twice.
+    raw_ids = list(epg)
+    aliases = 0
+    for channel_id in raw_ids:
+        canonical_id = canonical_tvg_id(channel_id)
+        if canonical_id and canonical_id not in epg:
+            epg[canonical_id] = epg[channel_id]
+            aliases += 1
+    station_only = set()
+    for prefer_east in (True, False):
+        for channel_id in raw_ids:
+            base_id = normalize_tvg_id(channel_id).strip()
+            if not base_id or base_id in epg:
+                continue
+            region = feed_region(channel_id)
+            if region not in _FEED_REGION_WORDS:
+                station_only.add(base_id)
+                continue
+            if prefer_east and region != "east":
+                continue
+            epg[base_id] = epg[channel_id]
+            aliases += 1
+    station_only -= set(epg)
+    if station_only:
+        logging.info(f"{len(station_only)} bare EPG channel id(s) left without listings: "
+                     "the guide only has local-station feeds for them")
+    if aliases:
+        logging.info(f"Added {aliases} EPG channel id alias(es) for feed-suffixed ids")
 
     if total > 0:
         print(f"Processed {total} programs ({filtered} past, {total - filtered} current/upcoming)")
+
+    # A guide that has run out looks exactly like a channel with no listings,
+    # so say so. This matters most for a self-hosted guide file, which only
+    # covers the days it was generated for and is never refreshed on its own.
+    if total > 0:
+        ends = [p["stop_time"] or p["start_time"] for progs in epg.values() for p in progs
+                if p["stop_time"] or p["start_time"]]
+        latest = max(ends) if ends else None
+        hours_left = (latest - now).total_seconds() / 3600 if latest else 0
+        if hours_left < EPG_STALE_WARN_HOURS:
+            state = ("has no current or upcoming programmes" if hours_left <= 0
+                     else f"runs out in about {max(1, round(hours_left))} hour(s)")
+            hint = (" Regenerate it with: python tools/update_epg.py"
+                    if local_path is not None else "")
+            msg = f"EPG {state}: {local_path if local_path is not None else url}.{hint}"
+            # One path only: the apps' console handler already shows WARNING
+            # and above, so also printing put the line on screen twice.
+            if logging.getLogger().handlers:
+                logging.warning(msg)
+            else:
+                print(f"Warning: {msg}", file=sys.stderr)
 
     return epg
 
@@ -606,6 +853,98 @@ def is_new_episode(air_date: str, days_threshold: int = 7) -> bool:
         return 0 <= days_diff <= days_threshold
     except ValueError:
         return False
+
+
+def normalize_tvg_id(tvg_id: str) -> str:
+    """Return *tvg_id* without an XMLTV feed suffix ("CNN.us@SD" -> "CNN.us").
+
+    iptv-org-style guides append a feed suffix ("@SD", "@HD", "@East", ...) to
+    the channel id while playlists reference the bare id. Stripping everything
+    from the first "@" makes those match; ids without a suffix are unchanged.
+    """
+    if not tvg_id:
+        return tvg_id
+    return tvg_id.split("@", 1)[0]
+
+
+_FEED_REGION_WORDS = {"east", "west", "pacific", "mountain", "central", "atlantic", "eastern", "western"}
+_FEED_QUALITY_RE = re.compile(r"(sd|hd|fhd|uhd|4k)$", re.IGNORECASE)
+
+
+def feed_region(tvg_id: str) -> str:
+    """The part of an id's "@feed" suffix that changes the schedule.
+
+    "@SD"/"@HD" are the same programmes at a different picture quality, so
+    they (and no suffix at all) give "". "@East"/"@WestHD" give "east"/"west",
+    and anything else (a local station such as "@WNYW") is returned whole,
+    lower-cased. Two ids for one channel share a schedule only when this
+    matches.
+    """
+    feed = tvg_id.split("@", 1)[1].strip().lower() if tvg_id and "@" in tvg_id else ""
+    stripped = _FEED_QUALITY_RE.sub("", feed)
+    if stripped == "" or stripped in _FEED_REGION_WORDS:
+        return stripped
+    return feed
+
+
+def canonical_tvg_id(tvg_id: str) -> str:
+    """*tvg_id* with only the schedule-relevant part of its feed suffix.
+
+    "CNN.us@HD" -> "CNN.us", "HBO.us@WestHD" -> "HBO.us@west". Ids that give
+    the same result here can share a guide entry; ids that don't, can't.
+    """
+    if not tvg_id:
+        return tvg_id
+    region = feed_region(tvg_id)
+    base_id = normalize_tvg_id(tvg_id).strip()
+    return f"{base_id}@{region}" if region else base_id
+
+
+def epg_key_for(epg: EpgData, tvg_id: str) -> Optional[str]:
+    """The key in *epg* that holds the schedule for a channel's *tvg_id*.
+
+    The exact id wins. Otherwise the canonical id is tried, which load_epg()
+    aliases to a variant with the same schedule ("CNN.us@HD" finds
+    "CNN.us@SD", "HBO.us@WestHD" finds "HBO.us@West"). There is deliberately
+    no further fallback: "HBO.us@West" must not get the East schedule just
+    because the guide has no West feed. No listings beat wrong ones.
+    """
+    if not tvg_id or not epg:
+        return None
+    if tvg_id in epg:
+        return tvg_id
+    canonical_id = canonical_tvg_id(tvg_id)
+    if canonical_id in epg:
+        return canonical_id
+    return None
+
+
+def epg_channel_count(epg: EpgData) -> int:
+    """Number of real channels in *epg*.
+
+    len(epg) also counts load_epg()'s aliases, which share another id's
+    programme list, so count distinct lists instead.
+    """
+    return len({id(progs) for progs in epg.values()})
+
+
+def epg_programmes(epg: EpgData, tvg_id: str) -> List[Dict[str, Any]]:
+    """Programme list for *tvg_id* (see epg_key_for for the matching rules)."""
+    key = epg_key_for(epg, tvg_id)
+    return epg[key] if key is not None else []
+
+
+def channels_for_epg_key(epg: EpgData, tvg_map: Dict[str, List[Channel]], channel_id: str) -> List[Channel]:
+    """Channels whose schedule is *channel_id* when iterating the whole guide.
+
+    *tvg_map* indexes a channel under both its full and its canonical id,
+    and the guide can hold the same programmes under a variant and its
+    aliases, so a plain tvg_map[channel_id] would list some channels under
+    two keys. Keeping only the channels that resolve to exactly this key
+    reports each one once, against the right schedule.
+    """
+    return [ch for ch in tvg_map.get(channel_id, ())
+            if epg_key_for(epg, ch.get("tvg-id", "")) == channel_id]
 
 # ---------------------------------------------------------------------------
 # Search
@@ -646,8 +985,15 @@ def _build_tvg_map(channels: List[Channel]) -> Dict[str, List[Channel]]:
             tvg_map: Dict[str, List[Channel]] = defaultdict(list)
             for ch in channels:
                 tvg_id = ch.get("tvg-id")
-                if tvg_id:
-                    tvg_map[tvg_id].append(ch)
+                if not tvg_id:
+                    continue
+                tvg_map[tvg_id].append(ch)
+                # Also index the canonical id, which is the key a channel
+                # resolves to when the guide lacks its exact id ("CNN.us@HD"
+                # -> "CNN.us"); see epg_key_for / channels_for_epg_key.
+                canonical_id = canonical_tvg_id(tvg_id)
+                if canonical_id != tvg_id:
+                    tvg_map[canonical_id].append(ch)
             _tvg_map_cached_key = channels
             _tvg_map_cached_result = tvg_map
         return _tvg_map_cached_result
@@ -682,7 +1028,8 @@ def search_shows_in_timeframe(
     results: List[ShowResult] = []
 
     for channel_id, programs in epg.items():
-        if channel_id not in tvg_map:
+        matched_channels = channels_for_epg_key(epg, tvg_map, channel_id)
+        if not matched_channels:
             continue
         for prog in programs:
             title = prog.get("title", "")
@@ -698,7 +1045,7 @@ def search_shows_in_timeframe(
                 continue
             minutes_until = int((start_time - now).total_seconds() / 60)
             air_date = prog.get("air_date", "")
-            for ch in tvg_map[channel_id]:
+            for ch in matched_channels:
                 if groups and not ch_in_group(ch, groups):
                     continue
                 results.append({
@@ -748,7 +1095,8 @@ def find_alternative_streams(
     alternatives: List[ShowResult] = []
 
     for channel_id, programs in epg.items():
-        if channel_id not in tvg_map:
+        matched_channels = channels_for_epg_key(epg, tvg_map, channel_id)
+        if not matched_channels:
             continue
         for prog in programs:
             title          = prog.get("title", "")
@@ -768,7 +1116,7 @@ def find_alternative_streams(
             if not (is_playing_now or now <= start_time):
                 continue
             minutes_until = int((start_time - now).total_seconds() / 60)
-            for ch in tvg_map[channel_id]:
+            for ch in matched_channels:
                 if exclude_url and ch.get("url", "") == exclude_url:
                     continue
                 alternatives.append({
@@ -807,7 +1155,8 @@ def find_future_reruns(
     reruns: List[ShowResult] = []
 
     for channel_id, programs in epg.items():
-        if channel_id not in tvg_map:
+        matched_channels = channels_for_epg_key(epg, tvg_map, channel_id)
+        if not matched_channels:
             continue
         for prog in programs:
             title      = prog.get("title", "")
@@ -824,7 +1173,7 @@ def find_future_reruns(
             if not (now < start_time <= cutoff):
                 continue
             minutes_until = int((start_time - now).total_seconds() / 60)
-            for ch in tvg_map[channel_id]:
+            for ch in matched_channels:
                 reruns.append({
                     "channel":      ch,
                     "title":        title,
@@ -1378,9 +1727,9 @@ def get_frequent_channels(channels: List[Channel], epg: EpgData) -> List[Dict[st
         if not ch:
             continue
         current_show = None
-        if tvg_id in epg:
+        if tvg_id:
             now = datetime.now().astimezone()
-            for prog in epg[tvg_id]:
+            for prog in epg_programmes(epg, tvg_id):
                 st = prog.get("start_time")
                 et = prog.get("stop_time")
                 if st and et and st <= now < et:
@@ -1471,15 +1820,24 @@ def display_search_history_now_playing(now_playing: List[Dict[str, Any]], start_
 # ---------------------------------------------------------------------------
 
 def load_favorites() -> List[Dict[str, str]]:
-    """Return the saved favorites list."""
+    """Return the saved favorites list.
+
+    Tolerates a corrupt/hand-edited file: callers iterate the result and call
+    .get() on each entry, so anything that is not a list of dicts has to be
+    rejected here instead of raising AttributeError deep in the menu loop.
+    """
     if not FAVORITES_FILE.exists():
         return []
     try:
         with open(FAVORITES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except Exception as e:
         logging.warning(f"Failed to load favorites: {e}")
         return []
+    if not isinstance(data, list):
+        logging.warning(f"Favorites file is not a list (got {type(data).__name__}); ignoring it")
+        return []
+    return [fav for fav in data if isinstance(fav, dict)]
 
 
 def save_favorites(favs: List[Dict[str, str]]):
@@ -1532,13 +1890,12 @@ def get_favorite_channels(channels: List[Channel], epg: EpgData) -> List[Dict[st
         if not ch:
             continue
         current_show = None
-        if tvg_id and tvg_id in epg:
-            for prog in epg[tvg_id]:
-                st = prog.get("start_time")
-                et = prog.get("stop_time")
-                if st and et and st <= now < et:
-                    current_show = prog
-                    break
+        for prog in epg_programmes(epg, tvg_id):
+            st = prog.get("start_time")
+            et = prog.get("stop_time")
+            if st and et and st <= now < et:
+                current_show = prog
+                break
         result.append({"channel": ch, "current_show": current_show})
     return result
 
@@ -1595,12 +1952,13 @@ def get_channel_groups(channels: List[Channel]) -> List[tuple]:
 
 def get_channel_schedule(epg: EpgData, tvg_id: str, upcoming: int = 3) -> List[Dict[str, Any]]:
     """Return the current programme and the next *upcoming* programmes for a tvg-id."""
-    if not tvg_id or tvg_id not in epg:
+    progs = epg_programmes(epg, tvg_id)
+    if not progs:
         return []
     now = datetime.now().astimezone()
     cutoff = now + timedelta(hours=12)
     items: List[Dict[str, Any]] = []
-    for prog in epg[tvg_id]:
+    for prog in progs:
         st = prog.get("start_time")
         et = prog.get("stop_time")
         if not st:
@@ -1633,15 +1991,19 @@ def send_desktop_notification(title: str, message: str):
 # ---------------------------------------------------------------------------
 
 def load_channel_notes() -> Dict[str, str]:
-    """Return saved channel notes as {key: note_text}."""
+    """Return saved channel notes as {key: note_text} (non-dict files are ignored)."""
     if not CHANNEL_NOTES_FILE.exists():
         return {}
     try:
         with open(CHANNEL_NOTES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except Exception as e:
         logging.warning(f"Failed to load channel notes: {e}")
         return {}
+    if not isinstance(data, dict):
+        logging.warning(f"Channel notes file is not an object (got {type(data).__name__}); ignoring it")
+        return {}
+    return {str(k): str(v) for k, v in data.items()}
 
 
 def _channel_note_key(channel: Channel) -> str:
@@ -1791,7 +2153,11 @@ def extract_subtitles_from_recording(mkv_path: Path) -> List[Path]:
             srt_path = mkv_path.parent / fname
             print(f"[SUBTITLE EXTRACTION] Extracting stream {stream_index} ({language}) -> {fname}")
             result = subprocess.run(
-                ["ffmpeg", "-i", str(mkv_path), "-map", f"0:{stream_index}", "-c:s", "srt", str(srt_path)],
+                # -nostdin keeps ffmpeg from reading the terminal (it inherits
+                # stdin, so a prompt here would swallow the next menu keystroke);
+                # -y overwrites a previous extraction instead of prompting.
+                ["ffmpeg", "-nostdin", "-y", "-i", str(mkv_path),
+                 "-map", f"0:{stream_index}", "-c:s", "srt", str(srt_path)],
                 capture_output=True, text=True, check=False,
             )
             if result.returncode == 0:

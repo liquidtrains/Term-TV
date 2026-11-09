@@ -81,15 +81,17 @@ from lib.term_tv_core import (
 
 # --- Constants ---
 CONFIG_FILE = Path("config.json")
-LOG_FILE = Path("term-tv.log")
-MPV_LOG_FILE = Path("mpv-output.log")
-RECORDINGS_LOG_FILE = Path("recordings.log")
-MPV_LOG_ARCHIVE_DIR = Path("mpv-log-archive")
+LOG_FILE = _core.DATA_DIR / "term-tv.log"
+MPV_LOG_FILE = _core.DATA_DIR / "mpv-output.log"
+RECORDINGS_LOG_FILE = _core.DATA_DIR / "recordings.log"
+MPV_LOG_ARCHIVE_DIR = _core.DATA_DIR / "mpv-log-archive"
 MPV_LOG_CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB per chunk
 
 # --- Logging Configuration ---
 def setup_logging():
     """Configure logging to both file and console with detailed formatting."""
+    # Runtime data lives outside the source tree (see lib.term_tv_core.DATA_DIR)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     # Create formatter with detailed information
     log_format = '%(asctime)s - [%(levelname)s] - %(funcName)s:%(lineno)d - %(message)s'
     date_format = '%Y-%m-%d %H:%M:%S'
@@ -319,6 +321,21 @@ def _is_already_scheduled(show_title: str, channel_name: str, task_type: Optiona
             and (task_type is None or t.get("type") == task_type)
             for t in SCHEDULED_TASKS
         )
+
+
+def _seconds_until_start(start_time: Optional[datetime], fallback_minutes: int = 0) -> int:
+    """Seconds from now until *start_time* (never negative).
+
+    Scheduled playback/recording used to compute their delay as
+    ``minutes_until * 60``. minutes_until is ``int(...)`` of a minute count, so
+    that floors to whole minutes and fires up to 59 seconds early — playback
+    could open on the tail of the previous programme and a recording started
+    before its show did. Deriving the wait from the real start time fixes both;
+    fallback_minutes is only used when the EPG gave no start time.
+    """
+    if not start_time:
+        return max(0, fallback_minutes) * 60
+    return max(0, int((start_time - datetime.now().astimezone()).total_seconds()))
 
 
 def _persist_tasks():
@@ -760,9 +777,13 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         stop_time = show_result.get("stop_time")
         episode_num = show_result.get("episode_num", "")
 
+        # Default the length cap to the programme's own duration, matching the
+        # web UI's auto-stop at programme end. "Unlimited" used to be the
+        # default, so a 30-minute show recorded the channel until the user quit.
+        programme_minutes = 0
         if start_time and stop_time:
-            duration_minutes = int((stop_time - start_time).total_seconds() / 60)
-            print(f"\nShow duration: {duration_minutes} minutes")
+            programme_minutes = max(1, int((stop_time - start_time).total_seconds() // 60))
+            print(f"\nShow duration: {programme_minutes} minutes")
             print(f"Starts in: {minutes_until} minutes")
 
         # Generate filename
@@ -772,8 +793,13 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         output_path = RECORDINGS_DIR / filename
 
         print(f"\nRecording will be saved to: {output_path}")
-        duration_cap_input = input("Duration in minutes (Enter for unlimited): ").strip()
-        rec_duration_seconds = int(duration_cap_input) * 60 if duration_cap_input and duration_cap_input.isdigit() else 0
+        dur_hint = (f"Enter for {programme_minutes} (programme length)"
+                    if programme_minutes else "Enter for unlimited")
+        duration_cap_input = input(f"Duration in minutes ({dur_hint}): ").strip()
+        if duration_cap_input and duration_cap_input.isdigit():
+            rec_duration_seconds = int(duration_cap_input) * 60
+        else:
+            rec_duration_seconds = programme_minutes * 60
         confirm = input("Schedule this recording? (y/n): ").strip().lower()
 
         if confirm != 'y':
@@ -786,7 +812,7 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
                 return
 
         # Start background thread for scheduled recording
-        delay_seconds = minutes_until * 60
+        delay_seconds = _seconds_until_start(start_time, minutes_until)
 
         # Generate unique task ID
         task_id = int(time.time() * 1000)  # Millisecond timestamp
@@ -851,9 +877,24 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
         mpv_args.append("--sid=auto")  # Auto-select subtitles at start
         mpv_args.append("--no-sub-visibility")  # Start with subs hidden (toggle with 'v')
 
-        duration_cap = input("Duration in minutes (Enter for unlimited): ").strip()
-        if duration_cap and duration_cap.isdigit():
-            mpv_args.append(f"--length={int(duration_cap) * 60}")
+        # Default to what is left of the programme being recorded, matching
+        # scheduled recordings (programme length) and the web UI (auto-stop at
+        # programme end). Without a known end time the default stays unlimited.
+        remaining_minutes = 0
+        _stop_time = show_result.get("stop_time") if show_result else None
+        if _stop_time:
+            _left = (_stop_time - datetime.now().astimezone()).total_seconds()
+            if _left > 0:
+                remaining_minutes = max(1, int(-(-_left // 60)))
+        dur_hint = (f"Enter for {remaining_minutes} (rest of programme), 0 for unlimited"
+                    if remaining_minutes else "Enter for unlimited")
+        duration_cap = input(f"Duration in minutes ({dur_hint}): ").strip()
+        if duration_cap.isdigit():
+            record_minutes = int(duration_cap)
+        else:
+            record_minutes = remaining_minutes
+        if record_minutes > 0:
+            mpv_args.append(f"--length={record_minutes * 60}")
 
         print(f"\n📹 Recording to: {output_path}")
         print("⚠️  WARNING: Do NOT change subtitle tracks during recording or it will stop!")
@@ -1047,9 +1088,9 @@ def select_from_channel_list(results: List[Channel], epg: EpgData) -> Optional[C
         print(f"{i}. {channel_name} [{provider}]")
 
         # Show current program if available
-        if tvg_id and tvg_id in epg:
+        if tvg_id:
             now = datetime.now().astimezone()
-            for program in epg[tvg_id][:5]:
+            for program in _core.epg_programmes(epg, tvg_id)[:5]:
                 start_time = program.get("start_time")
                 stop_time = program.get("stop_time")
 
@@ -1096,7 +1137,11 @@ def main():
     args = parser.parse_args()
 
     # --- Logging Setup ---
+    # Move runtime files left in the repo by older versions out of the source
+    # tree before the log file is (re)opened.
+    _core.migrate_legacy_data()
     setup_logging()
+    _core.log_migration_notes()
     logging.info("Starting main application")
 
     # --- Register cleanup on exit ---
@@ -1198,8 +1243,8 @@ def main():
         logging.info(f"Loading EPG from {chosen_playlist['epg_url']}")
         epg = load_epg(chosen_playlist["epg_url"])
         if epg:
-            logging.info(f"Loaded EPG for {len(epg)} channels")
-            print(f"✓ Loaded EPG for {len(epg)} channels.")
+            logging.info(f"Loaded EPG for {_core.epg_channel_count(epg)} channels")
+            print(f"✓ Loaded EPG for {_core.epg_channel_count(epg)} channels.")
         else:
             logging.warning("EPG data unavailable")
             print("⚠ EPG unavailable - continuing without program guide data.")
@@ -1562,7 +1607,7 @@ def main():
                                 print("Loading EPG data...")
                                 epg = load_epg(chosen_playlist["epg_url"])
                                 if epg:
-                                    print(f"✓ Loaded EPG for {len(epg)} channels.")
+                                    print(f"✓ Loaded EPG for {_core.epg_channel_count(epg)} channels.")
                                 else:
                                     print("⚠ EPG unavailable.")
                             with DATA_LOCK:
@@ -1583,7 +1628,7 @@ def main():
                     epg_global = epg
                 if epg:
                     logging.info(f"EPG refreshed and global state updated")
-                    print(f"✓ Refreshed EPG for {len(epg)} channels.")
+                    print(f"✓ Refreshed EPG for {_core.epg_channel_count(epg)} channels.")
                 else:
                     print("⚠ EPG still unavailable.")
             else:
@@ -1660,14 +1705,17 @@ def main():
                 scheduled_count = 0
                 for _mr in chosen_result:
                     _mu = _mr.get("minutes_until", 0)
-                    if _mu <= 0:
+                    _st = _mr.get("start_time")
+                    # minutes_until is floored, so 0 covers both "already
+                    # started" and "starts in the next 59s". Only the former
+                    # should be skipped — schedule against the real start time.
+                    if _mr.get("is_playing_now") or (_st and _st <= datetime.now().astimezone()):
                         print(f"Skipped (already started): {_mr['title']}")
                         continue
                     _ch = _mr["channel"]
                     _title = _mr.get("title", "Unknown")
                     _ep = _mr.get("episode_num", "")
-                    _st = _mr.get("start_time")
-                    _delay = _mu * 60
+                    _delay = _seconds_until_start(_st, _mu)
                     if _is_already_scheduled(_title, _ch.get("name", "?"), "playback"):
                         print(f"Skipped (already scheduled): {_title}")
                         continue
@@ -1752,10 +1800,10 @@ def main():
                                 confirm = 'n'
 
                         if confirm == 'y':
-                            delay_seconds = minutes_until * 60
                             show_title = chosen_result.get("title", "Unknown")
                             episode_num = chosen_result.get("episode_num", "")
                             start_time = chosen_result.get("start_time")
+                            delay_seconds = _seconds_until_start(start_time, minutes_until)
 
                             # Generate unique task ID
                             task_id = int(time.time() * 1000)  # Millisecond timestamp
@@ -1799,12 +1847,22 @@ def main():
                         show_title = chosen_result.get("title", "Unknown")
                         episode_num = chosen_result.get("episode_num", "")
                         start_time = chosen_result.get("start_time")
+                        stop_time = chosen_result.get("stop_time")
+                        programme_minutes = (
+                            max(1, int((stop_time - start_time).total_seconds() // 60))
+                            if start_time and stop_time else 0
+                        )
                         filename = get_safe_filename(channel_name, show_title)
                         output_path = RECORDINGS_DIR / filename
 
                         print(f"\nRecording will be saved to: {output_path}")
-                        future_dur_input = input("Duration in minutes (Enter for unlimited): ").strip()
-                        future_rec_duration = int(future_dur_input) * 60 if future_dur_input and future_dur_input.isdigit() else 0
+                        dur_hint = (f"Enter for {programme_minutes} (programme length)"
+                                    if programme_minutes else "Enter for unlimited")
+                        future_dur_input = input(f"Duration in minutes ({dur_hint}): ").strip()
+                        if future_dur_input and future_dur_input.isdigit():
+                            future_rec_duration = int(future_dur_input) * 60
+                        else:
+                            future_rec_duration = programme_minutes * 60
                         confirm = input("Schedule this recording? (y/n): ").strip().lower()
 
                         if confirm == 'y' and _is_already_scheduled(show_title, channel_name, "recording"):
@@ -1813,7 +1871,7 @@ def main():
                                 confirm = 'n'
 
                         if confirm == 'y':
-                            delay_seconds = minutes_until * 60
+                            delay_seconds = _seconds_until_start(start_time, minutes_until)
 
                             # Generate unique task ID
                             task_id = int(time.time() * 1000)  # Millisecond timestamp

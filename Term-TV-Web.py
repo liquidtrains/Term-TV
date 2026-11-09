@@ -59,6 +59,7 @@ from collections import defaultdict
 
 import requests
 from flask import Flask, jsonify, request, Response
+import lib.term_tv_core as _core
 from lib.term_tv_core import (
     parse_epg_time, get_safe_filename, MPV_RESILIENCE_ARGS, MpvStallWatchdog,
     MPV_STALL_RETRY_RESET_SECONDS,
@@ -70,20 +71,25 @@ from lib.term_tv_core import (
     is_new_episode as _core_is_new_episode,
     ch_in_group as _core_ch_in_group,
     send_desktop_notification,
+    clean_old_cache_files,
     load_favorites as _core_load_favorites,
     toggle_favorite as _core_toggle_favorite,
     get_channel_note as _core_get_channel_note,
     set_channel_note as _core_set_channel_note,
+    validate_playlists,
+    canonical_tvg_id,
+    epg_programmes,
+    channels_for_epg_key,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 CONFIG_FILE         = Path("config.json")
-WATCH_HISTORY_FILE  = Path(".watch_history.json")
-EPG_CACHE_DIR       = Path(".epg_cache")
-M3U_CACHE_DIR       = Path(".m3u_cache")
-LOG_FILE            = Path("term-tv-web.log")
-MPV_LOG_FILE        = Path("mpv-output.log")
-MPV_LOG_ARCHIVE_DIR = Path("mpv-log-archive")
+WATCH_HISTORY_FILE  = _core.DATA_DIR / ".watch_history.json"
+EPG_CACHE_DIR       = _core.DATA_DIR / ".epg_cache"
+M3U_CACHE_DIR       = _core.DATA_DIR / ".m3u_cache"
+LOG_FILE            = _core.DATA_DIR / "term-tv-web.log"
+MPV_LOG_FILE        = _core.DATA_DIR / "mpv-output.log"
+MPV_LOG_ARCHIVE_DIR = _core.DATA_DIR / "mpv-log-archive"
 MPV_LOG_CHUNK_SIZE  = 5 * 1024 * 1024  # 5 MB
 RECORDINGS_DIR      = Path.home() / "Videos" / "Recordings"
 
@@ -100,6 +106,8 @@ WEB_URL  = f"http://{WEB_HOST}:{WEB_PORT}"
 # ── Logging ───────────────────────────────────────────────────────────────────
 def setup_logging():
     fmt = "%(asctime)s [%(levelname)s] %(funcName)s:%(lineno)d  %(message)s"
+    # Runtime data lives outside the source tree (see lib.term_tv_core.DATA_DIR)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.DEBUG,
         format=fmt,
@@ -211,10 +219,17 @@ def search_shows_web(query: str, hours_ahead: int = 24, groups: Optional[set] = 
         tid = ch.get("tvg-id")
         if tid:
             tvg_to_channels[tid].append(ch)
+            # Also index the canonical id, which is the guide key this
+            # channel resolves to when its exact id is missing ("CNN.us@HD"
+            # -> "CNN.us"); channels_for_epg_key() below picks which applies.
+            canonical = canonical_tvg_id(tid)
+            if canonical != tid:
+                tvg_to_channels[canonical].append(ch)
 
     results: List[Dict] = []
     for channel_id, programs in epg.items():
-        if channel_id not in tvg_to_channels:
+        matched_channels = channels_for_epg_key(epg, tvg_to_channels, channel_id)
+        if not matched_channels:
             continue
         for prog in programs:
             title = prog.get("title", "")
@@ -242,7 +257,7 @@ def search_shows_web(query: str, hours_ahead: int = 24, groups: Optional[set] = 
             dur_min = max(1, int((stop_time - start_time).total_seconds() / 60)) if stop_time else 0
 
             new_ep = is_new_episode(prog)
-            for ch in tvg_to_channels[channel_id]:
+            for ch in matched_channels:
                 results.append({
                     "channel_name":  ch.get("name", ""),
                     "channel_url":   ch.get("url", ""),
@@ -628,7 +643,7 @@ def mpv_status() -> Dict:
 
 _recordings:      Dict[str, Dict] = {}
 _recordings_lock: threading.Lock  = threading.Lock()
-ACTIVE_RECORDINGS_FILE = Path(".active_recordings.json")
+ACTIVE_RECORDINGS_FILE = _core.DATA_DIR / ".active_recordings.json"
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
@@ -765,7 +780,7 @@ def _restore_active_recordings():
 
 _web_tasks:      List[Dict] = []   # [{id, type, title, ch_name, ch_url, start_ts, stop_ts, _cancel}]
 _web_tasks_lock: threading.Lock = threading.Lock()
-WEB_TASKS_FILE = Path(".web_tasks.json")
+WEB_TASKS_FILE = _core.DATA_DIR / ".web_tasks.json"
 
 
 def _save_web_tasks():
@@ -2304,6 +2319,11 @@ async function updateStatus() {
     }
     _dataVersion = st.data_version ?? _dataVersion;
 
+    // Recordings can start server-side (scheduled recording, restored task), so
+    // poll them from the status tick. They used to stay invisible until a page
+    // reload, because only an in-page Record click ever began polling.
+    updateRecordings();
+
   } catch (_) {}
 }
 
@@ -3301,7 +3321,6 @@ function spOpenShow(idx) {
 }
 
 // ── Recording ──────────────────────────────────────────────────────────────
-let _recTimer = null;
 
 // Everything the EPG popup knows about an episode, saved alongside its recording
 // (as a .json sidecar next to the .mkv) to help classify recordings later.
@@ -3359,12 +3378,10 @@ async function updateRecordings() {
 
     if (recs.length === 0) {
       panel.style.display = 'none';
-      if (_recTimer) { clearInterval(_recTimer); _recTimer = null; }
       return;
     }
 
     panel.style.display = '';
-    if (!_recTimer) _recTimer = setInterval(updateRecordings, 5000);
 
     list.innerHTML = recs.map(r => {
       const label = r.show ? escH(r.channel) + ' \u2014 ' + escH(r.show) : escH(r.channel);
@@ -3401,7 +3418,7 @@ function escH(s) {
 
 @app.route("/api/ping")
 def api_ping():
-    return jsonify({"ok": True, "channels": len(_channels), "epg": len(_epg)})
+    return jsonify({"ok": True, "channels": len(_channels), "epg": _core.epg_channel_count(_epg)})
 
 
 @app.route("/")
@@ -3415,7 +3432,7 @@ def index():
 @app.route("/api/guide")
 def api_guide():
     _t0      = time.time()
-    print(f"api_guide: request received (channels={len(_channels)}, epg={len(_epg)})")
+    print(f"api_guide: request received (channels={len(_channels)}, epg={_core.epg_channel_count(_epg)})")
     start_ts = request.args.get("start_ts", type=float)
     hours    = request.args.get("hours", default=8, type=int)
     hours    = max(1, min(hours, 24))
@@ -3472,30 +3489,29 @@ def api_guide():
         tvg_id  = ch.get("tvg-id", "")
 
         progs = []
-        if tvg_id in epg:
-            for p in epg[tvg_id]:
-                st  = p.get("start_time")
-                et  = p.get("stop_time")
-                if not st or not et:
-                    continue
-                st_ts = st.timestamp()
-                et_ts = et.timestamp()
-                if et_ts <= start_ts or st_ts >= end_ts:
-                    continue
-                desc = p.get("description", "")
-                if len(desc) > 400:
-                    desc = desc[:397] + "…"
-                progs.append({
-                    "title":       p.get("title", ""),
-                    "subtitle":    p.get("subtitle", ""),
-                    "description": desc,
-                    "episode_num": p.get("episode_num", ""),
-                    "air_date":    p.get("air_date", ""),
-                    "start_ts":    int(st_ts),
-                    "stop_ts":     int(et_ts),
-                    "duration_min":max(1, int((et_ts - st_ts) / 60)),
-                    "is_now":      st_ts <= now_ts < et_ts,
-                })
+        for p in epg_programmes(epg, tvg_id):
+            st  = p.get("start_time")
+            et  = p.get("stop_time")
+            if not st or not et:
+                continue
+            st_ts = st.timestamp()
+            et_ts = et.timestamp()
+            if et_ts <= start_ts or st_ts >= end_ts:
+                continue
+            desc = p.get("description", "")
+            if len(desc) > 400:
+                desc = desc[:397] + "…"
+            progs.append({
+                "title":       p.get("title", ""),
+                "subtitle":    p.get("subtitle", ""),
+                "description": desc,
+                "episode_num": p.get("episode_num", ""),
+                "air_date":    p.get("air_date", ""),
+                "start_ts":    int(st_ts),
+                "stop_ts":     int(et_ts),
+                "duration_min":max(1, int((et_ts - st_ts) / 60)),
+                "is_now":      st_ts <= now_ts < et_ts,
+            })
 
         result.append({
             "tvg_id":  tvg_id,
@@ -4467,7 +4483,7 @@ def _load_data():
         else:
             logging.info(f"Stale data load (gen {my_gen} < {_load_gen}) discarded")
             return
-    print(f"✓ Guide data ready  ({len(_channels)} channels, {len(_epg)} EPG entries)")
+    print(f"✓ Guide data ready  ({len(_channels)} channels, {_core.epg_channel_count(_epg)} EPG entries)")
 
 
 # ── F6: Periodic guide auto-refresh ──────────────────────────────────────────
@@ -4512,7 +4528,16 @@ def main():
     args = parser.parse_args()
 
     _skip_epg = args.skip_epg
+    # Move runtime files left in the repo by older versions out of the source
+    # tree before the log file is (re)opened.
+    _core.migrate_legacy_data()
     setup_logging()
+    _core.log_migration_notes()
+    # Keep the M3U/EPG caches tidy like the CLIs do (README promises this).
+    # Safe to age by mtime now that load_m3u_cached/load_epg refresh the mtime
+    # of any cache they actually use, so a cache that is still the only working
+    # copy of an unreachable source can't be deleted out from under you.
+    atexit.register(clean_old_cache_files)
     atexit.register(archive_mpv_log)
     atexit.register(disconnect_vpn)
 
@@ -4527,10 +4552,13 @@ def main():
         print(f"Error: Invalid config.json — {e}", file=sys.stderr)
         sys.exit(1)
 
-    playlists = _config.get("playlists", [])
+    playlists = validate_playlists(_config.get("playlists", []))
     if not playlists:
         print("Error: No playlists defined in config.json.", file=sys.stderr)
         sys.exit(1)
+    # Keep api_sources()/_load_data()/source indices aligned with the filtered
+    # list (disabled or malformed entries would otherwise shift the indices).
+    _config["playlists"] = playlists
 
     # F8: configurable port (--port beats config web_port beats default)
     if args.port:
