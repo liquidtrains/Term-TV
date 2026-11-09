@@ -3418,7 +3418,7 @@ function escH(s) {
 
 @app.route("/api/ping")
 def api_ping():
-    return jsonify({"ok": True, "channels": len(_channels), "epg": len(_epg)})
+    return jsonify({"ok": True, "channels": len(_channels), "epg": _core.epg_channel_count(_epg)})
 
 
 @app.route("/")
@@ -3432,7 +3432,7 @@ def index():
 @app.route("/api/guide")
 def api_guide():
     _t0      = time.time()
-    print(f"api_guide: request received (channels={len(_channels)}, epg={len(_epg)})")
+    print(f"api_guide: request received (channels={len(_channels)}, epg={_core.epg_channel_count(_epg)})")
     start_ts = request.args.get("start_ts", type=float)
     hours    = request.args.get("hours", default=8, type=int)
     hours    = max(1, min(hours, 24))
@@ -4483,7 +4483,7 @@ def _load_data():
         else:
             logging.info(f"Stale data load (gen {my_gen} < {_load_gen}) discarded")
             return
-    print(f"✓ Guide data ready  ({len(_channels)} channels, {len(_epg)} EPG entries)")
+    print(f"✓ Guide data ready  ({len(_channels)} channels, {_core.epg_channel_count(_epg)} EPG entries)")
 
 
 # ── F6: Periodic guide auto-refresh ──────────────────────────────────────────

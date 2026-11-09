@@ -757,8 +757,10 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
     #      "HBO.us@WestHD" -> "HBO.us@west"), and
     #   2. the bare id, when the guide has no bare or quality-only entry for
     #      it, pointing at the East feed if there is one, else the first
-    #      variant. A bare playlist id says nothing about the feed, so this
-    #      is the conventional default rather than a contradiction.
+    #      other time-zone feed. A bare playlist id says nothing about the
+    #      feed, so a network feed is the conventional default. It is never
+    #      pointed at a local station ("NBC.us@WNYW"): that is one city's
+    #      schedule, the same wrong-listings case epg_key_for refuses.
     # An alias shares the variant's list; anything iterating the whole guide
     # must go through channels_for_epg_key() so those programmes aren't
     # reported twice.
@@ -769,15 +771,24 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
         if canonical_id and canonical_id not in epg:
             epg[canonical_id] = epg[channel_id]
             aliases += 1
+    station_only = set()
     for prefer_east in (True, False):
         for channel_id in raw_ids:
             base_id = normalize_tvg_id(channel_id).strip()
             if not base_id or base_id in epg:
                 continue
-            if prefer_east and feed_region(channel_id) != "east":
+            region = feed_region(channel_id)
+            if region not in _FEED_REGION_WORDS:
+                station_only.add(base_id)
+                continue
+            if prefer_east and region != "east":
                 continue
             epg[base_id] = epg[channel_id]
             aliases += 1
+    station_only -= set(epg)
+    if station_only:
+        logging.info(f"{len(station_only)} bare EPG channel id(s) left without listings: "
+                     "the guide only has local-station feeds for them")
     if aliases:
         logging.info(f"Added {aliases} EPG channel id alias(es) for feed-suffixed ids")
 
@@ -798,8 +809,12 @@ def load_epg(url: str, lookback_hours: int = 0) -> EpgData:
             hint = (" Regenerate it with: python tools/update_epg.py"
                     if local_path is not None else "")
             msg = f"EPG {state}: {local_path if local_path is not None else url}.{hint}"
-            logging.warning(msg)
-            print(f"Warning: {msg}", file=sys.stderr)
+            # One path only: the apps' console handler already shows WARNING
+            # and above, so also printing put the line on screen twice.
+            if logging.getLogger().handlers:
+                logging.warning(msg)
+            else:
+                print(f"Warning: {msg}", file=sys.stderr)
 
     return epg
 
@@ -902,6 +917,15 @@ def epg_key_for(epg: EpgData, tvg_id: str) -> Optional[str]:
     if canonical_id in epg:
         return canonical_id
     return None
+
+
+def epg_channel_count(epg: EpgData) -> int:
+    """Number of real channels in *epg*.
+
+    len(epg) also counts load_epg()'s aliases, which share another id's
+    programme list, so count distinct lists instead.
+    """
+    return len({id(progs) for progs in epg.values()})
 
 
 def epg_programmes(epg: EpgData, tvg_id: str) -> List[Dict[str, Any]]:

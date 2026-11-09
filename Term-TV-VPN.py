@@ -1921,8 +1921,8 @@ def main():
         logging.info(f"Loading EPG from {chosen_playlist['epg_url']}")
         epg = load_epg(chosen_playlist["epg_url"])
         if epg:
-            logging.info(f"Loaded EPG for {len(epg)} channels")
-            print(f"✓ Loaded EPG for {len(epg)} channels.")
+            logging.info(f"Loaded EPG for {_core.epg_channel_count(epg)} channels")
+            print(f"✓ Loaded EPG for {_core.epg_channel_count(epg)} channels.")
         else:
             logging.warning("EPG data unavailable")
             print("⚠ EPG unavailable - continuing without program guide data.")
@@ -2217,7 +2217,7 @@ def main():
                                 print("Loading EPG data...")
                                 epg = load_epg(chosen_playlist["epg_url"])
                                 if epg:
-                                    print(f"✓ Loaded EPG for {len(epg)} channels.")
+                                    print(f"✓ Loaded EPG for {_core.epg_channel_count(epg)} channels.")
                                 else:
                                     print("⚠ EPG unavailable.")
                             with DATA_LOCK:
@@ -2238,7 +2238,7 @@ def main():
                     epg_global = epg
                 if epg:
                     logging.info(f"EPG refreshed and global state updated")
-                    print(f"✓ Refreshed EPG for {len(epg)} channels.")
+                    print(f"✓ Refreshed EPG for {_core.epg_channel_count(epg)} channels.")
                 else:
                     print("⚠ EPG still unavailable.")
             else:

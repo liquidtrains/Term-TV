@@ -68,6 +68,9 @@ SITE_PRIORITY = (
 # errors / 404s), so they are only used when nothing else carries the id.
 SITE_FALLBACK = {"tvpassport.com", "tvtv.us", "distro.tv"}
 
+# Above this many ids, say up front that the run will be slow.
+LARGE_RUN_IDS = 3000
+
 # Print one progress line per this many lines of grabber output.
 REPORT_EVERY = 50
 
@@ -184,9 +187,18 @@ def download_grabber(grabber_dir: Path, force: bool) -> None:
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
         root = next(n for n in z.namelist() if n.endswith("/") and n.count("/") == 1)
         z.extractall(staging)
+    previous = grabber_dir.parent / (grabber_dir.name + ".old")
+    if previous.exists():
+        shutil.rmtree(previous)
     if grabber_dir.exists():
-        shutil.rmtree(grabber_dir)
-    (staging / root.strip("/")).rename(grabber_dir)
+        grabber_dir.rename(previous)
+    try:
+        (staging / root.strip("/")).rename(grabber_dir)
+    except OSError:
+        if previous.exists() and not grabber_dir.exists():
+            previous.rename(grabber_dir)  # put the working checkout back
+        raise
+    shutil.rmtree(previous, ignore_errors=True)
     shutil.rmtree(staging, ignore_errors=True)
     log(f"  {len(r.content) / 1048576:.1f} MB extracted")
 
@@ -245,6 +257,9 @@ def run(cmd: List[str], cwd: Path, env: Dict[str, str], timeout: Optional[int] =
     finally:
         if timer:
             timer.cancel()
+        if proc.poll() is None:  # reading its output failed: don't leave it running
+            proc.kill()
+            proc.wait()
     if timed_out.is_set():
         print("\n".join(tail), file=sys.stderr)
         die(f"command timed out after {timeout}s")
@@ -426,6 +441,8 @@ def main() -> int:
     parser.add_argument("--from-config", action="store_true",
                         help="Take tvg-ids from the enabled playlists in config.json "
                              "(can be combined with --ids-from)")
+    parser.add_argument("--max-ids", type=int, default=0, metavar="N",
+                        help="Use at most N ids, in playlist order (default 0 = no limit)")
     parser.add_argument("--grab-timeout", type=int, default=60, metavar="MINUTES",
                         help="Give up on the whole grab after this long (default 60, 0 = never)")
     parser.add_argument("--days", type=int, default=2,
@@ -470,6 +487,13 @@ def main() -> int:
     targets = load_target_ids(sources)
     if not targets:
         die("no tvg-ids found in the given playlists")
+    if args.max_ids > 0 and len(targets) > args.max_ids:
+        log(f"  --max-ids: using the first {args.max_ids} of {len(targets)} ids")
+        targets = dict(list(targets.items())[:args.max_ids])
+    elif len(targets) > LARGE_RUN_IDS:
+        log(f"  Note: {len(targets)} ids is a large run and can take a long time "
+            "(a worldwide playlist adds thousands). Narrow it with --ids-from "
+            "or cap it with --max-ids.")
 
     download_grabber(grabber_dir, args.update)
     ensure_node_modules(grabber_dir, data_dir)
