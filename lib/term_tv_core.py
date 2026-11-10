@@ -176,7 +176,9 @@ IPTV_API_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 # the one in countries.json.
 _COUNTRY_NAME_ALIASES = {
     "usa": "US", "us": "US", "u.s.": "US", "united states of america": "US",
-    "uk": "GB", "u.k.": "GB", "great britain": "GB",
+    # iptv-org codes the United Kingdom as "UK", not ISO's "GB".
+    "gb": "UK", "u.k.": "UK", "great britain": "UK", "england": "UK",
+    "scotland": "UK", "wales": "UK",
     "south korea": "KR", "north korea": "KP", "russia": "RU",
     "vietnam": "VN", "czechia": "CZ", "ivory coast": "CI",
     "holland": "NL", "uae": "AE",
@@ -329,13 +331,16 @@ def _country_languages(code: str, index: Dict[str, Any]) -> List[str]:
 
 def _country_code(value: str, index: Dict[str, Any]) -> str:
     """Resolve "US", "usa" or "United States" to a country code."""
-    token = (value or "").strip()
+    token = (value or "").strip().lower()
     if not token:
         return ""
     if len(token) == 2 and token.isalpha():
-        return token.upper()
-    token = token.lower()
-    return index["country_by_name"].get(token) or _COUNTRY_NAME_ALIASES.get(token, "")
+        code = _COUNTRY_NAME_ALIASES.get(token, token.upper())   # "gb" -> iptv-org's "UK"
+    else:
+        code = index["country_by_name"].get(token) or _COUNTRY_NAME_ALIASES.get(token, "")
+    # Only codes the dataset knows: a stray two-letter word in a group title
+    # ("HD") must not become a country.
+    return code if code in index["country_languages"] else ""
 
 
 def _country_from_group_title(title: str, index: Dict[str, Any]) -> str:

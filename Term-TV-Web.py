@@ -638,25 +638,39 @@ def _pump_mpv_output(proc: subprocess.Popen, log_handle, url: str, channel_name:
     pump_started = time.monotonic()
     stalled = False
     lost_pipe = False
-    settled = threading.Event()   # first track/AV line or a classified failure
+    settled = threading.Event()   # playback started, or the failure was reported
+    settle_lock = threading.Lock()
+    # Error lines seen before playback starts are only *candidates*. A stream
+    # can log a 403 from one server or a corrupt first packet and still play
+    # (6 of 431 sessions in the archived mpv logs did), so the failure is
+    # reported only once mpv exits or the first-frame timer runs out without
+    # anything playing. Keeps the most specific reason: mpv prints the
+    # informative line ("HTTP error 404") before a generic "Failed to open".
+    pending: List[Tuple[str, str]] = []
 
-    def _no_first_frame():
-        if settled.is_set() or not _is_current_process(proc):
-            return
-        settled.set()
-        detail = f"no audio/video within {int(MPV_FIRST_FRAME_TIMEOUT)}s"
-        _health_failure(proc, "no_response", detail)
-        _mark_dead_if_current(proc, url, "no_response", detail)
-        logging.warning(f"Stream not responding ({detail}) — {channel_name}")
+    def _settle_failure(default_reason: str, default_detail: str) -> bool:
+        """Report the failure once; False if playback started or it was already reported."""
+        with settle_lock:
+            if settled.is_set() or not _is_current_process(proc):
+                return False
+            settled.set()
+            reason, detail = pending[0] if pending else (default_reason, default_detail)
+        _health_failure(proc, reason, detail)
+        _mark_dead_if_current(proc, url, reason, detail)
+        logging.warning(f"Stream failed ({reason}: {detail}) — {channel_name}")
         try:
-            log_handle.write(f"\n[health] no_response: {detail}\n")
+            log_handle.write(f"\n[health] {reason}: {detail}\n")
             log_handle.flush()
         except Exception:
             pass
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        return True
+
+    def _no_first_frame():
+        if _settle_failure("no_response", f"no audio/video within {int(MPV_FIRST_FRAME_TIMEOUT)}s"):
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     frame_timer = threading.Timer(MPV_FIRST_FRAME_TIMEOUT, _no_first_frame)
     frame_timer.daemon = True
@@ -670,26 +684,25 @@ def _pump_mpv_output(proc: subprocess.Popen, log_handle, url: str, channel_name:
             except Exception:
                 pass
 
-            failure = classify_stream_error(line)
-            if failure and not settled.is_set():
-                reason, detail = failure
-                _health_failure(proc, reason, detail)
-                _mark_dead_if_current(proc, url, reason, detail)
-                settled.set()
-                logging.warning(f"Stream failed ({reason}: {detail}) — {channel_name}")
-            elif mpv_line_is_playing(line):
-                # Also runs after a transient failure line: a stream that starts
-                # playing later is healthy again and leaves the dead list.
-                _set_health(proc, "playing")
-                _mark_channel_alive(url)
-                settled.set()
+            if not settled.is_set():
+                failure = classify_stream_error(line)
+                if failure:
+                    if not pending:
+                        pending.append(failure)
+                    elif pending[0][0] == "failed" and failure[0] != "failed":
+                        pending[0] = failure
+                elif mpv_line_is_playing(line):
+                    with settle_lock:
+                        settled.set()
+                    pending.clear()
+                    _set_health(proc, "playing")
+                    _mark_channel_alive(url)
 
             if watchdog.feed(line):
                 stalled = True
-                settled.set()
+                # Not reported as a failure here: the stall usually reconnects
+                # below, and only a give-up marks the channel dead.
                 detail = f"no position change for {int(watchdog.timeout_seconds)}s"
-                _health_failure(proc, "stalled", detail)
-                _mark_dead_if_current(proc, url, "stalled", detail)
                 msg = f"Stream stalled ({detail}) — {channel_name}"
                 logging.warning(msg)
                 try:
@@ -706,9 +719,6 @@ def _pump_mpv_output(proc: subprocess.Popen, log_handle, url: str, channel_name:
         # once did exactly that: the pump died silently, and a real stall
         # right after went uncaught because nothing was left watching.)
         lost_pipe = True
-        settled.set()
-        _health_failure(proc, "failed", "lost mpv output")
-        _mark_dead_if_current(proc, url, "failed", "lost mpv output")
         logging.warning(f"mpv output pump error ({channel_name}): {e}")
         try:
             proc.kill()
@@ -717,14 +727,9 @@ def _pump_mpv_output(proc: subprocess.Popen, log_handle, url: str, channel_name:
     finally:
         frame_timer.cancel()
 
-    if not settled.is_set() and _is_current_process(proc):
-        # mpv exited without ever selecting a track or reporting an error.
-        settled.set()
-        detail = "stream closed before playback started"
-        _health_failure(proc, "no_response", detail)
-        _mark_dead_if_current(proc, url, "no_response", detail)
-
     if not (stalled or lost_pipe):
+        # mpv exited before anything played: report the best reason seen.
+        _settle_failure("no_response", "stream closed before playback started")
         return
 
     # Only act if this pump's process is still the tracked one — a user-
@@ -744,6 +749,10 @@ def _pump_mpv_output(proc: subprocess.Popen, log_handle, url: str, channel_name:
                                is_reconnect=True, started_at=original_started_at)
         else:
             logging.warning(f"{channel_name} kept failing — giving up")
+            reason, detail = (("stalled", f"no position change for {int(watchdog.timeout_seconds)}s")
+                              if stalled else ("failed", "lost mpv output"))
+            _set_health(proc, "failed", reason, detail)
+            _mark_channel_dead(url, reason, detail)
 
 
 def stop_mpv(internal_reconnect: bool = False):
@@ -2597,6 +2606,7 @@ async function play(url, channel, show) {
           const s = await r.json();
           if (s.health && s.health.state === 'failed') {
             clearInterval(_fp);
+            _lastHealthAt = s.health.at;  // shown here; updateStatus() must not toast it again
             showToast('Stream failed: ' + healthLabel(s.health), true);
             updateStatus();
           } else if (s.mpv_just_died) {
