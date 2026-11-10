@@ -80,6 +80,10 @@ from lib.term_tv_core import (
     canonical_tvg_id,
     epg_programmes,
     channels_for_epg_key,
+    channel_matches_languages,
+    get_language_options,
+    classify_stream_error,
+    mpv_line_is_playing,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -92,6 +96,11 @@ MPV_LOG_FILE        = _core.DATA_DIR / "mpv-output.log"
 MPV_LOG_ARCHIVE_DIR = _core.DATA_DIR / "mpv-log-archive"
 MPV_LOG_CHUNK_SIZE  = 5 * 1024 * 1024  # 5 MB
 RECORDINGS_DIR      = Path.home() / "Videos" / "Recordings"
+
+# How long mpv may run without selecting a track or reporting a position before
+# we treat the stream as not answering at all (a hung TCP connect can otherwise
+# sit there indefinitely with no output).
+MPV_FIRST_FRAME_TIMEOUT = 15.0
 
 _VOD_EXTS   = frozenset({'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v'})
 _VOD_GRP_RE = re.compile(
@@ -201,7 +210,8 @@ def is_new_episode(prog: Dict) -> bool:
     return _core_is_new_episode(prog.get("air_date", ""))
 
 
-def search_shows_web(query: str, hours_ahead: int = 24, groups: Optional[set] = None) -> List[Dict]:
+def search_shows_web(query: str, hours_ahead: int = 24, groups: Optional[set] = None,
+                     langs: Optional[set] = None) -> List[Dict]:
     """Search full EPG for shows airing now or within hours_ahead. Mirrors CLI search_shows_in_timeframe."""
     with _data_lock:
         channels = list(_channels)
@@ -215,6 +225,8 @@ def search_shows_web(query: str, hours_ahead: int = 24, groups: Optional[set] = 
     for ch in channels:
         # S2: Respect group filter if provided (handles merged "A, B" group labels)
         if groups and not _core_ch_in_group(ch, groups):
+            continue
+        if langs and not channel_matches_languages(ch, langs):
             continue
         tid = ch.get("tvg-id")
         if tid:
@@ -450,6 +462,101 @@ _mpv_launch_lock = threading.Lock()
 # the CLIs' play_channel() behavior.
 MPV_STALL_MAX_RETRIES = 1
 
+# Channels whose last launch failed for the current server session, keyed by
+# URL: {reason, detail, at}. Cleared as soon as one of them plays again; the
+# guide shows the reason so a dead row is obvious before the next click.
+_dead_channels: Dict[str, Dict] = {}
+_dead_lock = threading.Lock()
+_dead_epoch = 0          # bumped on every change so the UI can re-render once
+
+
+def _mark_channel_dead(url: str, reason: str, detail: str = ""):
+    global _dead_epoch
+    if not url:
+        return
+    with _dead_lock:
+        previous = _dead_channels.get(url)
+        if previous and previous.get("reason") == reason and previous.get("detail") == detail:
+            return
+        _dead_channels[url] = {"reason": reason, "detail": detail, "at": int(time.time())}
+        _dead_epoch += 1
+
+
+def _mark_channel_alive(url: str):
+    global _dead_epoch
+    if not url:
+        return
+    with _dead_lock:
+        if _dead_channels.pop(url, None) is not None:
+            _dead_epoch += 1
+
+
+def _dead_snapshot() -> Dict[str, Dict]:
+    with _dead_lock:
+        return dict(_dead_channels)
+
+
+def _set_health(proc: subprocess.Popen, state: str, reason: Optional[str] = None,
+                detail: str = "") -> None:
+    """Update the health of the current mpv attempt (no-op for a replaced one)."""
+    with _mpv_lock:
+        if _mpv_process is not proc:
+            return
+        health = _mpv_info.setdefault("health", {})
+        if health.get("state") == state and health.get("reason") == reason:
+            return
+        health.update({
+            "state":  state,
+            "reason": reason,
+            "detail": detail,
+            "at":     int(time.time()),
+        })
+
+
+def _health_failure(proc: subprocess.Popen, reason: str, detail: str = ""):
+    """Record a failed attempt, keeping the most specific reason seen.
+
+    mpv usually prints the informative line first ("HTTP error 404") and then a
+    generic "Failed to open ..."; the generic one must not replace it.
+    """
+    with _mpv_lock:
+        current = dict(_mpv_info.get("health") or {})
+    if current.get("state") == "failed" and current.get("reason") not in (None, "", "failed"):
+        return
+    _set_health(proc, "failed", reason, detail)
+
+
+def _health_label(health: Dict) -> str:
+    """Human-readable one-liner for an API health object (used in logs)."""
+    labels = {
+        "dead_link": "dead link", "forbidden_geo": "geo-blocked",
+        "auth_required": "authentication required", "timeout": "timed out",
+        "unreachable": "unreachable", "no_response": "not responding",
+        "corrupt": "corrupt stream", "codec": "unsupported codec",
+        "dns": "host not found", "tls": "certificate error",
+        "stalled": "stream stalled", "server_error": "server error",
+        "http_error": "HTTP error", "failed": "could not open stream",
+    }
+    reason = (health or {}).get("reason") or "failed"
+    detail = (health or {}).get("detail") or ""
+    label = labels.get(reason, reason)
+    return f"{label} ({detail})" if detail else label
+
+
+def _is_current_process(proc: subprocess.Popen) -> bool:
+    with _mpv_lock:
+        return _mpv_process is proc
+
+
+def _mark_dead_if_current(proc: subprocess.Popen, url: str, reason: str, detail: str = ""):
+    """Mark *url* dead only while this is still the tracked attempt.
+
+    A user-initiated stop/switch clears _mpv_process first; that must not be
+    recorded as a dead channel.
+    """
+    if _is_current_process(proc):
+        _mark_channel_dead(url, reason, detail)
+
 
 def launch_mpv(url: str, channel_name: str, show_title: str = "") -> bool:
     global _mpv_process, _mpv_info, _mpv_log_handle
@@ -495,6 +602,8 @@ def _launch_mpv_locked(url: str, channel_name: str, show_title: str = "", stall_
                 "show":       show_title,
                 "url":        url,
                 "started_at": started_at if started_at is not None else int(time.time()),
+                "health":     {"state": "connecting", "reason": None, "detail": "",
+                               "at": int(time.time())},
             }
         threading.Thread(
             target=_pump_mpv_output,
@@ -513,17 +622,60 @@ def _launch_mpv_locked(url: str, channel_name: str, show_title: str = "", stall_
 
 def _pump_mpv_output(proc: subprocess.Popen, log_handle, url: str, channel_name: str,
                       show_title: str, stall_retries_left: int) -> None:
-    """Tees *proc*'s stdout to *log_handle* and watches for a stuck live
-    position (see MpvStallWatchdog). mpv's stdout used to go straight to the
-    log file with nothing reading it live, so a hung ad-segment fetch (mpv
-    sits in "(Buffering)" forever, no error, no exit) was invisible until
-    someone noticed the picture was frozen — nothing ever killed or replaced
-    that mpv process. Runs in its own thread per mpv launch.
+    """Tees *proc*'s stdout to *log_handle*, watches for a stuck live position
+    (see MpvStallWatchdog), and classifies stream failures for the UI.
+
+    Health states recorded in _mpv_info["health"]:
+      connecting -> no track/position yet (a timer turns a silent one into
+                    "no_response" and kills mpv)
+      playing    -> mpv selected an A/V track or reports a position
+      failed     -> reason/details from classify_stream_error(), a stall, or
+                    "no_response"; the channel URL is also remembered so the
+                    guide can mark it dead.
+    Runs in its own thread per mpv launch.
     """
     watchdog = MpvStallWatchdog()
     pump_started = time.monotonic()
     stalled = False
     lost_pipe = False
+    settled = threading.Event()   # playback started, or the failure was reported
+    settle_lock = threading.Lock()
+    # Error lines seen before playback starts are only *candidates*. A stream
+    # can log a 403 from one server or a corrupt first packet and still play
+    # (6 of 431 sessions in the archived mpv logs did), so the failure is
+    # reported only once mpv exits or the first-frame timer runs out without
+    # anything playing. Keeps the most specific reason: mpv prints the
+    # informative line ("HTTP error 404") before a generic "Failed to open".
+    pending: List[Tuple[str, str]] = []
+
+    def _settle_failure(default_reason: str, default_detail: str) -> bool:
+        """Report the failure once; False if playback started or it was already reported."""
+        with settle_lock:
+            if settled.is_set() or not _is_current_process(proc):
+                return False
+            settled.set()
+            reason, detail = pending[0] if pending else (default_reason, default_detail)
+        _health_failure(proc, reason, detail)
+        _mark_dead_if_current(proc, url, reason, detail)
+        logging.warning(f"Stream failed ({reason}: {detail}) — {channel_name}")
+        try:
+            log_handle.write(f"\n[health] {reason}: {detail}\n")
+            log_handle.flush()
+        except Exception:
+            pass
+        return True
+
+    def _no_first_frame():
+        if _settle_failure("no_response", f"no audio/video within {int(MPV_FIRST_FRAME_TIMEOUT)}s"):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    frame_timer = threading.Timer(MPV_FIRST_FRAME_TIMEOUT, _no_first_frame)
+    frame_timer.daemon = True
+    frame_timer.start()
+
     try:
         for line in proc.stdout:
             try:
@@ -531,9 +683,27 @@ def _pump_mpv_output(proc: subprocess.Popen, log_handle, url: str, channel_name:
                 log_handle.flush()
             except Exception:
                 pass
+
+            if not settled.is_set():
+                failure = classify_stream_error(line)
+                if failure:
+                    if not pending:
+                        pending.append(failure)
+                    elif pending[0][0] == "failed" and failure[0] != "failed":
+                        pending[0] = failure
+                elif mpv_line_is_playing(line):
+                    with settle_lock:
+                        settled.set()
+                    pending.clear()
+                    _set_health(proc, "playing")
+                    _mark_channel_alive(url)
+
             if watchdog.feed(line):
                 stalled = True
-                msg = f"Stream stalled (no position change for {int(watchdog.timeout_seconds)}s) — {channel_name}"
+                # Not reported as a failure here: the stall usually reconnects
+                # below, and only a give-up marks the channel dead.
+                detail = f"no position change for {int(watchdog.timeout_seconds)}s"
+                msg = f"Stream stalled ({detail}) — {channel_name}"
                 logging.warning(msg)
                 try:
                     log_handle.write(f"\n{msg}\n")
@@ -554,8 +724,12 @@ def _pump_mpv_output(proc: subprocess.Popen, log_handle, url: str, channel_name:
             proc.kill()
         except Exception:
             pass
+    finally:
+        frame_timer.cancel()
 
     if not (stalled or lost_pipe):
+        # mpv exited before anything played: report the best reason seen.
+        _settle_failure("no_response", "stream closed before playback started")
         return
 
     # Only act if this pump's process is still the tracked one — a user-
@@ -575,6 +749,10 @@ def _pump_mpv_output(proc: subprocess.Popen, log_handle, url: str, channel_name:
                                is_reconnect=True, started_at=original_started_at)
         else:
             logging.warning(f"{channel_name} kept failing — giving up")
+            reason, detail = (("stalled", f"no position change for {int(watchdog.timeout_seconds)}s")
+                              if stalled else ("failed", "lost mpv output"))
+            _set_health(proc, "failed", reason, detail)
+            _mark_channel_dead(url, reason, detail)
 
 
 def stop_mpv(internal_reconnect: bool = False):
@@ -1459,10 +1637,10 @@ body {
   font-size: 11px; color: var(--muted); z-index: 50;
 }
 
-/* ── Group filter button + panel ── */
-#btn-groups { position: relative; }
-#btn-groups.active { border-color: var(--accent); color: var(--accent); }
-#groups-panel {
+/* ── Group / language filter buttons + panels ── */
+#btn-groups, #btn-langs { position: relative; }
+#btn-groups.active, #btn-langs.active { border-color: var(--accent); color: var(--accent); }
+#groups-panel, #langs-panel {
   position: fixed;
   width: 240px; max-height: 400px; overflow-y: auto;
   background: var(--surface); border: 1px solid var(--border);
@@ -1510,6 +1688,19 @@ body {
 .row-playing > .ch-cell {
   background: #0d2a0d !important;
   border-left: 3px solid var(--green);
+}
+
+/* Stream health: channels whose last launch failed in this session */
+.ch-dead-badge {
+  position: absolute; top: 3px; right: 20px; z-index: 2;
+  font-size: 10px; line-height: 1; color: #f87171; cursor: help;
+}
+.row-dead > .ch-cell { background: #2a1212; }
+.row-dead > .ch-cell .ch-name { color: #fca5a5; }
+#popup-dead {
+  font-size: 12px; color: #f87171; background: #2a1212;
+  border: 1px solid #7f1d1d; border-radius: 5px;
+  padding: 6px 9px; margin-bottom: 10px; line-height: 1.45;
 }
 
 /* V2: VOD sort select */
@@ -1719,6 +1910,7 @@ body {
   <div class="flex1"></div>
   <select id="source-select" title="Switch playlist source"></select>
   <button id="btn-groups" class="btn" title="Filter by group">Groups ▾</button>
+  <button id="btn-langs" class="btn" title="Filter by language">Language ▾</button>
   <button id="btn-library" class="btn" title="Browse finished recordings">📼</button>
   <div id="search-wrap">
     <input id="search" type="search" placeholder="Search shows or channels…" autocomplete="off">
@@ -1737,6 +1929,9 @@ body {
 
 <!-- Groups panel (positioned by JS) -->
 <div id="groups-panel" style="display:none"></div>
+
+<!-- Language panel (positioned by JS) -->
+<div id="langs-panel" style="display:none"></div>
 
 <!-- F2: Recordings library panel (positioned by JS) -->
 <div id="library-panel" style="display:none"></div>
@@ -1783,6 +1978,7 @@ body {
       <h2 id="popup-title"></h2>
       <div id="popup-ep"></div>
       <div id="popup-time"></div>
+      <div id="popup-dead" style="display:none"></div>
       <p id="popup-desc"></p>
       <div id="popup-note-row">
         <input id="popup-note" type="text" placeholder="Channel note…" maxlength="200" autocomplete="off">
@@ -1864,6 +2060,9 @@ let popupProg       = null;
 let loadedAt        = null;
 let selectedGroups  = new Set();   // empty = show all groups
 let _groupsData     = [];          // [{name, count, is_vod}, ...]
+let selectedLangs   = new Set();   // empty = all languages
+let _langsData      = [];          // [{code, name, count}, ...]
+let _langApplyTimer;
 let vodMode         = false;
 let vodPage         = 1;
 let _vodTotal       = 0;
@@ -1874,6 +2073,8 @@ let _playingRow       = null;       // Fix-7: cached DOM ref to highlighted guid
 let _loadGuideActive  = false;      // prevent concurrent loadGuide() calls
 let _guideRetryTimer  = null;       // pending error-retry setTimeout handle
 let _playingChName   = '';         // Fix-7: name of currently highlighted channel
+let _deadEpoch        = -1;         // server revision of channels that failed to play
+let _lastHealthAt     = 0;          // "at" of the last failure already shown as a toast
 
 // ── Boot ───────────────────────────────────────────────────────────────────
 // Script is at end of <body> so DOM is already ready — no DOMContentLoaded needed
@@ -1898,6 +2099,12 @@ async function _boot() {
     if (Array.isArray(saved)) saved.forEach(g => { if (g) selectedGroups.add(g); });
   } catch (_) {}
 
+  // Restore persisted language filter
+  try {
+    const savedLangs = JSON.parse(localStorage.getItem('termtv_langs') || '[]');
+    if (Array.isArray(savedLangs)) savedLangs.forEach(l => { if (l) selectedLangs.add(l); });
+  } catch (_) {}
+
   // Connectivity test — confirms browser can reach Flask before loading guide
   document.getElementById('loading-msg').textContent = 'Pinging server…';
   try {
@@ -1916,6 +2123,7 @@ async function _boot() {
   loadGuide().then(() => {
     jumpToNow();
     loadGroups();
+    loadLanguages();
     setInterval(tickClock, 1000);
     setInterval(updateStatus, 5000);
     setInterval(() => { if (guideData) positionNowLine(); }, 15000);
@@ -1966,6 +2174,10 @@ function setupEvents() {
   document.addEventListener('click', e => {
     if (!e.target.closest('#groups-panel') && !e.target.closest('#btn-groups')) closeGroupsPanel();
   });
+  document.getElementById('btn-langs').addEventListener('click', e => { e.stopPropagation(); toggleLangsPanel(); });
+  document.addEventListener('click', e => {
+    if (!e.target.closest('#langs-panel') && !e.target.closest('#btn-langs')) closeLangsPanel();
+  });
   document.getElementById('btn-library').addEventListener('click', e => { e.stopPropagation(); toggleLibraryPanel(); });
   document.addEventListener('click', e => {
     if (!e.target.closest('#library-panel') && !e.target.closest('#btn-library')) closeLibraryPanel();
@@ -1977,7 +2189,7 @@ function setupEvents() {
     if (e.target.id === 'vod-popup-overlay') closeVodPopup();
   });
   document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') { closePopup(); closeVodPopup(); return; }
+    if (e.key === 'Escape') { closePopup(); closeVodPopup(); closeLangsPanel(); closeGroupsPanel(); return; }
     // Global shortcuts — skip when a text field has focus or a popup is open
     const tag = document.activeElement && document.activeElement.tagName;
     if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
@@ -2011,6 +2223,7 @@ async function loadGuide(silent = false) {
   if (!silent) setLoading(true);
   const p = new URLSearchParams({ start_ts: winStartTs, hours: WIN_HRS });
   selectedGroups.forEach(g => p.append('groups', g));
+  selectedLangs.forEach(l => p.append('langs', l));
   let hadError = false;  // keep the overlay (with its message) visible on error/retry instead
                           // of hiding it in finally the instant it's set
   try {
@@ -2141,6 +2354,15 @@ function buildRow(ch, totalW) {
   favEl.addEventListener('click', e => { e.stopPropagation(); toggleFav(ch, favEl); });
   cell.appendChild(favEl);
 
+  // Stream health: this channel failed to launch earlier in the session
+  if (ch.dead) {
+    row.classList.add('row-dead');
+    const deadEl = mk('span', 'ch-dead-badge');
+    deadEl.textContent = '\u2715';
+    deadEl.title = 'Last stream check failed: ' + healthLabel(ch.dead);
+    cell.appendChild(deadEl);
+  }
+
   row.appendChild(cell);
 
   const area = mk('div', 'prog-area');
@@ -2252,6 +2474,22 @@ function tickClock() {
 }
 
 // ── Status polling ────────────────────────────────────────────────────────
+function healthLabel(h) {
+  if (!h) return '';
+  const labels = {
+    dead_link: 'dead link', forbidden_geo: 'geo-blocked',
+    auth_required: 'authentication required', timeout: 'timed out',
+    unreachable: 'unreachable', no_response: 'not responding',
+    corrupt: 'corrupt stream', codec: 'unsupported codec',
+    dns: 'host not found', tls: 'certificate error',
+    stalled: 'stream stalled', server_error: 'server error',
+    http_error: 'HTTP error', failed: 'could not open stream'
+  };
+  const reason = h.reason || 'failed';
+  const label  = labels[reason] || reason;
+  return h.detail ? label + ' (' + h.detail + ')' : label;
+}
+
 async function updateStatus() {
   try {
     const res = await fetch('/api/status');
@@ -2301,6 +2539,24 @@ async function updateStatus() {
       }
     }
 
+    // Stream health: explain why a launch failed (dead link, geo-block, ...)
+    const h = st.health || null;
+    if (h && h.state === 'failed' && h.at && h.at !== _lastHealthAt) {
+      _lastHealthAt = h.at;
+      showToast('Stream failed: ' + healthLabel(h), true);
+    } else if (h && h.state === 'playing') {
+      _lastHealthAt = 0;
+    }
+
+    // The server's dead-channel list changed: re-render so rows gain/lose
+    // their badge. Skip the very first observation (the guide is already up).
+    if (st.dead_epoch !== undefined) {
+      if (_deadEpoch >= 0 && st.dead_epoch !== _deadEpoch && !vodMode && guideData) {
+        loadGuide(true);
+      }
+      _deadEpoch = st.dead_epoch;
+    }
+
     // Surface M3U load errors
     if (!st.data_loading && st.data_error) {
       const el = document.getElementById('loading-msg');
@@ -2309,13 +2565,13 @@ async function updateStatus() {
 
     // U3: Auto-refresh guide when background data load transitions loading → done
     if (_prevDataLoading && !st.data_loading) {
-      loadGuide(true).then(() => { loadGroups(); if (!vodMode) jumpToNow(); });
+      loadGuide(true).then(() => { loadGroups(); loadLanguages(); if (!vodMode) jumpToNow(); });
     }
     _prevDataLoading = !!st.data_loading;
 
     // Auto-refresh when EPG finishes loading after M3U (data_version increments)
     if (_dataVersion >= 0 && st.data_version !== _dataVersion && !st.data_loading) {
-      loadGuide(true).then(() => loadGroups());
+      loadGuide(true).then(() => { loadGroups(); loadLanguages(); });
     }
     _dataVersion = st.data_version ?? _dataVersion;
 
@@ -2339,14 +2595,21 @@ async function play(url, channel, show) {
     if (data.ok) {
       showToast('▶ Launching: ' + channel + (show ? ' — ' + show : ''));
       setTimeout(updateStatus, 800);
-      // F2: Aggressive short poll (5 × 2s) to detect immediate stream failure
+      // F2: Aggressive short poll (5 × 2s) to detect immediate stream failure.
+      // The server classifies the failure (dead link, geo-block, corrupt, ...),
+      // so prefer its reason over the bare mpv exit code.
       let _fpc = 0;
       const _fp = setInterval(async () => {
         _fpc++;
         try {
           const r = await fetch('/api/status');
           const s = await r.json();
-          if (s.mpv_just_died) {
+          if (s.health && s.health.state === 'failed') {
+            clearInterval(_fp);
+            _lastHealthAt = s.health.at;  // shown here; updateStatus() must not toast it again
+            showToast('Stream failed: ' + healthLabel(s.health), true);
+            updateStatus();
+          } else if (s.mpv_just_died) {
             clearInterval(_fp);
             showToast('Stream failed — mpv exited (code ' + (s.mpv_exit_code ?? '?') + '). URL may be dead.', true);
             updateStatus();
@@ -2531,6 +2794,13 @@ function showPopup(prog, ch) {
   }
   document.getElementById('popup-time').textContent  =
     fmt(prog.start_ts) + ' – ' + fmt(prog.stop_ts) + '  (' + prog.duration_min + ' min)';
+  const _deadEl = document.getElementById('popup-dead');
+  if (ch.dead) {
+    _deadEl.textContent = 'Last stream check failed: ' + healthLabel(ch.dead);
+    _deadEl.style.display = '';
+  } else {
+    _deadEl.style.display = 'none';
+  }
   document.getElementById('popup-desc').textContent  = prog.description || 'No description available.';
   document.getElementById('popup-now').style.display = isNow ? 'inline-block' : 'none';
 
@@ -3042,6 +3312,104 @@ function applyGroupFilter() {
   else loadGuide();
 }
 
+// ── Language filter ────────────────────────────────────────────────────────
+async function loadLanguages() {
+  try {
+    const data = await (await fetch('/api/languages')).json();
+    _langsData = data.languages || [];
+    // Drop persisted selections that no longer occur in this playlist
+    const valid = new Set(_langsData.map(l => l.code));
+    selectedLangs.forEach(l => { if (!valid.has(l)) selectedLangs.delete(l); });
+    updateLangsBtnLabel();
+  } catch (_) {}
+}
+
+function updateLangsBtnLabel() {
+  const btn = document.getElementById('btn-langs');
+  if (selectedLangs.size === 0) {
+    btn.textContent = 'Language \u25be';
+    btn.classList.remove('active');
+  } else {
+    btn.textContent = selectedLangs.size + ' Lang' + (selectedLangs.size > 1 ? 's' : '') + ' \u25be';
+    btn.classList.add('active');
+  }
+}
+
+async function toggleLangsPanel() {
+  const panel = document.getElementById('langs-panel');
+  if (panel.style.display !== 'none') { closeLangsPanel(); return; }
+  await loadLanguages();
+  renderLangsPanel();
+  const btn  = document.getElementById('btn-langs');
+  const rect = btn.getBoundingClientRect();
+  panel.style.display = '';
+  panel.style.top  = (rect.bottom + 4) + 'px';
+  panel.style.left = Math.max(4, rect.right - 240) + 'px';
+}
+
+function closeLangsPanel() {
+  document.getElementById('langs-panel').style.display = 'none';
+}
+
+function renderLangsPanel() {
+  const panel = document.getElementById('langs-panel');
+  let html = '<div class="gp-actions">'
+    + '<button class="gp-action-btn" onclick="selectAllLangs()">Select All</button>'
+    + '<button class="gp-action-btn" onclick="clearAllLangs()">Clear All</button>'
+    + '</div>';
+  if (_langsData.length === 0) {
+    html += '<div style="padding:12px 10px;color:var(--muted);font-size:12px;text-align:center">No language data</div>';
+  } else {
+    for (const l of _langsData) {
+      const chk = selectedLangs.has(l.code) ? ' checked' : '';
+      html += '<label class="gp-item">'
+            + '<input type="checkbox"' + chk + ' onchange="toggleLang(' + escH(JSON.stringify(l.code)) + ',this.checked)">'
+            + '<span class="gp-item-name">' + escH(l.name) + '</span>'
+            + '<span class="gp-item-count">' + l.count + '</span>'
+            + '</label>';
+    }
+    html += '<div class="gp-apply-row">'
+          + '<button class="gp-apply-btn" onclick="applyLangAndClose()">Apply Filter</button>'
+          + '</div>';
+  }
+  panel.innerHTML = html;
+}
+
+function _saveLangs() {
+  try { localStorage.setItem('termtv_langs', JSON.stringify([...selectedLangs])); } catch (_) {}
+}
+
+function toggleLang(code, checked) {
+  if (checked) selectedLangs.add(code);
+  else         selectedLangs.delete(code);
+  updateLangsBtnLabel();
+  _saveLangs();
+  clearTimeout(_langApplyTimer);
+  _langApplyTimer = setTimeout(applyGroupFilter, 600);
+}
+
+function applyLangAndClose() {
+  clearTimeout(_langApplyTimer);
+  closeLangsPanel();
+  applyGroupFilter();
+}
+
+function selectAllLangs() {
+  _langsData.forEach(l => selectedLangs.add(l.code));
+  renderLangsPanel();
+  updateLangsBtnLabel();
+  _saveLangs();
+  applyGroupFilter();
+}
+
+function clearAllLangs() {
+  selectedLangs.clear();
+  renderLangsPanel();
+  updateLangsBtnLabel();
+  _saveLangs();
+  applyGroupFilter();
+}
+
 // ── VOD mode ───────────────────────────────────────────────────────────────
 function switchToVodMode() {
   vodMode = true;
@@ -3079,6 +3447,7 @@ async function loadVod(page) {
   if (searchQ) p.set('q', searchQ);
   p.set('sort', document.getElementById('vod-sort').value); // Fix-5: server-side sort
   selectedGroups.forEach(g => p.append('groups', g));
+  selectedLangs.forEach(l => p.append('langs', l));
   try {
     const res  = await fetch('/api/vod?' + p);
     const data = await res.json();
@@ -3198,6 +3567,7 @@ async function switchSource(idx) {
     await waitForData();
     selectedGroups.clear();
     await loadGroups();
+    await loadLanguages();
     winStartTs = Math.floor(Date.now() / 1000) - 3600;
     if (vodMode) switchToGuideMode();
     await loadGuide();
@@ -3230,9 +3600,10 @@ let _srShows    = [];
 
 async function fetchSearch(q) {
   try {
-    // S2: Include active group filter so search is scoped to visible groups
+    // S2: Include active group + language filters so search is scoped to visible channels
     const p = new URLSearchParams({ q, hours: 24 });
     selectedGroups.forEach(g => p.append('groups', g));
+    selectedLangs.forEach(l => p.append('langs', l));
     const res  = await fetch('/api/search?' + p);
     const data = await res.json();
     // B5: Handle loading state
@@ -3471,6 +3842,8 @@ def api_guide():
     print(f"api_guide: sorted {len(channels)} channels in {time.time()-_t0:.3f}s")
 
     grp_filter = set(request.args.getlist("groups"))
+    lang_filter = set(request.args.getlist("langs"))
+    dead_map = _dead_snapshot()
 
     # Build channel list with programmes in the window
     # Fix-3: Count total matching channels but only build EPG data for the first 200
@@ -3479,6 +3852,8 @@ def api_guide():
     total  = 0
     for ch in channels:
         if grp_filter and not _core_ch_in_group(ch, grp_filter):
+            continue
+        if lang_filter and not channel_matches_languages(ch, lang_filter):
             continue
         total += 1
         if total > GUIDE_CH_LIMIT:
@@ -3520,6 +3895,7 @@ def api_guide():
             "url":     ch.get("url", ""),
             "logo":    ch.get("tvg-logo", ""),
             "fav":     _is_fav(ch),
+            "dead":    dead_map.get(ch.get("url", "")),
             "programs": progs,
         })
 
@@ -3558,6 +3934,8 @@ def api_status():
         "data_version":   _data_version,
         "mpv_just_died":  mpv_just_died,
         "mpv_exit_code":  st.get("exit_code"),
+        "health":         st.get("health"),
+        "dead_epoch":     _dead_epoch,
     })
 
 
@@ -4204,8 +4582,9 @@ def api_search():
     if _data_loading and not _channels:
         return jsonify({"channels": [], "shows": [], "loading": True})
 
-    # S2: Respect active group filter
+    # S2: Respect active group + language filters
     grp_filter = set(request.args.getlist("groups"))
+    lang_filter = set(request.args.getlist("langs"))
 
     with _data_lock:
         channels = list(_channels)
@@ -4215,9 +4594,12 @@ def api_search():
         for c in channels
         if q.lower() in c.get("name", "").lower()
         and (not grp_filter or _core_ch_in_group(c, grp_filter))
+        and (not lang_filter or channel_matches_languages(c, lang_filter))
     ]
 
-    show_results = search_shows_web(q, hours_ahead=hours, groups=grp_filter if grp_filter else None)
+    show_results = search_shows_web(q, hours_ahead=hours,
+                                    groups=grp_filter if grp_filter else None,
+                                    langs=lang_filter if lang_filter else None)
 
     return jsonify({
         "channels": ch_results[:20],
@@ -4244,10 +4626,21 @@ def api_groups():
     return jsonify({"groups": result})
 
 
+@app.route("/api/languages")
+def api_languages():
+    """Languages present in the loaded channels, with channel counts."""
+    with _data_lock:
+        channels = list(_channels)
+    if _data_loading and not channels:
+        return jsonify({"languages": [], "loading": True})
+    return jsonify({"languages": get_language_options(channels)})
+
+
 @app.route("/api/vod")
 def api_vod():
     q          = request.args.get("q", "").strip().lower()
     grp_filter = set(request.args.getlist("groups"))
+    lang_filter = set(request.args.getlist("langs"))
     sort       = request.args.get("sort", "az")
     page       = request.args.get("page", 1, type=int)
     per_page   = 100
@@ -4262,6 +4655,8 @@ def api_vod():
         grp = ch.get("group-title", "")
         # ch_in_group handles merged "A, B" labels produced by M3U dedup
         if grp_filter and not _core_ch_in_group(ch, grp_filter):
+            continue
+        if lang_filter and not channel_matches_languages(ch, lang_filter):
             continue
         name = ch.get("name", "")
         if q and q not in name.lower():
@@ -4465,6 +4860,13 @@ def _load_data():
         with _data_lock:
             if my_gen == _load_gen:
                 _data_error = err
+
+    # Warm the language index (weekly iptv-org download) while the EPG loads,
+    # so opening the Language panel doesn't block on it.
+    try:
+        _core.get_language_index()
+    except Exception as e:
+        logging.warning(f"Language index unavailable: {e}")
 
     try:
         if not _skip_epg and playlist.get("epg_url"):

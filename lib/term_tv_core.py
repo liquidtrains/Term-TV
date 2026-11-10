@@ -162,6 +162,274 @@ def validate_playlists(playlists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Channel language metadata (iptv-org API)
+# ---------------------------------------------------------------------------
+# Playlists almost never carry tvg-language, but the iptv-org dataset behind
+# their tvg-ids does: feeds list the languages a feed is broadcast in, channels
+# map to a country, and countries list their languages. That gives the Web UI a
+# real language filter instead of guessing from group titles.
+IPTV_API_BASE = "https://iptv-org.github.io/api"
+IPTV_API_DIR = DATA_DIR / ".iptv_api"
+IPTV_API_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
+# Group titles/attributes sometimes use a colloquial country name that is not
+# the one in countries.json.
+_COUNTRY_NAME_ALIASES = {
+    "usa": "US", "us": "US", "u.s.": "US", "united states of america": "US",
+    # iptv-org codes the United Kingdom as "UK", not ISO's "GB".
+    "gb": "UK", "u.k.": "UK", "great britain": "UK", "england": "UK",
+    "scotland": "UK", "wales": "UK",
+    "south korea": "KR", "north korea": "KP", "russia": "RU",
+    "vietnam": "VN", "czechia": "CZ", "ivory coast": "CI",
+    "holland": "NL", "uae": "AE",
+}
+
+# Some iptv-org feeds still use ISO 639-2/B codes where languages.json uses
+# 639-3, which otherwise shows up as a second, nameless language option.
+_LANGUAGE_CODE_ALIASES = {
+    "alb": "sqi", "arm": "hye", "baq": "eus", "bur": "mya", "chi": "zho",
+    "cze": "ces", "dut": "nld", "fre": "fra", "geo": "kat", "ger": "deu",
+    "gre": "ell", "ice": "isl", "iri": "gle", "mac": "mkd", "mao": "mri",
+    "may": "msa", "per": "fas", "rum": "ron", "scc": "srp", "scr": "hrv",
+    "slo": "slk", "tib": "bod", "wel": "cym",
+}
+
+
+def _normalize_language_code(code: str) -> str:
+    token = (code or "").strip().lower()
+    return _LANGUAGE_CODE_ALIASES.get(token, token)
+
+_language_index: Optional[Dict[str, Any]] = None
+_language_index_lock = threading.Lock()
+
+
+def _read_json_file(path: Path) -> Optional[Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.debug(f"Could not read {path}: {e}")
+        return None
+
+
+def _iptv_api_data(name: str) -> Optional[Any]:
+    """Return one iptv-org API dataset, refreshing it weekly.
+
+    Order: fresh local cache -> download -> stale local cache -> the copy the
+    EPG grabber keeps. Returns None when none of those work, which simply
+    disables the language filter rather than breaking channel loading.
+    """
+    path = IPTV_API_DIR / f"{name}.json"
+    try:
+        fresh = path.exists() and (time.time() - path.stat().st_mtime) < IPTV_API_MAX_AGE_SECONDS
+    except OSError:
+        fresh = False
+    if fresh:
+        data = _read_json_file(path)
+        if data is not None:
+            return data
+    try:
+        r = requests.get(f"{IPTV_API_BASE}/{name}.json", timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_bytes(r.content)
+            os.replace(tmp, path)
+        except OSError as e:
+            logging.debug(f"Could not cache {path}: {e}")
+        return data
+    except (requests.RequestException, ValueError) as e:
+        logging.info(f"Could not refresh iptv-org {name}.json: {e}")
+    stale = _read_json_file(path)
+    if stale is not None:
+        logging.info(f"Using stale iptv-org {name}.json")
+        return stale
+    grabber_copy = DATA_DIR / "epg-grabber" / "temp" / "data" / f"{name}.json"
+    stale = _read_json_file(grabber_copy)
+    if stale is not None:
+        logging.info(f"Using iptv-org {name}.json from {grabber_copy}")
+    return stale
+
+
+def get_language_index(refresh: bool = False) -> Dict[str, Any]:
+    """Build (once) and return the lookup tables used to infer languages."""
+    global _language_index
+    with _language_index_lock:
+        if _language_index is not None and not refresh:
+            return _language_index
+
+        languages = _iptv_api_data("languages") or []
+        countries = _iptv_api_data("countries") or []
+        channels  = _iptv_api_data("channels") or []
+        feeds     = _iptv_api_data("feeds") or []
+
+        names: Dict[str, str] = {}
+        for lang in languages:
+            if isinstance(lang, dict) and lang.get("code"):
+                names[lang["code"]] = lang.get("name") or lang["code"]
+        codes_by_name = {str(name).strip().lower(): code for code, name in names.items()}
+
+        country_languages: Dict[str, List[str]] = {}
+        country_by_name: Dict[str, str] = {}
+        for country in countries:
+            if not isinstance(country, dict) or not country.get("code"):
+                continue
+            code = str(country["code"]).upper()
+            country_languages[code] = list(dict.fromkeys(
+                _normalize_language_code(x)
+                for x in (country.get("languages") or []) if isinstance(x, str)
+            ))
+            if country.get("name"):
+                country_by_name[str(country["name"]).strip().lower()] = code
+
+        feed_languages: Dict[Tuple[str, str], List[str]] = {}
+        main_feed_languages: Dict[str, List[str]] = {}
+        first_feed_languages: Dict[str, List[str]] = {}
+        for feed in feeds:
+            if not isinstance(feed, dict):
+                continue
+            channel_id = feed.get("channel")
+            if not channel_id:
+                continue
+            langs = list(dict.fromkeys(
+                _normalize_language_code(x)
+                for x in (feed.get("languages") or []) if isinstance(x, str)
+            ))
+            feed_id = feed.get("id")
+            if feed_id:
+                feed_languages[(channel_id, str(feed_id))] = langs
+            if feed.get("is_main"):
+                main_feed_languages.setdefault(channel_id, langs)
+            first_feed_languages.setdefault(channel_id, langs)
+        for channel_id, langs in first_feed_languages.items():
+            main_feed_languages.setdefault(channel_id, langs)
+
+        channel_country: Dict[str, str] = {}
+        for channel in channels:
+            if isinstance(channel, dict) and channel.get("id") and channel.get("country"):
+                channel_country[channel["id"]] = str(channel["country"]).upper()
+
+        _language_index = {
+            "language_names": names,
+            "language_codes_by_name": codes_by_name,
+            "country_languages": country_languages,
+            "country_by_name": country_by_name,
+            "feed_languages": feed_languages,
+            "main_feed_languages": main_feed_languages,
+            "channel_country": channel_country,
+        }
+        return _language_index
+
+
+def _country_languages(code: str, index: Dict[str, Any]) -> List[str]:
+    if not code:
+        return []
+    return list(index["country_languages"].get(str(code).strip().upper(), []))
+
+
+def _country_code(value: str, index: Dict[str, Any]) -> str:
+    """Resolve "US", "usa" or "United States" to a country code."""
+    token = (value or "").strip().lower()
+    if not token:
+        return ""
+    if len(token) == 2 and token.isalpha():
+        code = _COUNTRY_NAME_ALIASES.get(token, token.upper())   # "gb" -> iptv-org's "UK"
+    else:
+        code = index["country_by_name"].get(token) or _COUNTRY_NAME_ALIASES.get(token, "")
+    # Only codes the dataset knows: a stray two-letter word in a group title
+    # ("HD") must not become a country.
+    return code if code in index["country_languages"] else ""
+
+
+def _country_from_group_title(title: str, index: Dict[str, Any]) -> str:
+    """'PlutoTV - Denmark' -> 'DK' (best effort; '' when unknown)."""
+    for part in reversed(re.split(r"\s+-\s+|\s*;\s*", title or "")):
+        code = _country_code(part, index)
+        if code:
+            return code
+    return ""
+
+
+def channel_languages(channel: Channel, index: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Best-effort ISO 639-3 language codes for *channel*.
+
+    Sources in priority order: the iptv-org feed for its tvg-id, an explicit
+    tvg-language, then the channel's country (tvg-country, the tvg-id's ".cc"
+    suffix, or a "Provider - Country" group title). The first source that
+    yields anything wins, so a French-only Canadian channel doesn't inherit
+    every language spoken in Canada.
+    """
+    idx = index if index is not None else get_language_index()
+    tvg_id = (channel.get("tvg-id") or "").strip()
+    base_id, _, feed_id = tvg_id.partition("@")
+
+    # 1. Feed languages from the iptv-org dataset (exact feed, else main feed).
+    if base_id:
+        langs = idx["feed_languages"].get((base_id, feed_id)) if feed_id else None
+        if langs is None:
+            langs = idx["main_feed_languages"].get(base_id)
+        if langs:
+            return list(dict.fromkeys(langs))
+
+    # 2. Explicit tvg-language ("English" or "eng;fra").
+    raw = (channel.get("tvg-language") or "").strip()
+    if raw:
+        explicit: List[str] = []
+        for part in re.split(r"[;,]", raw):
+            token = part.strip()
+            if not token:
+                continue
+            if len(token) <= 3 and token.isalpha():
+                explicit.append(_normalize_language_code(token))
+            else:
+                code = idx["language_codes_by_name"].get(token.lower())
+                if code:
+                    explicit.append(code)
+        if explicit:
+            return list(dict.fromkeys(explicit))
+
+    # 3. Country -> the languages that country broadcasts in.
+    candidates = [
+        (channel.get("tvg-country") or "").strip(),
+        base_id.rsplit(".", 1)[-1] if "." in base_id else "",
+        _country_from_group_title(channel.get("group-title", ""), idx),
+    ]
+    for candidate in candidates:
+        langs = _country_languages(_country_code(candidate, idx), idx)
+        if langs:
+            return list(dict.fromkeys(langs))
+    return []
+
+
+def channel_matches_languages(channel: Channel, langs: Any,
+                              index: Optional[Dict[str, Any]] = None) -> bool:
+    """True when *channel* broadcasts in any of *langs* (empty set = no filter)."""
+    wanted = {str(x).strip().lower() for x in (langs or []) if str(x).strip()}
+    if not wanted:
+        return True
+    have = {code.lower() for code in channel_languages(channel, index)}
+    return bool(have & wanted)
+
+
+def get_language_options(channels: List[Channel]) -> List[Dict[str, Any]]:
+    """Return [{code, name, count}] for every language present in *channels*."""
+    index = get_language_index()
+    counts: Dict[str, int] = {}
+    for ch in channels:
+        for code in channel_languages(ch, index):
+            counts[code] = counts.get(code, 0) + 1
+    names = index["language_names"]
+    options = [
+        {"code": code, "name": names.get(code, code), "count": count}
+        for code, count in counts.items()
+    ]
+    options.sort(key=lambda opt: opt["name"].lower())
+    return options
+
+
+# ---------------------------------------------------------------------------
 # Cache helpers
 # ---------------------------------------------------------------------------
 
@@ -1318,6 +1586,69 @@ class MpvStallWatchdog:
             self._fired = True
             return True
         return False
+
+
+# ---------------------------------------------------------------------------
+# mpv stream-error classification (Web UI health display)
+# ---------------------------------------------------------------------------
+# mpv/ffmpeg report a failed open in a handful of recognisable shapes. The Web
+# UI turns these into a human-readable reason instead of just "mpv exited".
+_MPV_HTTP_ERROR_RE = re.compile(r"HTTP error (\d{3})", re.IGNORECASE)
+
+
+def classify_stream_error(line: str) -> Optional[Tuple[str, str]]:
+    """Classify one mpv/ffmpeg output line as a stream failure.
+
+    Returns (reason, detail), with reason one of: dead_link, forbidden_geo,
+    auth_required, http_error, server_error, timeout, unreachable, dns, tls,
+    corrupt, codec, failed. Returns None for ordinary output lines.
+    """
+    if not line:
+        return None
+    match = _MPV_HTTP_ERROR_RE.search(line)
+    if match:
+        code = int(match.group(1))
+        detail = f"HTTP {code}"
+        if code == 403:
+            return ("forbidden_geo", detail)
+        if code == 401:
+            return ("auth_required", detail)
+        if code in (404, 410, 503):
+            return ("dead_link", detail)
+        if 500 <= code < 600:
+            return ("server_error", detail)
+        if 400 <= code < 500:
+            return ("http_error", detail)
+        return ("http_error", detail)
+
+    low = line.lower()
+    if "connection to tcp://" in low and "failed" in low:
+        return ("timeout", "connection failed")
+    if "connection timed out" in low or "timed out" in low:
+        return ("timeout", "connection timed out")
+    if "connection refused" in low:
+        return ("unreachable", "connection refused")
+    if "failed to resolve" in low or "could not resolve" in low or "name or service not known" in low:
+        return ("dns", "host not found")
+    if "certificate" in low and ("error" in low or "verify" in low):
+        return ("tls", "certificate error")
+    if "probably corrupt input" in low or "invalid data found" in low or "corrupt" in low:
+        return ("corrupt", "corrupt or undecodable stream")
+    if "no video or audio streams" in low or "could not select" in low:
+        return ("codec", "no playable audio/video stream")
+    if "errors when loading file" in low or "failed to open" in low:
+        return ("failed", "could not open the stream")
+    return None
+
+
+def mpv_line_is_playing(line: str) -> bool:
+    """True once mpv has selected an A/V track or reports a playback position."""
+    if not line:
+        return False
+    low = line.lower()
+    if "● video" in low or "● audio" in low:
+        return True
+    return bool(_AV_POSITION_RE.search(line))
 
 
 # ---------------------------------------------------------------------------
