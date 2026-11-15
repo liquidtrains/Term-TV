@@ -367,13 +367,22 @@ def _restore_scheduled_tasks():
             SCHEDULED_TASKS.append(t)
         ttype = t.get("type", "playback")
         if ttype == "recording":
+            # A recording that was already under way when the CLI closed
+            # (load_scheduled_tasks keeps it while the programme is still on)
+            # starts now and records only what is left.
+            duration = int(t.get("duration_seconds", 0) or 0)
+            missed = int(t.pop("_resume_elapsed", 0) or 0)
+            if missed:
+                duration = max(60, duration - missed)
+                print(f"  Resuming recording '{t.get('show_title', '?')}' "
+                      f"({duration // 60} min left of the programme)")
             threading.Thread(
                 target=scheduled_recording_task,
                 args=(t.get("url", ""), Path(t.get("output_path", "")), delay,
                       t.get("channel_name", "?"), t.get("show_title", "?"),
                       t.get("provider", ""), t.get("extract_subs", True),
                       t.get("id", 0), t.get("episode_num", ""),
-                      t.get("original_start_time"), t.get("duration_seconds", 0),
+                      t.get("original_start_time"), duration,
                       cancel_event),
                 daemon=True,
             ).start()
@@ -531,7 +540,8 @@ def scheduled_playback_task(channel_url: str, delay_seconds: int, channel_name: 
         show_title=show_title, provider=provider, task_id=task_id, episode_num=episode_num,
         original_start_time=original_start_time, channels=_channels, epg=_epg, cancel_event=evt,
         remove_task_fn=_remove_task,
-        mpv_cmd_builder=lambda url, elapsed: ["mpv", *MPV_RESILIENCE_ARGS, "--", url],
+        mpv_cmd_builder=lambda url, elapsed: ["mpv", *MPV_RESILIENCE_ARGS,
+                                              *_core.mpv_stream_header_args(url), "--", url],
         log_fn=lambda **kw: log_mpv_output(**kw),
         refresh_data_fn=_refresh_channels_epg,
     )
@@ -591,8 +601,26 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
         _channels = channels_global
         _epg = epg_global
 
+    # Every attempt (retry, alternative channel, resume after a drop) gets
+    # its own file: mpv's --stream-record truncates an existing file, so
+    # reusing output_path wiped whatever an earlier attempt had recorded.
+    written_paths: List[Path] = []
+
+    def _next_part_path() -> Path:
+        part = 1
+        while True:
+            path = output_path if part == 1 else output_path.with_name(
+                f"{output_path.stem}_part{part}{output_path.suffix}")
+            if not (path.exists() and path.stat().st_size > 0):
+                return path
+            part += 1
+
     def _build_mpv_cmd(url: str, elapsed: float) -> List[str]:
-        cmd = ["mpv", f"--stream-record={output_path}", *MPV_RESILIENCE_ARGS,
+        part_path = _next_part_path()
+        if part_path not in written_paths:
+            written_paths.append(part_path)
+        cmd = ["mpv", f"--stream-record={part_path}", *MPV_RESILIENCE_ARGS,
+               *_core.mpv_stream_header_args(url),
                "--sid=auto",              # Auto-select subtitles at start
                "--no-sub-visibility"]     # Start with subs hidden (user can toggle with 'v')
         if duration_seconds:
@@ -607,10 +635,12 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
 
     def _on_success():
         # run_scheduled_stream() already prints its own "[RECORDING COMPLETE]"
-        # banner right after this returns — just report the path here.
-        print(f"Saved to: {output_path}")
-        if extract_subs:
-            extract_subtitles_from_recording(output_path)
+        # banner right after this returns — just report the path(s) here.
+        saved = [p for p in written_paths if p.exists() and p.stat().st_size > 0]
+        for path in saved or [output_path]:
+            print(f"Saved to: {path}")
+            if extract_subs and path.exists():
+                extract_subtitles_from_recording(path)
 
     evt = cancel_event or threading.Event()
     result = run_scheduled_stream(
@@ -623,6 +653,7 @@ def scheduled_recording_task(channel_url: str, output_path: Path, delay_seconds:
         log_fn=lambda **kw: log_mpv_output(**kw, log_path=RECORDINGS_LOG_FILE),
         on_success=_on_success,
         refresh_data_fn=_refresh_channels_epg,
+        record_seconds=duration_seconds,
     )
     if result["status"] != "rerun_found":
         return
@@ -909,6 +940,7 @@ def play_channel(channel: Channel, show_result: Optional[ShowResult] = None):
             sleep_seconds = int(_sleep_input) * 60
             mpv_args.append(f"--length={sleep_seconds}")
 
+    mpv_args.extend(_core.mpv_stream_header_args(channel_url))
     mpv_args.append("--")
     mpv_args.append(channel_url)
 
@@ -1284,6 +1316,7 @@ def main():
         _h_mpv = ["mpv", f"--stream-record={_h_path}", *MPV_RESILIENCE_ARGS, "--sid=auto", "--no-sub-visibility"]
         if _h_dur:
             _h_mpv.append(f"--length={_h_dur}")
+        _h_mpv.extend(_core.mpv_stream_header_args(_h_url))
         _h_mpv.append("--")
         _h_mpv.append(_h_url)
         try:
@@ -1329,7 +1362,8 @@ def main():
             s_end   = s_start + len(search_now_playing) - 1
             label   = str(s_start) if s_start == s_end else f"{s_start}-{s_end}"
             print(f"  {label}: Watch from recent searches")
-        print("  s: Search for show/movie")
+        if not args.no_epg:
+            print("  s: Search for show/movie")
         print("  c: Search for channel")
         print("  g: Browse by channel group")
         print("  fav: Manage favorites")
@@ -1337,7 +1371,8 @@ def main():
         print("  rec: Browse and play recordings")
         print("  export: Export watch history to CSV")
         print("  hc: Check channel health")
-        print("  epg: Refresh EPG data")
+        if not args.no_epg:
+            print("  epg: Refresh EPG data")
         print("  cfg: Reload config")
         if len(playlists) > 1:
             print("  pl: Switch playlist")
@@ -1348,10 +1383,10 @@ def main():
         if _startup_search:
             choice = 's'
         else:
-            choice = input("\nYour choice (default: s): ").strip().lower()
-
-        if not choice:
-            choice = 's'
+            default_choice = 'c' if args.no_epg else 's'
+            choice = input(f"\nYour choice (default: {default_choice}): ").strip().lower()
+            if not choice:
+                choice = default_choice
 
         if choice in ("quit", "exit"):
             with SCHEDULED_TASKS_LOCK:
