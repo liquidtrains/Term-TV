@@ -2212,18 +2212,41 @@ function setupEvents() {
 }
 
 // ── Data loading ──────────────────────────────────────────────────────────
+// The server sends the guide a page of GUIDE_PAGE channels at a time;
+// loadMoreChannels() appends the next page when the guide is scrolled near
+// its bottom. loadGuide() re-fetches every page already loaded (and keeps the
+// scroll position) unless the group/language filter changed, which starts
+// over from the top.
+const GUIDE_PAGE = 200;
+let _guideGen       = 0;      // bumped per loadGuide(); stale "load more" replies are dropped
+let _loadingMore    = false;
+let _guideFilterKey = null;   // filter the loaded pages belong to
+
+function _guideParams(offset, limit) {
+  const p = new URLSearchParams({ start_ts: winStartTs, hours: WIN_HRS, offset: offset, limit: limit });
+  selectedGroups.forEach(g => p.append('groups', g));
+  selectedLangs.forEach(l => p.append('langs', l));
+  return p;
+}
+
+function _currentFilterKey() {
+  return JSON.stringify([[...selectedGroups].sort(), [...selectedLangs].sort()]);
+}
+
 // silent=true: background refresh (no loading overlay, skipped if already running)
 async function loadGuide(silent = false) {
   if (_loadGuideActive && silent) return;  // skip concurrent background refreshes
   _loadGuideActive = true;
+  const gen = ++_guideGen;
 
   // Cancel any pending error-retry; this call supersedes it
   if (_guideRetryTimer !== null) { clearTimeout(_guideRetryTimer); _guideRetryTimer = null; }
 
   if (!silent) setLoading(true);
-  const p = new URLSearchParams({ start_ts: winStartTs, hours: WIN_HRS });
-  selectedGroups.forEach(g => p.append('groups', g));
-  selectedLangs.forEach(l => p.append('langs', l));
+  const filterKey = _currentFilterKey();
+  const sameFilter = guideData && filterKey === _guideFilterKey;
+  const loaded = sameFilter ? (guideData.channels || []).length : 0;
+  const p = _guideParams(0, Math.max(GUIDE_PAGE, loaded));
   let hadError = false;  // keep the overlay (with its message) visible on error/retry instead
                           // of hiding it in finally the instant it's set
   try {
@@ -2233,7 +2256,10 @@ async function loadGuide(silent = false) {
     const res = await fetch('/api/guide?' + p, { signal: _ctrl.signal });
     clearTimeout(_timeout);
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    guideData = await res.json();
+    const data = await res.json();
+    if (gen !== _guideGen) return;  // a newer load started meanwhile
+    guideData = data;
+    _guideFilterKey = filterKey;
     loadedAt  = Date.now();
     if (guideData.error) {
       hadError = true;
@@ -2242,7 +2268,7 @@ async function loadGuide(silent = false) {
       _guideRetryTimer = setTimeout(() => loadGuide(), 3000);
       return;
     }
-    renderGuide(guideData.channels);
+    renderGuide(guideData.channels, sameFilter);
     updateInfoBar();
     setLoading(false);  // always dismiss overlay on successful render (even if silent)
   } catch (e) {
@@ -2256,57 +2282,121 @@ async function loadGuide(silent = false) {
   } finally {
     _loadGuideActive = false;
     if (!silent && !hadError) setLoading(false);  // dismiss overlay on success; leave error/retry message visible otherwise
+    // A reload may have discarded an in-flight "load more" while the guide
+    // was already scrolled to its end; no further scroll event would come,
+    // so check here instead of waiting for one.
+    if (!hadError) setTimeout(_maybeLoadMore, 0);
   }
 }
 
+async function loadMoreChannels() {
+  if (_loadingMore || _loadGuideActive || !guideData || !guideData.has_more || vodMode) return;
+  _loadingMore = true;
+  const gen = _guideGen;
+  let ok = false;
+  try {
+    const res = await fetch('/api/guide?' + _guideParams(guideData.channels.length, GUIDE_PAGE));
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    // Dropped if the guide was reloaded (new filter, time window, refresh) meanwhile
+    if (gen !== _guideGen || data.error || !guideData) return;
+    guideData.channels = guideData.channels.concat(data.channels);
+    guideData.total    = data.total;
+    guideData.has_more = data.has_more;
+    appendGuideRows(data.channels);
+    ok = true;
+  } catch (e) {
+    showToast('Could not load more channels: ' + e.message, true);
+  } finally {
+    _loadingMore = false;
+    // Keep going while the screen still isn't filled (not after an error,
+    // which would just retry in a tight loop; the next scroll retries it).
+    if (ok) setTimeout(_maybeLoadMore, 0);
+  }
+}
+
+// Fetch the next page when the guide is scrolled within a few rows of its
+// end, or when the loaded rows don't even fill the screen (e.g. a local
+// search left only a few of them visible).
+function _maybeLoadMore() {
+  const guide = document.getElementById('guide');
+  if (!guide || !guideData || !guideData.has_more) return;
+  if (guide.scrollTop + guide.clientHeight >= guide.scrollHeight - 8 * ROW_H) loadMoreChannels();
+}
+
 // ── Rendering ─────────────────────────────────────────────────────────────
-function renderGuide(channels) {
+// keepScroll: same channels re-rendered (refresh, time navigation), so stay
+// where the user was instead of jumping back to the top.
+function renderGuide(channels, keepScroll = false) {
   // Fix-7: DOM is being replaced — invalidate cached row reference
   _playingRow    = null;
   _playingChName = '';
   const guide   = document.getElementById('guide');
+  const top     = guide.scrollTop;
+  const left    = guide.scrollLeft;
   const totalW  = WIN_HRS * 60 * PX_MIN;
   const frag    = document.createDocumentFragment();
 
   frag.appendChild(buildTimeRow(totalW));
-  for (const ch of channels) frag.appendChild(buildRow(ch, totalW));
+  for (const ch of _locallyFiltered(channels)) frag.appendChild(buildRow(ch, totalW));
 
   guide.innerHTML = '';
   guide.appendChild(frag);
+  if (keepScroll) {
+    guide.scrollTop  = top;
+    guide.scrollLeft = left;
+  } else {
+    guide.scrollTop = 0;
+  }
   positionNowLine();
+}
+
+function appendGuideRows(channels) {
+  const guide  = document.getElementById('guide');
+  const totalW = WIN_HRS * 60 * PX_MIN;
+  const frag   = document.createDocumentFragment();
+  for (const ch of _locallyFiltered(channels)) frag.appendChild(buildRow(ch, totalW));
+  guide.appendChild(frag);
+  _updateCorner();
+}
+
+// The search box also narrows the loaded rows (by channel, group or title).
+function _locallyFiltered(channels) {
+  const q = searchQLower;
+  if (!q) return channels;
+  return channels.filter(ch => {
+    if (ch.name.toLowerCase().includes(q)) return true;
+    if ((ch.group || '').toLowerCase().includes(q)) return true;
+    return (ch.programs || []).some(p => p.title.toLowerCase().includes(q));
+  });
 }
 
 function filterRender() {
   if (!guideData) return;
-  const q  = searchQLower;
-  let chs  = guideData.channels;
-  if (q) {
-    chs = chs.filter(ch => {
-      if (ch.name.toLowerCase().includes(q)) return true;
-      if ((ch.group || '').toLowerCase().includes(q)) return true;
-      return (ch.programs || []).some(p => p.title.toLowerCase().includes(q));
-    });
+  renderGuide(guideData.channels);
+  _maybeLoadMore();
+}
+
+function _updateCorner(corner) {
+  corner = corner || document.querySelector('#guide .corner');
+  if (!corner || !guideData) return;
+  const loaded = (guideData.channels || []).length;
+  const total  = guideData.total || 0;
+  if (guideData.has_more) {
+    corner.textContent = loaded + '/' + total + ' ch';
+    corner.title = 'Showing ' + loaded + ' of ' + total + ' channels \u2014 scroll down to load more';
+    corner.style.color = 'var(--accent)';
+  } else {
+    corner.textContent = total + ' ch';
+    corner.title = '';
+    corner.style.color = '';
   }
-  const guide  = document.getElementById('guide');
-  const totalW = WIN_HRS * 60 * PX_MIN;
-  const frag   = document.createDocumentFragment();
-  frag.appendChild(buildTimeRow(totalW));
-  for (const ch of chs) frag.appendChild(buildRow(ch, totalW));
-  guide.innerHTML = '';
-  guide.appendChild(frag);
-  positionNowLine();
 }
 
 function buildTimeRow(totalW) {
   const row    = mk('div', 'row row-time');
   const corner = mk('div', 'ch-cell corner');
-  if (guideData.truncated) {
-    corner.textContent = guideData.shown + '/' + guideData.total + ' ch';
-    corner.title = 'Showing first ' + guideData.shown + ' of ' + guideData.total + ' channels — use Groups to filter';
-    corner.style.color = 'var(--accent)';
-  } else {
-    corner.textContent = (guideData.total || 0) + ' ch';
-  }
+  _updateCorner(corner);
   row.appendChild(corner);
 
   const area = mk('div', 'prog-area time-area');
@@ -2455,6 +2545,13 @@ function positionNowLine() {
 
 // Keep now-line synced on scroll
 document.addEventListener('scroll', positionNowLine, true);
+
+// Load the next page of channels as the guide nears its bottom. The check
+// is a cheap position comparison and loadMoreChannels() ignores calls while
+// a page is already on its way, so it runs on every scroll event.
+document.addEventListener('scroll', e => {
+  if (e.target && e.target.id === 'guide') _maybeLoadMore();
+}, true);
 
 function jumpToNow() {
   if (!guideData) return;
@@ -3800,6 +3897,12 @@ def index():
     return resp
 
 
+# Channels per guide page, and the most one request may ask for (a refresh
+# re-fetches every page already scrolled through).
+GUIDE_PAGE_SIZE = 200
+GUIDE_MAX_LIMIT = 5000
+
+
 @app.route("/api/guide")
 def api_guide():
     _t0      = time.time()
@@ -3845,9 +3948,12 @@ def api_guide():
     lang_filter = set(request.args.getlist("langs"))
     dead_map = _dead_snapshot()
 
-    # Build channel list with programmes in the window
-    # Fix-3: Count total matching channels but only build EPG data for the first 200
-    GUIDE_CH_LIMIT = 200
+    # The guide is served in pages: every matching channel is counted, but
+    # programmes are only built for the requested slice. The page asks for the
+    # next slice as it scrolls; a refresh asks for everything already shown.
+    # (A fixed cap of 200 used to make channel 201 onwards unreachable.)
+    offset = max(0, request.args.get("offset", default=0, type=int))
+    limit  = max(1, min(request.args.get("limit", default=GUIDE_PAGE_SIZE, type=int), GUIDE_MAX_LIMIT))
     result = []
     total  = 0
     for ch in channels:
@@ -3856,7 +3962,7 @@ def api_guide():
         if lang_filter and not channel_matches_languages(ch, lang_filter):
             continue
         total += 1
-        if total > GUIDE_CH_LIMIT:
+        if not (offset < total <= offset + limit):
             continue  # still count, but skip the expensive EPG build
 
         ch_name = ch.get("name", "")
@@ -3899,16 +4005,15 @@ def api_guide():
             "programs": progs,
         })
 
-    truncated = total > GUIDE_CH_LIMIT
     print(f"api_guide: built result ({len(result)} ch, {sum(len(c['programs']) for c in result)} progs) in {time.time()-_t0:.3f}s")
     resp = jsonify({
         "window_start_ts": int(start_ts),
         "window_end_ts":   int(end_ts),
         "now_ts":          int(now_ts),
         "channels":        result,
+        "offset":          offset,
         "total":           total,
-        "truncated":       truncated,
-        "shown":           min(total, GUIDE_CH_LIMIT),
+        "has_more":        offset + len(result) < total,
     })
     print(f"api_guide: jsonify done, total {time.time()-_t0:.3f}s")
     return resp
