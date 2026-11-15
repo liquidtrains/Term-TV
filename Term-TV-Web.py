@@ -3,7 +3,7 @@
 Term-TV Web  —  Browser-based IPTV TV Guide with MPV integration.
 
 Run:    python Term-TV-Web.py
-Opens:  http://localhost:8080
+Opens:  http://127.0.0.1:8891 (web_port in config.json or --port to change)
 
 Features:
   • Fast EPG grid TV guide in your browser
@@ -410,7 +410,21 @@ def disconnect_vpn():
     _invalidate_ip_cache()
 
 
+_signal_handlers_registered = False
+
+
 def _register_vpn_signal_handlers():
+    """Install the exit handlers once per process.
+
+    Every VPN (re)connect used to call this again, creating a new ctypes
+    console callback and dropping the Python reference to the previous one
+    while Windows still held a raw pointer to it: closing the window after a
+    couple of reconnects could call freed memory. Term-TV-VPN.py fixed the
+    same bug the same way.
+    """
+    global _signal_handlers_registered
+    if _signal_handlers_registered:
+        return
     import signal
 
     def _on_signal(signum, frame):
@@ -435,6 +449,7 @@ def _register_vpn_signal_handlers():
 
         _win_console_handler_ref = _ctrl_handler
         ctypes.windll.kernel32.SetConsoleCtrlHandler(_ctrl_handler, True)
+    _signal_handlers_registered = True
 
 
 def _register_vpn_signal_handlers_safe():
@@ -572,6 +587,7 @@ def _launch_mpv_locked(url: str, channel_name: str, show_title: str = "", stall_
     mpv_args = [
         "mpv",
         *MPV_RESILIENCE_ARGS,
+        *_core.mpv_stream_header_args(url),
         "--",
         url,
     ]
@@ -1032,6 +1048,14 @@ def _write_recording_sidecar(out_path: Path, channel: str, show: str, url: str,
 # hand, and a long recording can plausibly hit more than one bad ad break.
 RECORDING_STALL_MAX_RETRIES = 2
 
+# A recording whose mpv exits more than this long before the programme's
+# stop time ended early (a live stream that drops exits normally).
+RECORDING_EARLY_END_GRACE = 60
+# Pause before restarting a recording, so a dead link isn't hammered.
+RECORDING_RETRY_DELAY = 5
+# Other channels to try once the original source keeps failing.
+RECORDING_MAX_ALTERNATIVES = 3
+
 
 def _spawn_recording_mpv(url: str, out_path: Path, channel: str, show: str) -> Tuple[subprocess.Popen, Any]:
     """Opens the mpv-output.log append handle and starts mpv recording to
@@ -1042,6 +1066,7 @@ def _spawn_recording_mpv(url: str, out_path: Path, channel: str, show: str) -> T
         f"--stream-record={out_path}",
         "--vo=null", "--ao=null",             # background — no window, but keep tracks selected so stream-record has data
         *MPV_RESILIENCE_ARGS,
+        *_core.mpv_stream_header_args(url),
         "--",
         url,
     ]
@@ -1120,17 +1145,51 @@ def launch_recording(url: str, channel: str, show: str = "", stop_ts: int = 0,
         return {"ok": False, "error": str(e)}
 
 
+def _find_alternative_recording_source(show: str, tried: Tuple[str, ...]) -> Optional[Dict]:
+    """Another channel airing *show* right now, not one already tried."""
+    if not show:
+        return None
+    try:
+        candidates = search_shows_web(show, hours_ahead=0)
+    except Exception as e:
+        logging.warning(f"Alternative recording source search failed: {e}")
+        return None
+    want = show.strip().lower()
+    for c in candidates:
+        if (c.get("is_now") and c.get("channel_url") and c["channel_url"] not in tried
+                and c.get("title", "").strip().lower() == want):
+            return c
+    return None
+
+
+def _give_up_recording(rec_id: str, proc: subprocess.Popen, show: str, channel: str, why: str):
+    logging.warning(f"Recording '{show or channel}' {why}; keeping what was recorded so far")
+    with _recordings_lock:
+        rec = _recordings.get(rec_id)
+        if rec and rec.get("process") is proc:
+            rec["process"] = None  # mpv is dead; nothing left for stop_recording() to kill
+    _save_active_recordings()
+    send_desktop_notification("Term-TV", f"Recording interrupted: {show or channel} ({why})")
+
+
 def _pump_recording_output(rec_id: str, proc: subprocess.Popen, log_handle, url: str,
                             channel: str, show: str, stop_ts: int, epg_meta: Optional[Dict],
-                            base_out_path: Path, part_num: int, stall_retries_left: int) -> None:
-    """Tees *proc*'s stdout to *log_handle* and watches for a stuck recording
-    (see MpvStallWatchdog). Unlike live playback, nobody's watching a
-    recording live to notice a freeze — it would otherwise just sit hung,
-    silently producing an incomplete file, until the already-scheduled
-    auto-stop timer (if any) eventually kills it hours later. On a stall,
-    starts a fresh "_partN" file continuing from where this one died instead
-    of leaving the recording stuck or corrupting it with an in-place retry.
+                            base_out_path: Path, part_num: int, stall_retries_left: int,
+                            tried_urls: Tuple[str, ...] = ()) -> None:
+    """Tees *proc*'s stdout to *log_handle* and keeps an unattended recording
+    going until its programme ends.
+
+    Nobody watches a recording live, so every way it can stop early has to be
+    handled here: a stall (see MpvStallWatchdog), losing mpv's output, and mpv
+    simply exiting before the stop time. That last one is the common case, a
+    live stream that drops, and mpv reports it as a normal exit, so it used to
+    end the recording silently; a dead link the moment a scheduled recording
+    started looked the same. Each restart writes a fresh "_partN" file (an
+    in-place retry would truncate what was recorded). After
+    RECORDING_STALL_MAX_RETRIES quick failures it moves to another channel
+    airing the same programme, up to RECORDING_MAX_ALTERNATIVES of them.
     """
+    tried = tuple(tried_urls) or (url,)
     watchdog = MpvStallWatchdog()
     pump_started = time.monotonic()
     stalled = False
@@ -1160,52 +1219,66 @@ def _pump_recording_output(rec_id: str, proc: subprocess.Popen, log_handle, url:
             proc.kill()
         except Exception:
             pass
-
-    if not (stalled or lost_pipe):
-        return
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
 
     with _recordings_lock:
         rec = _recordings.get(rec_id)
-        is_current = bool(rec) and rec.get("process") is proc
+        is_current = bool(rec) and rec.get("process") is proc and not rec.get("stopping")
     if not is_current:
-        return  # user already stopped this recording — not our stall to handle
+        return  # stopped by the user or the auto-stop timer — nothing to recover
 
+    seconds_left = (stop_ts - time.time()) if stop_ts else 0
+    ended_early = not (stalled or lost_pipe) and seconds_left > RECORDING_EARLY_END_GRACE
+    if not (stalled or lost_pipe or ended_early):
+        return  # finished normally, or no known end time to judge it by
+
+    why = "stalled" if stalled else ("lost mpv output" if lost_pipe else "stream ended early")
     try:
+        log_handle.write(f"\n[recording] {why}, {int(seconds_left)}s before the programme ends\n")
         log_handle.close()
     except Exception:
         pass
 
-    if time.monotonic() - pump_started > MPV_STALL_RETRY_RESET_SECONDS:
-        stall_retries_left = RECORDING_STALL_MAX_RETRIES  # long healthy part, so treat this as a new incident
     # Right before the programme ends, the auto-stop timer would kill a new
     # part within seconds, which just leaves a near-empty _partN file behind.
-    near_stop = bool(stop_ts) and stop_ts - time.time() < 30
-    if stall_retries_left <= 0 or near_stop:
-        reason = "programme is about to end" if near_stop else "kept failing"
-        logging.warning(f"Recording '{channel}' stalled and {reason}; not restarting, keeping what was recorded so far")
-        with _recordings_lock:
-            rec = _recordings.get(rec_id)
-            if rec and rec.get("process") is proc:
-                rec["process"] = None  # mpv is dead; nothing left for stop_recording() to kill
-        _save_active_recordings()
+    if stop_ts and seconds_left < 30:
+        _give_up_recording(rec_id, proc, show, channel, f"{why} as the programme was ending")
         return
+
+    if time.monotonic() - pump_started > MPV_STALL_RETRY_RESET_SECONDS:
+        stall_retries_left = RECORDING_STALL_MAX_RETRIES  # long healthy part, so treat this as a new incident
+    next_url = url
+    if stall_retries_left > 0:
+        stall_retries_left -= 1
+    else:
+        alt = (_find_alternative_recording_source(show, tried)
+               if len(tried) <= RECORDING_MAX_ALTERNATIVES else None)
+        if not alt:
+            _give_up_recording(rec_id, proc, show, channel, f"{why} and no other source is airing it")
+            return
+        next_url = alt["channel_url"]
+        tried = tried + (next_url,)
+        stall_retries_left = RECORDING_STALL_MAX_RETRIES
+        logging.info(f"Recording '{show}' switching to {alt.get('channel_name', '?')} after repeated failures")
+        send_desktop_notification("Term-TV", f"Recording {show}: switched to {alt.get('channel_name', 'another channel')}")
+
+    time.sleep(RECORDING_RETRY_DELAY)
 
     next_part = part_num + 1
     new_path = base_out_path.with_name(f"{base_out_path.stem}_part{next_part}{base_out_path.suffix}")
     try:
-        new_proc, new_log_handle = _spawn_recording_mpv(url, new_path, channel, show)
+        new_proc, new_log_handle = _spawn_recording_mpv(next_url, new_path, channel, show)
     except Exception as e:
         logging.error(f"Could not start recording continuation for '{channel}': {e}")
-        with _recordings_lock:
-            rec = _recordings.get(rec_id)
-            if rec and rec.get("process") is proc:
-                rec["process"] = None
-        _save_active_recordings()
+        _give_up_recording(rec_id, proc, show, channel, "could not restart mpv")
         return
 
     with _recordings_lock:
         rec = _recordings.get(rec_id)
-        if not rec or rec.get("process") is not proc:
+        if not rec or rec.get("process") is not proc or rec.get("stopping"):
             # Superseded while we were restarting (e.g. user clicked stop) —
             # don't leave the process we just started orphaned and untracked.
             new_proc.kill()
@@ -1218,14 +1291,14 @@ def _pump_recording_output(rec_id: str, proc: subprocess.Popen, log_handle, url:
         rec["log_handle"] = new_log_handle
         rec["path"]       = str(new_path)
         rec["filename"]   = new_path.name
-    logging.info(f"Recording '{channel}' continuing as part {next_part} after stall/error: {new_path.name}")
+    logging.info(f"Recording '{channel}' continuing as part {next_part} after {why}: {new_path.name}")
     _save_active_recordings()
-    _write_recording_sidecar(new_path, channel, show, url, stop_ts, epg_meta)
+    _write_recording_sidecar(new_path, channel, show, next_url, stop_ts, epg_meta)
 
     threading.Thread(
         target=_pump_recording_output,
-        args=(rec_id, new_proc, new_log_handle, url, channel, show, stop_ts, epg_meta,
-              base_out_path, next_part, stall_retries_left - 1),
+        args=(rec_id, new_proc, new_log_handle, next_url, channel, show, stop_ts, epg_meta,
+              base_out_path, next_part, stall_retries_left, tried),
         daemon=True,
     ).start()
 
@@ -1236,6 +1309,9 @@ def stop_recording(rec_id: str) -> bool:
         rec = _recordings.get(rec_id)
         if not rec:
             return False
+        # Tell the output pump this exit is intentional, so it doesn't
+        # mistake it for a dropped stream and start a new part.
+        rec["stopping"] = True
         proc = rec.get("process")
         pid  = rec.get("pid")
         lh   = rec.get("log_handle")
@@ -1351,6 +1427,33 @@ _data_lock                       = threading.Lock()
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
+
+
+@app.before_request
+def _reject_cross_site_requests():
+    """Only answer requests made by this app's own page.
+
+    The server has no login, and every POST handler reads its body with
+    get_json(force=True), which ignores the Content-Type. Browsers let any
+    website send a "simple" text/plain POST to 127.0.0.1 without asking, so
+    a page you happened to visit could delete recordings, start recordings,
+    open mpv on any URL or drop the VPN. Two checks close that:
+
+      * Host must be this server's own address, which defeats DNS rebinding
+        (a hostile domain re-pointed at 127.0.0.1 sends its own Host).
+      * A state-changing request carrying an Origin must come from that same
+        address. Browsers always send Origin on cross-site POSTs; tools such
+        as curl send none and are still allowed.
+    """
+    own = {f"127.0.0.1:{WEB_PORT}", f"localhost:{WEB_PORT}"}
+    if (request.host or "").lower() not in own:
+        return jsonify({"ok": False, "error": "Forbidden host"}), 403
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        origin = (request.headers.get("Origin") or "").rstrip("/").lower()
+        if origin and origin not in {f"http://{h}" for h in own}:
+            logging.warning(f"Rejected cross-site {request.method} {request.path} from {origin}")
+            return jsonify({"ok": False, "error": "Cross-site request rejected"}), 403
+    return None
 
 
 # ── HTML / CSS / JS template ──────────────────────────────────────────────────
@@ -4208,6 +4311,7 @@ def _try_mpv_stream(url: str, title: str) -> bool:
         proc = subprocess.Popen([
             "mpv",
             *MPV_RESILIENCE_ARGS,
+            *_core.mpv_stream_header_args(url),
             "--",
             url,
         ], stdin=subprocess.DEVNULL)
@@ -4311,10 +4415,14 @@ def _restore_web_tasks():
     for t in saved:
         try:
             start_ts = int(t.get("start_ts", 0))
-            if start_ts <= now:
+            stop_ts = int(t.get("stop_ts", 0) or 0)
+            # A recording whose programme is still on (the server restarted
+            # after its start time) starts now for the rest of the programme
+            # instead of being thrown away; its spawn delay clamps to zero.
+            in_progress = t.get("type") == "record_scheduled" and stop_ts > now + RECORDING_EARLY_END_GRACE
+            if start_ts <= now and not in_progress:
                 continue  # expired while the server was down
             cancel_evt = threading.Event()
-            stop_ts = int(t.get("stop_ts", 0) or 0)
             epg_meta = t.get("epg_meta") if isinstance(t.get("epg_meta"), dict) else None
             task = {"id": int(t["id"]), "type": t.get("type", "schedule"),
                     "title": t.get("title", "Unknown"), "ch_name": t.get("ch_name", ""),
@@ -4463,6 +4571,7 @@ def api_play_new():
         subprocess.Popen([
             "mpv",
             *MPV_RESILIENCE_ARGS,
+            *_core.mpv_stream_header_args(url),
             "--",
             url,
         ], **kw)
@@ -4921,7 +5030,7 @@ def _open_browser():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global _config, _vpn_configured, _skip_epg, WEB_PORT, WEB_URL
+    global _config, _vpn_configured, _skip_epg, WEB_PORT, WEB_URL, RECORDINGS_DIR
 
     parser = argparse.ArgumentParser(description="Term-TV Web: Browser-based IPTV guide")
     parser.add_argument("--skip-vpn",  action="store_true", help="Skip VPN prompt at startup")
@@ -4961,6 +5070,11 @@ def main():
     # Keep api_sources()/_load_data()/source indices aligned with the filtered
     # list (disabled or malformed entries would otherwise shift the indices).
     _config["playlists"] = playlists
+
+    # Same recordings folder as the CLIs, so each app sees the other's files.
+    if _config.get("recordings_dir"):
+        RECORDINGS_DIR = Path(str(_config["recordings_dir"])).expanduser()
+        _core.RECORDINGS_DIR = RECORDINGS_DIR
 
     # F8: configurable port (--port beats config web_port beats default)
     if args.port:

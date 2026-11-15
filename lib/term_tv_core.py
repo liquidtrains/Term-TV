@@ -203,6 +203,27 @@ _language_index: Optional[Dict[str, Any]] = None
 _language_index_lock = threading.Lock()
 
 
+# Serialises read-modify-write of the small JSON state files (watch history,
+# favorites, notes, search history, scheduled tasks). The Web UI runs request
+# handlers on several threads, and two quick clicks used to interleave a load
+# and a save so one change silently overwrote the other.
+_STATE_LOCK = threading.RLock()
+
+
+def _write_json_atomic(path: Path, data: Any):
+    """Write *data* to a temp file and rename it over *path*.
+
+    Writing in place meant a crash or Ctrl+C mid-write left a truncated file,
+    which the loaders then treat as empty: the whole watch history or favorites
+    list was lost.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
 def _read_json_file(path: Path) -> Optional[Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -536,17 +557,18 @@ def save_search_history(searches: List[str], max_entries: int = 5):
         if len(unique) >= max_entries:
             break
     try:
-        with open(SEARCH_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump({"searches": unique, "last_updated": datetime.now().isoformat()}, f, indent=2)
+        with _STATE_LOCK:
+            _write_json_atomic(SEARCH_HISTORY_FILE, {"searches": unique, "last_updated": datetime.now().isoformat()})
     except Exception as e:
         logging.warning(f"Failed to save search history: {e}")
 
 
 def add_to_search_history(search_term: str):
     """Prepend a successful search term and persist."""
-    searches = load_search_history()
-    searches.insert(0, search_term)
-    save_search_history(searches)
+    with _STATE_LOCK:
+        searches = load_search_history()
+        searches.insert(0, search_term)
+        save_search_history(searches)
     logging.info(f"Added to search history: {search_term}")
 
 # ---------------------------------------------------------------------------
@@ -659,32 +681,65 @@ def check_vpn_status(expected_vpn_ip: Optional[str] = None) -> bool:
 # M3U loading
 # ---------------------------------------------------------------------------
 
+# Per-stream HTTP headers some playlists require, keyed by stream URL. They
+# come from #EXTINF attributes (http-user-agent="...") or #EXTVLCOPT lines,
+# and mpv needs them passed as --user-agent/--referrer: without them those
+# servers answer 403, which looked exactly like a geo-blocked or dead channel.
+# A module-level map (filled whenever a playlist is parsed) lets every mpv
+# call site look them up from the URL alone, via mpv_stream_header_args().
+_STREAM_HEADERS: Dict[str, Dict[str, str]] = {}
+_STREAM_HEADERS_LOCK = threading.Lock()
+_M3U_ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
+_HEADER_KEYS = {"http-user-agent": "http-user-agent",
+                "http-referrer": "http-referrer", "http-referer": "http-referrer"}
+
+
+def mpv_stream_header_args(url: str) -> List[str]:
+    """mpv options for the HTTP headers the playlist asked for on *url*."""
+    with _STREAM_HEADERS_LOCK:
+        headers = _STREAM_HEADERS.get(url) or {}
+    args = []
+    if headers.get("http-user-agent"):
+        args.append(f"--user-agent={headers['http-user-agent']}")
+    if headers.get("http-referrer"):
+        args.append(f"--referrer={headers['http-referrer']}")
+    return args
+
+
 def _parse_m3u_lines(lines: List[str]) -> List[Channel]:
-    """Parse raw M3U text lines into a list of channel dicts."""
+    """Parse raw M3U text lines into a list of channel dicts.
+
+    Every key="value" attribute on the #EXTINF line is kept (tvg-country,
+    tvg-language, tvg-name, http-user-agent, ...), not just the handful the
+    UI displays: the language filter reads tvg-country/tvg-language, and the
+    HTTP header attributes are needed to play some streams at all.
+    """
     channels: List[Channel] = []
     current: Optional[Dict[str, str]] = None
     for line in lines:
         line = line.strip()
         if line.startswith("#EXTINF"):
             current = {}
-            m = re.search(r'tvg-id="([^"]*)"', line)
-            if m:
-                current["tvg-id"] = m.group(1)
-            m = re.search(r'tvg-logo="([^"]*)"', line)
-            if m:
-                current["tvg-logo"] = m.group(1)
-            m = re.search(r'group-title="([^"]*)"', line)
-            if m:
-                current["group-title"] = m.group(1)
             # Channel name is everything after the comma that ends the
             # attribute section.  Splitting on the LAST comma would truncate
             # names like "NCIS, Los Angeles", so find the first comma after
             # the final quoted attribute instead.
             last_quote = line.rfind('"')
             comma_idx = line.find(",", last_quote + 1) if last_quote != -1 else line.find(",")
+            attr_part = line[:comma_idx] if comma_idx != -1 else line
+            for key, value in _M3U_ATTR_RE.findall(attr_part):
+                key = _HEADER_KEYS.get(key.lower(), key)
+                # "name"/"url" are set from the line itself, never from an attribute
+                if value and key not in current and key not in ("name", "url"):
+                    current[key] = value
             name_part = line[comma_idx + 1:] if comma_idx != -1 else ""
             if name_part.strip():
                 current["name"] = name_part.strip()
+        elif line.startswith("#EXTVLCOPT:") and current is not None:
+            key, sep, value = line[len("#EXTVLCOPT:"):].partition("=")
+            key = _HEADER_KEYS.get(key.strip().lower())
+            if sep and key and value.strip():
+                current.setdefault(key, value.strip())
         elif line and not line.startswith("#") and current is not None:
             if "name" in current:
                 current["url"] = line
@@ -703,7 +758,13 @@ def _parse_m3u_lines(lines: List[str]) -> List[Channel]:
             g_new = ch.get("group-title", "")
             if g_new and g_new not in g_existing:
                 seen[url]["group-title"] = f"{g_existing}, {g_new}" if g_existing else g_new
-    return [seen[url] for url in order]
+    result = [seen[url] for url in order]
+    with _STREAM_HEADERS_LOCK:
+        for ch in result:
+            headers = {k: ch[k] for k in ("http-user-agent", "http-referrer") if ch.get(k)}
+            if headers:
+                _STREAM_HEADERS[ch["url"]] = headers
+    return result
 
 
 def load_m3u(url: str) -> List[Channel]:
@@ -1722,6 +1783,15 @@ def archive_log_file(log_file: Path, archive_dir: Path, prefix: str,
 # Shared scheduled-task retry/failover engine
 # ---------------------------------------------------------------------------
 
+# A recording that stops more than this long before its end time ended early.
+_EARLY_END_GRACE_SECONDS = 60
+# An attempt that ran at least this long made real progress; its failure
+# resumes the stream instead of counting toward the switch to alternatives.
+_PROGRESS_SECONDS = 120
+# Upper bound on retries of one URL, so a stream that keeps playing for a few
+# minutes and then failing can't loop forever when there is no end time.
+_MAX_STREAM_ATTEMPTS = 20
+
 def run_scheduled_stream(
     kind: str,
     channel_url: str,
@@ -1743,6 +1813,7 @@ def run_scheduled_stream(
     on_stream_start: Optional[Callable[[], None]] = None,
     on_stream_stop: Optional[Callable[[], None]] = None,
     refresh_data_fn: Optional[Callable[[], Tuple[List[Channel], EpgData]]] = None,
+    record_seconds: int = 0,
 ) -> Dict[str, Any]:
     """Wait, then try-and-fail-over a scheduled stream (playback or recording).
 
@@ -1771,6 +1842,15 @@ def run_scheduled_stream(
     channel and future-rerun searches, instead of relying on the snapshot
     taken when the task's background thread started (which can be hours
     stale by the time a failover actually runs).
+
+    record_seconds (recordings only) is how long the recording should run.
+    mpv exits with status 0 both when --length is reached and when a live
+    stream simply ends, so without it a stream that dropped five minutes into
+    an hour-long programme was reported as a finished recording. With it, an
+    end well before the deadline counts as a failed attempt and the stream is
+    retried (mpv_cmd_builder must then write to a new file: --stream-record
+    truncates the old one). An attempt that ran for a while doesn't use up
+    the retry budget, so a long recording survives several drops.
 
     Returns {"status": "cancelled" | "success" | "failed"} or
     {"status": "rerun_found", "rerun": <dict from find_future_reruns>, "new_delay": int}
@@ -1818,6 +1898,10 @@ def run_scheduled_stream(
     logging.info(f"Starting {kind}: {show_title}")
 
     overall_start = time.time()
+    deadline = overall_start + record_seconds if (kind == "recording" and record_seconds) else None
+
+    def _time_left() -> float:
+        return float("inf") if deadline is None else deadline - time.time()
 
     def _try_url(url: str, label: str) -> bool:
         """Launch mpv for *url* and wait for it to exit. Returns True on
@@ -1881,6 +1965,12 @@ def run_scheduled_stream(
 
         log_fn(channel_name=label, command=mpv_cmd, stdout=stdout, stderr=stderr, returncode=returncode)
 
+        if (returncode == 0 and _time_left() > _EARLY_END_GRACE_SECONDS
+                and "Exiting... (End of file)" in stdout):
+            logging.warning(f"{kind.capitalize()} stream ended {int(_time_left())}s early — {label}")
+            print(f"[{tag}] Stream ended early ({int(_time_left() // 60)} min left) — continuing...")
+            return False
+
         if returncode in (0, 4):
             logging.info(f"{kind.capitalize()} completed successfully (exit code: {returncode})")
             if on_success:
@@ -1890,13 +1980,21 @@ def run_scheduled_stream(
         logging.warning(f"mpv exited with code {returncode}")
         return False
 
-    # Try original URL (with one retry)
-    for attempt in range(2):
-        attempt_num = attempt + 1
+    # Try the original URL. Two quick failures in a row move on to the
+    # alternatives; an attempt that played for a while before failing (a
+    # dropped stream mid-recording) doesn't count, so it is simply resumed.
+    quick_failures = 0
+    attempt_num = 0
+    recorded_something = False
+    while quick_failures < 2 and attempt_num < _MAX_STREAM_ATTEMPTS:
+        attempt_num += 1
         if attempt_num > 1 and not _vpn_still_up("retry"):
             return {"status": "failed"}
-        logging.info(f"Attempt {attempt_num}/2: Trying original URL {channel_url}")
-        print(f"[{tag}] Attempt {attempt_num}/2: {channel_name} [{provider}]")
+        if _time_left() <= _EARLY_END_GRACE_SECONDS:
+            break
+        logging.info(f"Attempt {attempt_num}: Trying original URL {channel_url}")
+        print(f"[{tag}] Attempt {attempt_num}: {channel_name} [{provider}]")
+        attempt_started = time.time()
         try:
             if _try_url(channel_url, f"{channel_name} [{provider}] - {show_title}"):
                 print(f"\n[{tag} COMPLETE]")
@@ -1908,9 +2006,26 @@ def run_scheduled_stream(
         except Exception as e:
             logging.error(f"Attempt {attempt_num} failed with exception: {e}")
             print(f"[{tag}] Error: {e}")
-        if attempt == 0:
+        if time.time() - attempt_started >= _PROGRESS_SECONDS:
+            recorded_something = True
+            quick_failures = 0
+        else:
+            quick_failures += 1
+        if quick_failures < 2:
             print(f"[{tag}] Retrying in 5 seconds...")
             time.sleep(5)
+
+    if deadline is not None and _time_left() <= _EARLY_END_GRACE_SECONDS:
+        # The programme is over. Whatever was recorded is all there will be.
+        if recorded_something:
+            logging.info(f"{kind.capitalize()} reached its end time after interruptions: {show_title}")
+            if on_success:
+                on_success()
+            print(f"\n[{tag} COMPLETE] (with interruptions)")
+            return {"status": "success"}
+        logging.error(f"{kind.capitalize()} failed: programme ended before any stream worked: {show_title}")
+        print(f"\n[{tag} FAILED] Programme ended before any stream worked: {show_title}")
+        return {"status": "failed"}
 
     # Original URL failed, try alternatives
     logging.warning("Original stream failed after 2 attempts, searching for alternatives")
@@ -1990,8 +2105,8 @@ def load_watch_history() -> List[Dict[str, Any]]:
                 migrated = True
         if migrated:
             try:
-                with open(WATCH_HISTORY_FILE, "w", encoding="utf-8") as f:
-                    json.dump(history, f, indent=2)
+                with _STATE_LOCK:
+                    _write_json_atomic(WATCH_HISTORY_FILE, history)
             except Exception:
                 pass
         return history
@@ -2004,6 +2119,11 @@ def log_channel_watch(channel: Channel, duration_seconds: int):
     """Record a channel watch session (ignored if < 2 minutes)."""
     if duration_seconds < 120:
         return
+    with _STATE_LOCK:
+        _log_channel_watch_locked(channel, duration_seconds)
+
+
+def _log_channel_watch_locked(channel: Channel, duration_seconds: int):
     history = load_watch_history()
     tvg_id = channel.get("tvg-id", "")
     url = channel.get("url", "")
@@ -2027,8 +2147,7 @@ def log_channel_watch(channel: Channel, duration_seconds: int):
             "last_watched":           datetime.now().isoformat(),
         })
     try:
-        with open(WATCH_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
+        _write_json_atomic(WATCH_HISTORY_FILE, history)
     except Exception as e:
         print(f"Warning: Could not save watch history. {e}", file=sys.stderr)
 
@@ -2174,14 +2293,19 @@ def load_favorites() -> List[Dict[str, str]]:
 def save_favorites(favs: List[Dict[str, str]]):
     """Persist the favorites list."""
     try:
-        with open(FAVORITES_FILE, "w", encoding="utf-8") as f:
-            json.dump(favs, f, indent=2)
+        with _STATE_LOCK:
+            _write_json_atomic(FAVORITES_FILE, favs)
     except Exception as e:
         print(f"Warning: Could not save favorites. {e}", file=sys.stderr)
 
 
 def toggle_favorite(channel: Channel) -> bool:
     """Add channel to favorites if absent; remove if present. Returns True if added."""
+    with _STATE_LOCK:
+        return _toggle_favorite_locked(channel)
+
+
+def _toggle_favorite_locked(channel: Channel) -> bool:
     favs = load_favorites()
     tvg_id = channel.get("tvg-id", "")
     url = channel.get("url", "")
@@ -2348,15 +2472,15 @@ def get_channel_note(channel: Channel) -> str:
 
 def set_channel_note(channel: Channel, note: str):
     """Save (or clear) a personal note for this channel."""
-    notes = load_channel_notes()
-    key = _channel_note_key(channel)
-    if note:
-        notes[key] = note
-    else:
-        notes.pop(key, None)
     try:
-        with open(CHANNEL_NOTES_FILE, "w", encoding="utf-8") as f:
-            json.dump(notes, f, indent=2)
+        with _STATE_LOCK:
+            notes = load_channel_notes()
+            key = _channel_note_key(channel)
+            if note:
+                notes[key] = note
+            else:
+                notes.pop(key, None)
+            _write_json_atomic(CHANNEL_NOTES_FILE, notes)
     except Exception as e:
         print(f"Warning: Could not save channel notes. {e}", file=sys.stderr)
 
@@ -2388,8 +2512,8 @@ def save_scheduled_tasks(tasks: List[Dict[str, Any]]):
             entry["output_path"] = str(t["output_path"])
         data.append(entry)
     try:
-        with open(SCHEDULED_TASKS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        with _STATE_LOCK:
+            _write_json_atomic(SCHEDULED_TASKS_FILE, data)
     except Exception as e:
         logging.warning(f"Could not save scheduled tasks: {e}")
 
@@ -2397,6 +2521,10 @@ def save_scheduled_tasks(tasks: List[Dict[str, Any]]):
 def load_scheduled_tasks() -> List[Dict[str, Any]]:
     """Load persisted scheduled tasks, dropping ones whose time has passed.
 
+    A recording whose start has passed but whose programme is still on (the
+    CLI was closed or the machine rebooted mid-show) is kept with
+    "_resume_elapsed" set to the seconds already missed, so the caller can
+    start it right away for the rest of the programme instead of losing it.
     ISO datetime strings are parsed back into aware datetimes.
     """
     if not SCHEDULED_TASKS_FILE.exists():
@@ -2413,8 +2541,14 @@ def load_scheduled_tasks() -> List[Dict[str, Any]]:
         try:
             st_raw = t.get("scheduled_time")
             st = datetime.fromisoformat(st_raw) if st_raw else None
-            if not st or st <= now:
-                continue  # expired while the CLI was closed
+            if not st:
+                continue
+            if st <= now:
+                duration = int(t.get("duration_seconds") or 0)
+                missed = int((now - st).total_seconds())
+                if not (t.get("type") == "recording" and duration and duration - missed > 60):
+                    continue  # expired while the CLI was closed
+                t["_resume_elapsed"] = missed
             t["scheduled_time"] = st
             if t.get("original_start_time"):
                 t["original_start_time"] = datetime.fromisoformat(t["original_start_time"])
